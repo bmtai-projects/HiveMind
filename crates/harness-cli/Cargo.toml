@@ -6,7 +6,7 @@ license.workspace = true
 authors.workspace = true
 
 [[bin]]
-name = "harness"
+name = "hivemind"
 path = "src/main.rs"
 
 [dependencies]

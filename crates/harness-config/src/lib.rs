@@ -272,12 +272,12 @@ fn load_file(path: &Path) -> Result<File, ConfigError> {
     })
 }
 
-/// Default config file location: `~/.config/harness/config.toml`.
+/// Default config file location: `~/.config/hivemind/config.toml`.
 pub fn default_config_path() -> std::path::PathBuf {
     if let Some(home) = dirs_home() {
-        return home.join(".config").join("harness").join("config.toml");
+        return home.join(".config").join("hivemind").join("config.toml");
     }
-    std::path::PathBuf::from("harness.toml")
+    std::path::PathBuf::from("hivemind.toml")
 }
 
 /// Minimal `$HOME` lookup so this crate doesn't need the `dirs` dependency

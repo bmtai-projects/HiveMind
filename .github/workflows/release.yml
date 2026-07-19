@@ -51,21 +51,21 @@ jobs:
         shell: bash
         run: |
           cd target/${{ matrix.target }}/release
-          tar -czf "harness-${{ matrix.target }}.tar.gz" harness
-          mv "harness-${{ matrix.target }}.tar.gz" "$GITHUB_WORKSPACE/"
+          tar -czf "hivemind-${{ matrix.target }}.tar.gz" hivemind
+          mv "hivemind-${{ matrix.target }}.tar.gz" "$GITHUB_WORKSPACE/"
 
       - name: Package (windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          Compress-Archive -Path "target/${{ matrix.target }}/release/harness.exe" -DestinationPath "harness-${{ matrix.target }}.zip"
+          Compress-Archive -Path "target/${{ matrix.target }}/release/hivemind.exe" -DestinationPath "hivemind-${{ matrix.target }}.zip"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: harness-${{ matrix.target }}
+          name: hivemind-${{ matrix.target }}
           path: |
-            harness-${{ matrix.target }}.tar.gz
-            harness-${{ matrix.target }}.zip
+            hivemind-${{ matrix.target }}.tar.gz
+            hivemind-${{ matrix.target }}.zip
           if-no-files-found: ignore
 
   release:
@@ -93,4 +93,4 @@ jobs:
           # fine-grained PAT even with Contents: Read/write (confirmed via
           # the actual run logs, not assumed). A static body avoids the
           # call entirely; the assets are what install.sh actually needs.
-          body: "Pre-built `harness` binaries for macOS (x86_64/aarch64), Linux (x86_64/aarch64), and Windows (x86_64)."
+          body: "Pre-built `hivemind` binaries for macOS (x86_64/aarch64), Linux (x86_64/aarch64), and Windows (x86_64)."

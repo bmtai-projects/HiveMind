@@ -3,7 +3,8 @@
 A fast, cost-optimized, DeepSeek-only coding agent — a from-scratch Rust
 harness in the shape of [grok-build](https://x.ai/cli), scoped down to one
 provider and built around one goal: **make an agentic coding loop cheap
-enough to give away.** The CLI binary is called `harness`.
+enough to give away.** The CLI binary is called `hivemind`; you run it with
+`hivemind activate`.
 
 Free while pricing is undecided. Modular by design so a second provider
 (OpenAI, Anthropic, xAI) is a new module later, not a rewrite.
@@ -51,7 +52,7 @@ If you have access to this (private) repo, build from source instead:
 git clone https://github.com/BibhabenduMukherjee/HiveMind.git
 cd HiveMind
 cargo build --release -p harness-cli
-./target/release/harness --version
+./target/release/hivemind --version
 ```
 
 ### Run
@@ -59,14 +60,14 @@ cargo build --release -p harness-cli
 ```sh
 export DEEPSEEK_API_KEY=sk-...
 
-harness                              # interactive REPL, starts on Flash
-harness -p "summarize src/main.rs"   # headless one-shot
-harness --tier pro                   # start on the stronger tier
+hivemind activate                              # interactive REPL, starts on Flash
+hivemind activate -p "summarize src/main.rs"   # headless one-shot
+hivemind activate --tier pro                   # start on the stronger tier
 ```
 
 No config file is required. To customize models, thresholds, or a proxy
 `base_url`, copy [`config.example.toml`](config.example.toml) to
-`~/.config/harness/config.toml`.
+`~/.config/hivemind/config.toml`.
 
 ## Optimizations implemented
 
@@ -92,7 +93,7 @@ crates/
   harness-provider   the DeepSeek streaming client: SSE decode, retries, connection reuse
   harness-tools      the Tool trait, registry, parallel dispatch, fs + shell builtins
   harness-agent      the sample<->tools loop: compaction, tiering/escalation, doom-loop guard
-  harness-cli        the `harness` binary: clap args, REPL/headless, terminal UI, cost display
+  harness-cli        the `hivemind` binary (activate subcommand): clap args, REPL/headless, terminal UI, cost display
 ```
 
 Six small crates instead of grok-build's ~70 — same layering, deliberately
@@ -122,11 +123,13 @@ Four built-ins, all workspace-confined (`--workdir`, default `.`):
 
 ## Flags
 
+All of these are flags on `hivemind activate`, e.g. `hivemind activate --tier pro`.
+
 | Flag | Meaning |
 |---|---|
 | `-p, --prompt` | Run one prompt headlessly (auto-approves shell), then exit. |
 | `--workdir` | Workspace root. Default `.`. |
-| `--config` | Config file path. Default `~/.config/harness/config.toml`. |
+| `--config` | Config file path. Default `~/.config/hivemind/config.toml`. |
 | `--tier` | Start on `flash` (default) or `pro`. |
 | `--api-key` / `--base-url` | Override resolved endpoint (e.g. point at a proxy or local mock). |
 | `--yolo` | Auto-approve all shell commands. Off by default. |

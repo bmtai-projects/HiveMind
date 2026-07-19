@@ -1,4 +1,4 @@
-//! `harness` — a fast, cost-optimized DeepSeek coding agent.
+//! `hivemind` — a fast, cost-optimized DeepSeek coding agent.
 //!
 //! Two tiers only, for now: Flash (default, cheap) and Pro (escalated to
 //! automatically when the agent looks stuck). See the workspace README for
@@ -9,7 +9,7 @@ mod ui;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use clap::Parser;
+use clap::{Args, Parser, Subcommand};
 
 use harness_agent::Agent;
 use harness_config::{CliOverrides, Tier};
@@ -33,11 +33,23 @@ Be concise. Reference files by path.";
 
 #[derive(Parser)]
 #[command(
-    name = "harness",
+    name = "hivemind",
     version,
     about = "A fast, cost-optimized DeepSeek coding agent"
 )]
 struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Start the agent — interactive REPL, or headless with --prompt.
+    Activate(ActivateArgs),
+}
+
+#[derive(Args)]
+struct ActivateArgs {
     /// Run one prompt headlessly (auto-approves shell), then exit.
     #[arg(short = 'p', long = "prompt")]
     prompt: Option<String>,
@@ -46,7 +58,7 @@ struct Cli {
     #[arg(long, default_value = ".")]
     workdir: PathBuf,
 
-    /// Path to config.toml. Defaults to ~/.config/harness/config.toml.
+    /// Path to config.toml. Defaults to ~/.config/hivemind/config.toml.
     #[arg(long)]
     config: Option<PathBuf>,
 
@@ -74,22 +86,23 @@ struct Cli {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    if let Err(e) = run(cli).await {
+    let Command::Activate(args) = cli.command;
+    if let Err(e) = run(args).await {
         eprintln!("\nerror: {e:#}");
         std::process::exit(1);
     }
     Ok(())
 }
 
-async fn run(cli: Cli) -> anyhow::Result<()> {
-    let config_path = cli
+async fn run(args: ActivateArgs) -> anyhow::Result<()> {
+    let config_path = args
         .config
         .clone()
         .unwrap_or_else(harness_config::default_config_path);
     let overrides = CliOverrides {
-        api_key: cli.api_key.clone(),
-        base_url: cli.base_url.clone(),
-        tier: cli
+        api_key: args.api_key.clone(),
+        base_url: args.base_url.clone(),
+        tier: args
             .tier
             .as_deref()
             .map(str::parse::<Tier>)
@@ -98,11 +111,11 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     };
     let resolved = harness_config::resolve(&config_path, overrides)?;
 
-    let workdir = cli
+    let workdir = args
         .workdir
         .canonicalize()
-        .map_err(|e| anyhow::anyhow!("workdir {:?}: {e}", cli.workdir))?;
-    let headless = cli.prompt.is_some();
+        .map_err(|e| anyhow::anyhow!("workdir {:?}: {e}", args.workdir))?;
+    let headless = args.prompt.is_some();
 
     let mut registry = Registry::new();
     let ws = Workspace::new(workdir.clone());
@@ -111,24 +124,24 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     registry.register(Arc::new(ListDir(ws.clone())));
 
     let mut bash = Bash::new(workdir.clone());
-    if !cli.yolo && !headless {
+    if !args.yolo && !headless {
         bash = bash.with_approval(Arc::new(ui::terminal_approve));
     }
     registry.register(Arc::new(bash));
     let tool_names = registry.names().join(", ");
 
-    let ui: Arc<TermUi> = Arc::new(TermUi::new(cli.show_reasoning));
+    let ui: Arc<TermUi> = Arc::new(TermUi::new(args.show_reasoning));
     let mut agent = Agent::new(resolved.clone(), registry, ui, SYSTEM_PROMPT.to_string());
 
     println!(
-        "harness · tier={} · flash={} · pro={} · workdir={} · tools=[{tool_names}]",
+        "hivemind · tier={} · flash={} · pro={} · workdir={} · tools=[{tool_names}]",
         resolved.policy.default_tier,
         resolved.flash.wire_id,
         resolved.pro.wire_id,
         workdir.display(),
     );
 
-    if let Some(prompt) = &cli.prompt {
+    if let Some(prompt) = &args.prompt {
         agent.run(prompt).await?;
         return Ok(());
     }
