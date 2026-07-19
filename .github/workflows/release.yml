@@ -88,4 +88,9 @@ jobs:
           repository: BibhabenduMukherjee/HiveMind-releases
           token: ${{ secrets.RELEASES_REPO_TOKEN }}
           files: dist/*
-          generate_release_notes: true
+          # NOT generate_release_notes: true -- that calls GitHub's
+          # auto-generate-notes endpoint, which 403'd against the
+          # fine-grained PAT even with Contents: Read/write (confirmed via
+          # the actual run logs, not assumed). A static body avoids the
+          # call entirely; the assets are what install.sh actually needs.
+          body: "Pre-built `harness` binaries for macOS (x86_64/aarch64), Linux (x86_64/aarch64), and Windows (x86_64)."
