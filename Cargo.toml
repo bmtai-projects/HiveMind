@@ -35,6 +35,8 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 async-trait = "0.1"
 rand = "0.9"
+reedline = "0.38"
+walkdir = "2"
 
 [profile.release]
 opt-level = 3

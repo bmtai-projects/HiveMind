@@ -4,17 +4,24 @@
 //! automatically when the agent looks stuck). See the workspace README for
 //! the full architecture and optimization notes.
 
+mod banner;
+mod commands;
+mod completion;
+mod input;
+mod mentions;
 mod ui;
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::{Args, Parser, Subcommand};
+use reedline::Signal;
 
+use commands::{SlashCommand, TierArg};
 use harness_agent::Agent;
 use harness_config::{CliOverrides, Tier};
 use harness_tools::{Bash, ListDir, ReadFile, Registry, Workspace, WriteFile};
-
+use input::HivePrompt;
 use ui::TermUi;
 
 const SYSTEM_PROMPT: &str =
@@ -131,51 +138,81 @@ async fn run(args: ActivateArgs) -> anyhow::Result<()> {
     let tool_names = registry.names().join(", ");
 
     let ui: Arc<TermUi> = Arc::new(TermUi::new(args.show_reasoning));
-    let mut agent = Agent::new(resolved.clone(), registry, ui, SYSTEM_PROMPT.to_string());
-
-    println!(
-        "hivemind · tier={} · flash={} · pro={} · workdir={} · tools=[{tool_names}]",
-        resolved.policy.default_tier,
-        resolved.flash.wire_id,
-        resolved.pro.wire_id,
-        workdir.display(),
+    let mut agent = Agent::new(
+        resolved.clone(),
+        registry,
+        ui.clone(),
+        SYSTEM_PROMPT.to_string(),
     );
 
+    banner::print(&resolved, &workdir, &tool_names);
+
     if let Some(prompt) = &args.prompt {
-        agent.run(prompt).await?;
+        let expanded = mentions::expand_mentions(prompt, &ws);
+        agent.run(&expanded).await?;
         return Ok(());
     }
 
-    repl(&mut agent).await
+    repl(&mut agent, ws, ui).await
 }
 
-async fn repl(agent: &mut Agent) -> anyhow::Result<()> {
-    use tokio::io::{AsyncBufReadExt, BufReader};
+async fn repl(agent: &mut Agent, ws: Workspace, ui: Arc<TermUi>) -> anyhow::Result<()> {
+    println!("Type your request, or /help for commands. @path references a file. Ctrl-D to quit.");
 
-    println!("Type your request. Ctrl-D or /exit to quit.");
-    let mut reader = BufReader::new(tokio::io::stdin());
-    let mut line = String::new();
+    let history_path = harness_config::default_config_path()
+        .parent()
+        .map(|dir| dir.join("history.txt"));
+    let mut line_editor = input::build_line_editor(&ws.root, history_path);
 
     loop {
-        print!("\n\x1b[1m› \x1b[0m");
-        ui::flush_stdout();
+        let (returned_editor, sig) = tokio::task::spawn_blocking(move || {
+            let sig = line_editor.read_line(&HivePrompt);
+            (line_editor, sig)
+        })
+        .await?;
+        line_editor = returned_editor;
 
-        line.clear();
-        let bytes_read = reader.read_line(&mut line).await?;
-        if bytes_read == 0 {
-            println!();
-            return Ok(()); // EOF (Ctrl-D)
-        }
-        let input = line.trim();
+        let input = match sig.map_err(|e| anyhow::anyhow!("input error: {e}"))? {
+            Signal::Success(line) => line,
+            Signal::CtrlC => continue, // reedline already cleared the in-progress line
+            Signal::CtrlD => {
+                println!();
+                return Ok(());
+            }
+        };
+        let input = input.trim();
         if input.is_empty() {
             continue;
         }
-        if input == "/exit" || input == "/quit" {
-            return Ok(());
+
+        if let Some(cmd) = commands::parse(input) {
+            match cmd {
+                SlashCommand::Help => println!("{}", commands::HELP_TEXT),
+                SlashCommand::Clear => print!("\x1b[2J\x1b[H"),
+                SlashCommand::Compact => {
+                    if !agent.force_compact().await {
+                        println!("nothing to compact yet");
+                    }
+                }
+                SlashCommand::Tier(TierArg::Show) => println!("tier: {}", agent.current_tier()),
+                SlashCommand::Tier(TierArg::Set(tier)) => {
+                    agent.set_default_tier(tier);
+                    println!("tier set to {tier}");
+                }
+                SlashCommand::Tier(TierArg::Invalid(bad)) => {
+                    println!("unknown tier {bad:?} — expected \"flash\" or \"pro\"");
+                }
+                SlashCommand::Cost => println!("session cost so far: ${:.6}", ui.session_cost()),
+                SlashCommand::Exit => return Ok(()),
+                SlashCommand::Unknown(name) => println!("unknown command /{name} — try /help"),
+            }
+            continue;
         }
 
+        let expanded = mentions::expand_mentions(input, &ws);
+
         tokio::select! {
-            result = agent.run(input) => {
+            result = agent.run(&expanded) => {
                 if let Err(e) = result {
                     eprintln!("\nerror: {e:#}");
                 }

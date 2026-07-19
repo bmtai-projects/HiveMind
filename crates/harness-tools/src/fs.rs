@@ -19,7 +19,10 @@ impl Workspace {
         Self { root: root.into() }
     }
 
-    fn resolve(&self, rel: &str) -> Result<PathBuf, ToolError> {
+    /// Resolve `rel` against the workspace root, rejecting anything that
+    /// escapes it. `pub` so hosts (e.g. the CLI's `@file` mention expansion)
+    /// can reuse the same path-safety check instead of re-implementing it.
+    pub fn resolve(&self, rel: &str) -> Result<PathBuf, ToolError> {
         if rel.is_empty() {
             return Err(ToolError::Message("path is required".into()));
         }

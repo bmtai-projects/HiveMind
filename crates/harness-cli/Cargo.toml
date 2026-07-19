@@ -18,3 +18,5 @@ harness-agent = { workspace = true }
 tokio = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
+reedline = { workspace = true }
+walkdir = { workspace = true }

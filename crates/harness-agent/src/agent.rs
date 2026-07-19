@@ -79,6 +79,51 @@ impl Agent {
         self.current_tier
     }
 
+    /// Set the tier this session runs on, effective immediately and sticky
+    /// across future inputs (unlike auto-escalation, which resets to the
+    /// configured default at the start of every new `run()` call). Used by
+    /// an explicit user command (e.g. a REPL `/tier` command), not by the
+    /// doom-loop guard.
+    pub fn set_default_tier(&mut self, tier: Tier) {
+        self.policy.default_tier = tier;
+        self.current_tier = tier;
+    }
+
+    /// Force a compaction pass right now, bypassing the usage-threshold
+    /// check (an explicit user command, not the automatic turn-boundary
+    /// check `run()` already does). Returns `true` if there was enough
+    /// history to actually compact.
+    pub async fn force_compact(&mut self) -> bool {
+        let policy = CompactionPolicy {
+            threshold_percent: 0,
+            keep_recent: COMPACTION_KEEP_RECENT,
+        };
+        // maybe_compact() no-ops when total_tokens == 0 (nothing sampled
+        // yet); .max(1) only bypasses that guard, it doesn't affect what
+        // actually gets folded -- message count vs `keep_recent` still
+        // decides that.
+        if let Some(report) = maybe_compact(
+            &mut self.messages,
+            self.last_total_tokens.max(1),
+            self.context_window,
+            &policy,
+            &self.client,
+            &self.flash.wire_id,
+        )
+        .await
+        {
+            self.ui.compacted(
+                report.messages_before,
+                report.messages_after,
+                report.tokens_before,
+            );
+            self.last_total_tokens = 0;
+            true
+        } else {
+            false
+        }
+    }
+
     fn model_info_for(&self, tier: Tier) -> &ModelInfo {
         match tier {
             Tier::Flash => &self.flash,

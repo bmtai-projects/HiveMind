@@ -23,6 +23,14 @@ impl TermUi {
             session_cost_usd: Mutex::new(0.0),
         }
     }
+
+    /// Running total for a `/cost` command to read on demand.
+    pub fn session_cost(&self) -> f64 {
+        *self
+            .session_cost_usd
+            .lock()
+            .expect("session cost mutex poisoned")
+    }
 }
 
 impl Ui for TermUi {
