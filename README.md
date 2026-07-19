@@ -8,6 +8,12 @@ enough to give away.** The CLI binary is called `harness`.
 Free while pricing is undecided. Modular by design so a second provider
 (OpenAI, Anthropic, xAI) is a new module later, not a rewrite.
 
+> **This repo is source-only and private.** Compiled binaries are published
+> to the public [`HiveMind-releases`](https://github.com/BibhabenduMukherjee/HiveMind-releases)
+> repo, which has no source in it — that's where the public install command
+> lives. See [Distributing a release](#distributing-a-release) for how the
+> two repos connect.
+
 ## Why DeepSeek-only, for now
 
 Model choice isn't what makes Cursor/Claude expensive — **re-sent context**
@@ -32,11 +38,14 @@ for what's actually wired up.
 
 ### Install
 
+Public install command (no source access needed — this is what goes in
+user-facing docs):
+
 ```sh
-curl -fsSL https://raw.githubusercontent.com/BibhabenduMukherjee/HiveMind/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/BibhabenduMukherjee/HiveMind-releases/main/install.sh | bash
 ```
 
-Or build from source:
+If you have access to this (private) repo, build from source instead:
 
 ```sh
 git clone https://github.com/BibhabenduMukherjee/HiveMind.git
@@ -139,11 +148,20 @@ git tag v0.1.0
 git push origin v0.1.0              # triggers .github/workflows/release.yml
 ```
 
-Builds macOS (x86_64/aarch64), Linux (x86_64/aarch64), and Windows
-(x86_64) binaries and attaches them to a GitHub Release; `install.sh`
-downloads the right one for the caller's machine. This pipeline hasn't been
-exercised against a real remote yet — verify the first tagged run before
-pointing users at it.
+Builds macOS (x86_64/aarch64), Linux (x86_64/aarch64), and Windows (x86_64)
+binaries, then **publishes them to the public `HiveMind-releases` repo**, not
+this one — see `.github/workflows/release.yml`. That cross-repo publish
+needs a secret this repo doesn't manage automatically:
+
+- **`RELEASES_REPO_TOKEN`** — a PAT with `Contents: Read and write` scoped
+  to `BibhabenduMukherjee/HiveMind-releases`, added under this repo's
+  *Settings > Secrets and variables > Actions*. Without it, the `release`
+  job's publish step fails with a permissions error — the default
+  `GITHUB_TOKEN` can't write to a different repo.
+
+`HiveMind-releases/install.sh` downloads whichever asset matches the
+caller's platform. Both the workflow and the installer have been run
+end-to-end against real GitHub infrastructure, not just written and hoped.
 
 ## Roadmap
 

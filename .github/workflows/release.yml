@@ -71,15 +71,21 @@ jobs:
   release:
     needs: build
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     steps:
       - uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
-      - name: Create release
+      # Publishes to the public BibhabenduMukherjee/HiveMind-releases repo,
+      # not this one — this repo is private (source-only). The default
+      # GITHUB_TOKEN is scoped to the repo the workflow runs in and cannot
+      # write to a different repo, so this needs a PAT with Contents:
+      # read/write on HiveMind-releases, stored as the RELEASES_REPO_TOKEN
+      # secret here (Settings > Secrets and variables > Actions).
+      - name: Publish to public releases repo
         uses: softprops/action-gh-release@v2
         with:
+          repository: BibhabenduMukherjee/HiveMind-releases
+          token: ${{ secrets.RELEASES_REPO_TOKEN }}
           files: dist/*
           generate_release_notes: true
