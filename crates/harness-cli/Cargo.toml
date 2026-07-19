@@ -1,0 +1,20 @@
+[package]
+name = "harness-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "harness"
+path = "src/main.rs"
+
+[dependencies]
+harness-types = { workspace = true }
+harness-config = { workspace = true }
+harness-provider = { workspace = true }
+harness-tools = { workspace = true }
+harness-agent = { workspace = true }
+tokio = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }

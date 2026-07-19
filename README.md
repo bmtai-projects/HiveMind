@@ -1,0 +1,162 @@
+# HiveMind
+
+A fast, cost-optimized, DeepSeek-only coding agent — a from-scratch Rust
+harness in the shape of [grok-build](https://x.ai/cli), scoped down to one
+provider and built around one goal: **make an agentic coding loop cheap
+enough to give away.** The CLI binary is called `harness`.
+
+Free while pricing is undecided. Modular by design so a second provider
+(OpenAI, Anthropic, xAI) is a new module later, not a rewrite.
+
+## Why DeepSeek-only, for now
+
+Model choice isn't what makes Cursor/Claude expensive — **re-sent context**
+is. Every turn of an agent loop resends the whole growing conversation, and
+by mid-session that's tens of thousands of tokens billed on every call. Two
+things close that gap almost entirely:
+
+1. **Prompt-prefix caching.** DeepSeek caches automatically and bills
+   cache-hit prompt tokens at roughly **1/50th** the cache-miss rate. Keep
+   the prefix (system prompt, tool schemas) byte-stable turn to turn and
+   most of a session's input tokens land in that discount.
+2. **Compaction.** Once a session's usage crosses a threshold, fold older
+   turns into one summary instead of re-sending (and re-billing) them
+   forever.
+
+DeepSeek V4 Flash at ~$0.14/$0.28 per M tokens (cache-hit ~$0.0028/M) makes a
+full coding session cost cents, not dollars — cheap enough to run the whole
+product on before pricing is even decided. See [Optimizations](#optimizations-implemented)
+for what's actually wired up.
+
+## Quick start
+
+### Install
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/BibhabenduMukherjee/HiveMind/main/install.sh | bash
+```
+
+Or build from source:
+
+```sh
+git clone https://github.com/BibhabenduMukherjee/HiveMind.git
+cd HiveMind
+cargo build --release -p harness-cli
+./target/release/harness --version
+```
+
+### Run
+
+```sh
+export DEEPSEEK_API_KEY=sk-...
+
+harness                              # interactive REPL, starts on Flash
+harness -p "summarize src/main.rs"   # headless one-shot
+harness --tier pro                   # start on the stronger tier
+```
+
+No config file is required. To customize models, thresholds, or a proxy
+`base_url`, copy [`config.example.toml`](config.example.toml) to
+`~/.config/harness/config.toml`.
+
+## Optimizations implemented
+
+Every one of these is real, wired-up behavior — not a roadmap item:
+
+| Optimization | Where | Effect |
+|---|---|---|
+| **Prefix-stable requests + cache-hit visibility** | [`harness-cli/src/ui.rs`](crates/harness-cli/src/ui.rs), [`harness-provider/src/wire.rs`](crates/harness-provider/src/wire.rs) | Tool schemas serialize in sorted, deterministic order; DeepSeek's `prompt_cache_hit_tokens`/`prompt_cache_miss_tokens` are parsed and shown live (`cache 92%`) so the win is visible, not assumed. |
+| **Context compaction** | [`harness-agent/src/compaction.rs`](crates/harness-agent/src/compaction.rs) | At `compaction_threshold_percent` (default 75%) of the context window, older turns are folded into one model-generated summary via a cheap Flash call — never silently truncated, never re-billed forever. |
+| **Two-tier routing with auto-escalation** | [`harness-agent/src/agent.rs`](crates/harness-agent/src/agent.rs) | Every task starts on Flash. If the model repeats an identical tool call or hits repeated tool errors (a doom-loop symptom), the harness auto-escalates to Pro for that task only, then resets to Flash on the next input. |
+| **Parallel tool dispatch** | [`harness-tools/src/tool.rs`](crates/harness-tools/src/tool.rs) | Multiple tool calls in one turn run concurrently via `tokio::JoinSet`, then are reassembled in original call order — concurrent latency, deterministic transcript. |
+| **Retry/backoff with jitter** | [`harness-provider/src/retry.rs`](crates/harness-provider/src/retry.rs) | 429/5xx/network errors retry with exponential backoff + jitter, honoring a server's `Retry-After` header, surfaced to the UI via a retry hook. |
+| **Connection reuse** | [`harness-provider/src/client.rs`](crates/harness-provider/src/client.rs) | One pooled `reqwest::Client` per process — every request, retry, and background summarization call reuses keep-alive HTTP connections. |
+| **Zero-clone request path** | [`harness-provider/src/client.rs`](crates/harness-provider/src/client.rs) | The provider borrows the conversation only long enough to serialize it; sending a turn never clones the (potentially large) message history. Retries resend a cheaply-refcounted `Bytes` body, not a re-copy. |
+| **Live cost readout** | [`harness-cli/src/ui.rs`](crates/harness-cli/src/ui.rs) | Every response line shows `$turn / $session` cost, computed from real usage × tier pricing — the point of all of the above is a number you can watch stay small. |
+
+## Architecture
+
+```
+crates/
+  harness-types      provider-neutral wire model (Message, ToolCall, Usage, StreamEvent)
+  harness-config     config.toml + env resolution: DeepSeek Flash/Pro catalog, keys, policy
+  harness-provider   the DeepSeek streaming client: SSE decode, retries, connection reuse
+  harness-tools      the Tool trait, registry, parallel dispatch, fs + shell builtins
+  harness-agent      the sample<->tools loop: compaction, tiering/escalation, doom-loop guard
+  harness-cli        the `harness` binary: clap args, REPL/headless, terminal UI, cost display
+```
+
+Six small crates instead of grok-build's ~70 — same layering, deliberately
+compact. Data flows one way: `harness-cli` builds a `Registry` (tools) and a
+`Resolved` config, hands both to `harness-agent::Agent`, which drives
+`harness-provider` and streams events back through a UI trait the CLI
+implements. No crate reaches back up the stack.
+
+### Provider abstraction, kept honest
+
+There's no `Provider` trait today — `Agent` is concretely typed against
+`DeepSeekClient`, on purpose, per the current one-provider scope. Adding a
+second provider means: define its wire dialect in a new module (mirroring
+[`harness-provider/src/wire.rs`](crates/harness-provider/src/wire.rs)), then
+introduce the trait `Agent` needs at that point. Not before — an
+abstraction with one implementation is just indirection.
+
+## Tools
+
+Four built-ins, all workspace-confined (`--workdir`, default `.`):
+
+- `read_file`, `write_file`, `list_dir` — path-escape-checked against the
+  workspace root.
+- `run_shell` — gated by an interactive `[y/N]` approval prompt by default;
+  `--yolo` or headless (`-p`) mode auto-approves. Runs under a timeout with
+  `kill_on_drop` so a cancelled/timed-out command can't orphan a process.
+
+## Flags
+
+| Flag | Meaning |
+|---|---|
+| `-p, --prompt` | Run one prompt headlessly (auto-approves shell), then exit. |
+| `--workdir` | Workspace root. Default `.`. |
+| `--config` | Config file path. Default `~/.config/harness/config.toml`. |
+| `--tier` | Start on `flash` (default) or `pro`. |
+| `--api-key` / `--base-url` | Override resolved endpoint (e.g. point at a proxy or local mock). |
+| `--yolo` | Auto-approve all shell commands. Off by default. |
+| `--show-reasoning` | Print streamed chain-of-thought (deepseek-v4-pro). |
+
+## Development
+
+```sh
+cargo check -p <crate>              # target one crate; faster than a full build
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all
+```
+
+## Distributing a release
+
+```sh
+git tag v0.1.0
+git push origin v0.1.0              # triggers .github/workflows/release.yml
+```
+
+Builds macOS (x86_64/aarch64), Linux (x86_64/aarch64), and Windows
+(x86_64) binaries and attaches them to a GitHub Release; `install.sh`
+downloads the right one for the caller's machine. This pipeline hasn't been
+exercised against a real remote yet — verify the first tagged run before
+pointing users at it.
+
+## Roadmap
+
+Scoped out of this pass on purpose — natural next additions, each behind an
+existing seam:
+
+- **A second provider** (OpenAI/Anthropic/xAI) — see [Provider abstraction](#provider-abstraction-kept-honest).
+- **Diff-based edits** — `write_file` is full-rewrite today; a patch/diff tool plus an undo stack is the natural upgrade.
+- **MCP client** — mount external tool servers.
+- **Session persistence** — `Agent::history()` already exposes the full transcript; save/resume is a serialization layer away.
+- **Explicit `anthropic-style` cache breakpoints** — not needed for DeepSeek (caching is automatic), but relevant the moment a second provider needs it.
+- **A `/cost` and `/tier` REPL command** — the pricing and tier machinery already exists in `harness-config`/`harness-cli/src/ui.rs`; this is UI wiring, not new logic.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

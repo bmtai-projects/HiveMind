@@ -1,0 +1,15 @@
+# Copy to ~/.config/harness/config.toml (or pass --config path/to/this).
+# Every field is optional — the harness works with only $DEEPSEEK_API_KEY set.
+
+[deepseek]
+# api_key = "sk-..."        # prefer $DEEPSEEK_API_KEY; only set this for local experiments
+# base_url = "https://api.deepseek.com"
+# flash_model = "deepseek-v4-flash"
+# pro_model = "deepseek-v4-pro"
+
+[agent]
+default_tier = "flash"              # "flash" | "pro" — the tier each new task starts on
+max_turns = 25                      # hard cap on sample<->tool cycles per input
+compaction_threshold_percent = 75   # summarize older turns once usage crosses this % of the context window
+auto_escalate = true                # bump flash -> pro after repeated/failing tool calls on one task
+escalate_after_repeats = 2          # consecutive repeats/errors before escalating

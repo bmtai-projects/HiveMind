@@ -1,0 +1,14 @@
+[package]
+name = "harness-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+harness-types = { workspace = true }
+harness-config = { workspace = true }
+harness-provider = { workspace = true }
+harness-tools = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
