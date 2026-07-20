@@ -1,23 +1,24 @@
-//! The startup banner. Deliberately not full ASCII-art block lettering —
-//! that needs exact-width alignment to avoid looking broken across
-//! terminals, and a left-bordered card (no right border to close) sidesteps
-//! that risk entirely while still reading as a proper "welcome" screen.
+//! The startup banner: a small hexagon mark (honeycomb cluster — "hive")
+//! plus the wordmark, nothing else. Deliberately not literal ASCII-art
+//! outline reproduction of the logo — exact multi-line silhouettes are easy
+//! to misalign without live rendering to check against, and a scattered
+//! cluster degrades gracefully (a stray space just looks like a cluster,
+//! not a broken shape) where a precise outline wouldn't.
+//!
+//! No session info here on purpose (tier/model/workdir/tools) — that used
+//! to print every boot and it was just noise; `/tier` shows the active
+//! tier on demand instead.
 
-use std::path::Path;
+const CYAN: &str = "\x1b[96m";
+const BOLD_CYAN: &str = "\x1b[1;96m";
+const RESET: &str = "\x1b[0m";
 
-use harness_config::Resolved;
-
-pub fn print(resolved: &Resolved, workdir: &Path, tools: &str) {
-    println!("\x1b[36m┌─ HiveMind ─────────────────────────────────\x1b[0m");
-    println!(
-        "\x1b[36m│\x1b[0m DeepSeek coding agent · v{}",
-        env!("CARGO_PKG_VERSION")
-    );
-    println!(
-        "\x1b[36m│\x1b[0m tier={} · flash={} · pro={}",
-        resolved.policy.default_tier, resolved.flash.wire_id, resolved.pro.wire_id
-    );
-    println!("\x1b[36m│\x1b[0m workdir={}", workdir.display());
-    println!("\x1b[36m│\x1b[0m tools=[{tools}]");
-    println!("\x1b[36m└─────────────────────────────────────────────\x1b[0m");
+pub fn print() {
+    println!();
+    println!("{CYAN}         ⬡ ⬡ ⬡{RESET}");
+    println!("{CYAN}        ⬡ ⬡ ⬡ ⬡{RESET}");
+    println!("{CYAN}         ⬡ ⬡ ⬡{RESET}");
+    println!();
+    println!("{BOLD_CYAN}      H I V E M I N D{RESET}");
+    println!();
 }

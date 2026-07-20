@@ -135,7 +135,6 @@ async fn run(args: ActivateArgs) -> anyhow::Result<()> {
         bash = bash.with_approval(Arc::new(ui::terminal_approve));
     }
     registry.register(Arc::new(bash));
-    let tool_names = registry.names().join(", ");
 
     let ui: Arc<TermUi> = Arc::new(TermUi::new(args.show_reasoning));
     let mut agent = Agent::new(
@@ -144,8 +143,6 @@ async fn run(args: ActivateArgs) -> anyhow::Result<()> {
         ui.clone(),
         SYSTEM_PROMPT.to_string(),
     );
-
-    banner::print(&resolved, &workdir, &tool_names);
 
     if let Some(prompt) = &args.prompt {
         let expanded = mentions::expand_mentions(prompt, &ws);
@@ -157,7 +154,8 @@ async fn run(args: ActivateArgs) -> anyhow::Result<()> {
 }
 
 async fn repl(agent: &mut Agent, ws: Workspace, ui: Arc<TermUi>) -> anyhow::Result<()> {
-    println!("Type your request, or /help for commands. @path references a file. Ctrl-D to quit.");
+    banner::print();
+    println!("\x1b[90mTry /help for commands · @ to reference a file · Ctrl-D to quit\x1b[0m");
 
     let history_path = harness_config::default_config_path()
         .parent()

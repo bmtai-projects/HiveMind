@@ -1,12 +1,14 @@
-//! The interactive line editor: history, and Tab-triggered completion for
-//! `/` commands and `@` file references (see [`crate::completion`]).
+//! The interactive line editor: history, and completion for `/` commands
+//! and `@` file references (see [`crate::completion`]) that pops up as soon
+//! as you type the trigger character — no Tab needed, though Tab still
+//! opens/cycles it too.
 
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
 use reedline::{
-    ColumnarMenu, DefaultHinter, Emacs, FileBackedHistory, KeyCode, KeyModifiers, MenuBuilder,
-    Prompt, PromptEditMode, PromptHistorySearch, PromptHistorySearchStatus, Reedline,
+    ColumnarMenu, DefaultHinter, EditCommand, Emacs, FileBackedHistory, KeyCode, KeyModifiers,
+    MenuBuilder, Prompt, PromptEditMode, PromptHistorySearch, PromptHistorySearchStatus, Reedline,
     ReedlineEvent, ReedlineMenu, default_emacs_keybindings,
 };
 
@@ -30,6 +32,22 @@ pub fn build_line_editor(workdir: &Path, history_path: Option<PathBuf>) -> Reedl
             ReedlineEvent::MenuNext,
         ]),
     );
+    // Typing '@' or '/' inserts the character *and* opens the menu in the
+    // same keystroke -- matches the "type the trigger, suggestions just
+    // appear" feel instead of requiring a Tab press afterward. The
+    // completer itself still decides what (if anything) matches, so typing
+    // '/' mid-sentence (e.g. "src/main.rs") just opens an empty menu, not
+    // an error.
+    for trigger in ['@', '/'] {
+        keybindings.add_binding(
+            KeyModifiers::NONE,
+            KeyCode::Char(trigger),
+            ReedlineEvent::Multiple(vec![
+                ReedlineEvent::Edit(vec![EditCommand::InsertChar(trigger)]),
+                ReedlineEvent::Menu(MENU_NAME.to_string()),
+            ]),
+        );
+    }
     let edit_mode = Box::new(Emacs::new(keybindings));
 
     let mut line_editor = Reedline::create()
