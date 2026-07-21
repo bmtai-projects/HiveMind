@@ -416,6 +416,7 @@ dependencies = [
  "harness-provider",
  "harness-tools",
  "harness-types",
+ "serde_json",
  "tokio",
 ]
 
@@ -431,6 +432,9 @@ dependencies = [
  "harness-tools",
  "harness-types",
  "reedline",
+ "reqwest",
+ "serde",
+ "serde_json",
  "tokio",
  "walkdir",
 ]
@@ -470,6 +474,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.19",
  "tokio",
+ "walkdir",
 ]
 
 [[package]]

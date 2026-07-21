@@ -20,3 +20,6 @@ clap = { workspace = true }
 anyhow = { workspace = true }
 reedline = { workspace = true }
 walkdir = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

@@ -4,6 +4,7 @@
 //! automatically when the agent looks stuck). See the workspace README for
 //! the full architecture and optimization notes.
 
+mod auth;
 mod banner;
 mod commands;
 mod completion;
@@ -20,17 +21,26 @@ use reedline::Signal;
 use commands::{SlashCommand, TierArg};
 use harness_agent::Agent;
 use harness_config::{CliOverrides, Tier};
-use harness_tools::{Bash, ListDir, ReadFile, Registry, Workspace, WriteFile};
+use harness_tools::{
+    Bash, EditFile, ListDir, ReadFile, Registry, Search, SemanticSearch, Workspace, WriteFile,
+};
 use input::HivePrompt;
 use ui::TermUi;
 
 const SYSTEM_PROMPT: &str =
     "You are a terminal-based coding agent operating inside a user's workspace.
 
-You can read and write files, list directories, and run shell commands via the
-provided tools. Work in small, verifiable steps:
+You can search, read, create, and edit files, list directories, and run shell
+commands via the provided tools. Work in small, verifiable steps:
 
-- Investigate before acting: read files and list directories to build context.
+- Investigate before acting: use `search` for an exact string, or
+  `semantic_search` to find code by concept when you don't know the symbol
+  (prefer both over shell grep); then `read_file` and `list_dir` for detail.
+- To change an existing file, use `edit_file` — an exact old_string→new_string
+  replacement. It is cheaper than rewriting the file and cannot corrupt the
+  parts you leave untouched. Copy `old_string` verbatim from the file
+  (whitespace included) and give enough context that it matches one place.
+  Reserve `write_file` for creating new files.
 - Make focused changes, then verify them (build/test/inspect) with run_shell.
 - Prefer tools over guessing. Never claim you did something you did not do.
 - When the task is complete, stop calling tools and give a short final summary
@@ -53,6 +63,28 @@ struct Cli {
 enum Command {
     /// Start the agent — interactive REPL, or headless with --prompt.
     Activate(ActivateArgs),
+    /// Manage your HiveMind hosted account (sign in, sign out, check balance).
+    Auth(AuthArgs),
+}
+
+#[derive(Args)]
+struct AuthArgs {
+    #[command(subcommand)]
+    action: AuthAction,
+}
+
+#[derive(Subcommand)]
+enum AuthAction {
+    /// Sign in via the browser and store a hosted access token.
+    Login {
+        /// Override the hosted API base (mainly for testing against a non-production deployment).
+        #[arg(long)]
+        api_base: Option<String>,
+    },
+    /// Remove the stored hosted access token.
+    Logout,
+    /// Show whether you're signed in, and your balance.
+    Status,
 }
 
 #[derive(Args)]
@@ -93,8 +125,15 @@ struct ActivateArgs {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    let Command::Activate(args) = cli.command;
-    if let Err(e) = run(args).await {
+    let result = match cli.command {
+        Command::Activate(args) => run(args).await,
+        Command::Auth(args) => match args.action {
+            AuthAction::Login { api_base } => auth::login(api_base).await,
+            AuthAction::Logout => auth::logout().await,
+            AuthAction::Status => auth::status().await,
+        },
+    };
+    if let Err(e) = result {
         eprintln!("\nerror: {e:#}");
         std::process::exit(1);
     }
@@ -116,7 +155,11 @@ async fn run(args: ActivateArgs) -> anyhow::Result<()> {
             .transpose()
             .map_err(|e| anyhow::anyhow!("{e}"))?,
     };
-    let resolved = harness_config::resolve(&config_path, overrides)?;
+    let resolved = harness_config::resolve(
+        &config_path,
+        &harness_config::default_credentials_path(),
+        overrides,
+    )?;
 
     let workdir = args
         .workdir
@@ -128,7 +171,10 @@ async fn run(args: ActivateArgs) -> anyhow::Result<()> {
     let ws = Workspace::new(workdir.clone());
     registry.register(Arc::new(ReadFile(ws.clone())));
     registry.register(Arc::new(WriteFile(ws.clone())));
+    registry.register(Arc::new(EditFile(ws.clone())));
     registry.register(Arc::new(ListDir(ws.clone())));
+    registry.register(Arc::new(Search(ws.clone())));
+    registry.register(Arc::new(SemanticSearch::new(ws.clone())));
 
     let mut bash = Bash::new(workdir.clone());
     if !args.yolo && !headless {
