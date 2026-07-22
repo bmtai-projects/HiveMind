@@ -1,6 +1,6 @@
 //! `hivemind auth login|logout|status` — the device-flow client for
 //! HiveMind's hosted backend (`HiveMind-server`). Talks HTTP directly
-//! (not through `harness-provider`, which is scoped to the DeepSeek-shaped
+//! (not through `harness-provider`, which is scoped to the model provider's
 //! chat-completions SSE dialect, not this JSON control-plane API).
 //!
 //! Once logged in, `resolve()` in `harness-config` picks up the stored

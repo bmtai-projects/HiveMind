@@ -1,4 +1,4 @@
-//! `hivemind` — a fast, cost-optimized DeepSeek coding agent.
+//! `hivemind` — a fast, cost-optimized AI coding agent.
 //!
 //! Two tiers only, for now: Flash (default, cheap) and Pro (escalated to
 //! automatically when the agent looks stuck). See the workspace README for
@@ -52,7 +52,7 @@ Be concise. Reference files by path.";
 #[command(
     name = "hivemind",
     version,
-    about = "A fast, cost-optimized DeepSeek coding agent"
+    about = "A fast, cost-optimized AI coding agent"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -105,11 +105,11 @@ struct ActivateArgs {
     #[arg(long)]
     tier: Option<String>,
 
-    /// Override the DeepSeek API key (else $DEEPSEEK_API_KEY or config.toml).
+    /// Override the HiveMind API key (else $HIVEMIND_API_KEY or config.toml).
     #[arg(long)]
     api_key: Option<String>,
 
-    /// Override the DeepSeek base URL (e.g. to point at a proxy or mock).
+    /// Override the model API base URL (e.g. to point at a proxy or mock).
     #[arg(long)]
     base_url: Option<String>,
 
@@ -117,7 +117,7 @@ struct ActivateArgs {
     #[arg(long)]
     yolo: bool,
 
-    /// Print streamed model reasoning (deepseek-v4-pro).
+    /// Print streamed model reasoning (Pro tier only).
     #[arg(long)]
     show_reasoning: bool,
 }

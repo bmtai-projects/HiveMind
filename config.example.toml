@@ -1,8 +1,9 @@
-# Copy to ~/.config/harness/config.toml (or pass --config path/to/this).
-# Every field is optional — the harness works with only $DEEPSEEK_API_KEY set.
+# Copy to ~/.config/hivemind/config.toml (or pass --config path/to/this).
+# Every field is optional — the harness works with only $HIVEMIND_API_KEY set,
+# or `hivemind auth login` for hosted mode (no key needed at all).
 
-[deepseek]
-# api_key = "sk-..."        # prefer $DEEPSEEK_API_KEY; only set this for local experiments
+[model]
+# api_key = "sk-..."        # prefer $HIVEMIND_API_KEY; only set this for local experiments
 # base_url = "https://api.deepseek.com"
 # flash_model = "deepseek-v4-flash"
 # pro_model = "deepseek-v4-pro"

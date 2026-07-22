@@ -2,7 +2,7 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum ProviderError {
-    #[error("deepseek http {status}: {body}")]
+    #[error("hivemind http {status}: {body}")]
     Http {
         status: u16,
         body: String,

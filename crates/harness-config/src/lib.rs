@@ -1,15 +1,19 @@
-//! Config resolution: which DeepSeek endpoint, which tier, and where the key
+//! Config resolution: which model endpoint, which tier, and where the key
 //! comes from.
 //!
 //! Resolution order (highest wins): CLI flag > `config.toml` >
-//! `$DEEPSEEK_API_KEY` environment variable > stored hosted credentials
+//! `$HIVEMIND_API_KEY` environment variable > stored hosted credentials
 //! (`hivemind auth login`). This intentionally mirrors grok-build's own
 //! precedence (`SamplerConfig` construction in `xai-grok-sampler::config`),
-//! extended with the hosted fallback.
+//! extended with the hosted fallback. `$DEEPSEEK_API_KEY` and the legacy
+//! `[deepseek]` config section are still accepted silently, underneath
+//! `$HIVEMIND_API_KEY`/`[model]`, so nothing set up before this rename
+//! breaks.
 //!
-//! Scoped to DeepSeek only for now (Flash + Pro tiers), per the current
-//! product decision — but `Endpoint` is kept separate from tier/pricing data
-//! so a second provider is an additive module later, not a rewrite.
+//! Scoped to one upstream model provider for now (Flash + Pro tiers), per
+//! the current product decision — but `Endpoint` is kept separate from
+//! tier/pricing data so a second provider is an additive module later, not
+//! a rewrite.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -17,7 +21,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-/// The two DeepSeek tiers this harness ships. `Flash` is the default for
+/// The two model tiers this harness ships. `Flash` is the default for
 /// every turn; `Pro` is used for explicit escalation (harder tasks, or
 /// automatic escalation after repeated failure — see `harness-agent`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -68,7 +72,7 @@ pub struct ModelInfo {
     pub pricing: Pricing,
 }
 
-/// Resolved DeepSeek endpoint: where to send requests and with what key.
+/// Resolved model endpoint: where to send requests and with what key.
 #[derive(Debug, Clone)]
 pub struct Endpoint {
     pub base_url: String,
@@ -124,13 +128,18 @@ impl Resolved {
 #[derive(Debug, Default, Deserialize)]
 struct File {
     #[serde(default)]
-    deepseek: DeepSeekSection,
+    model: ModelSection,
+    // Legacy alias for `[model]`, from before the section was renamed.
+    // Still parsed, silently, so a config.toml written before this rename
+    // keeps working; never mentioned in anything user-facing going forward.
+    #[serde(default)]
+    deepseek: ModelSection,
     #[serde(default)]
     agent: AgentSection,
 }
 
 #[derive(Debug, Default, Deserialize)]
-struct DeepSeekSection {
+struct ModelSection {
     api_key: Option<String>,
     base_url: Option<String>,
     flash_model: Option<String>,
@@ -161,8 +170,8 @@ pub enum ConfigError {
         source: toml::de::Error,
     },
     #[error(
-        "no DeepSeek API key found — run `hivemind auth login`, set $DEEPSEEK_API_KEY, pass \
-         --api-key, or add `api_key` under [deepseek] in your config file"
+        "no HiveMind API key found — run `hivemind auth login`, set $HIVEMIND_API_KEY, pass \
+         --api-key, or add `api_key` under [model] in your config file"
     )]
     MissingKey,
     #[error("invalid tier: {0}")]
@@ -180,8 +189,8 @@ pub enum ConfigError {
     },
 }
 
-/// Prices as of 2026-07 — approximate, and DeepSeek can change them without
-/// notice. Override via `config.toml` if these drift.
+/// Prices as of 2026-07 — approximate, and the upstream provider can change
+/// them without notice. Override via `config.toml` if these drift.
 fn default_flash_pricing() -> Pricing {
     Pricing {
         input_cache_miss_per_m: 0.14,
@@ -236,16 +245,19 @@ pub fn resolve(
     let explicit_key = cli
         .api_key
         .clone()
+        .or_else(|| file.model.api_key.clone())
         .or_else(|| file.deepseek.api_key.clone())
+        .or_else(|| std::env::var("HIVEMIND_API_KEY").ok())
         .or_else(|| std::env::var("DEEPSEEK_API_KEY").ok())
         .filter(|k| !k.is_empty());
     let base_url_override = cli
         .base_url
         .clone()
+        .or_else(|| file.model.base_url.clone())
         .or_else(|| file.deepseek.base_url.clone());
 
     // A hosted token is only ever paired with its own api_base — never the
-    // bare DeepSeek default — unless an explicit override says otherwise
+    // bare upstream default — unless an explicit override says otherwise
     // (e.g. pointing a hosted token at a local mock for testing).
     let (api_key, base_url) = match explicit_key {
         Some(key) => (
@@ -262,12 +274,14 @@ pub fn resolve(
     };
 
     let flash_wire_id = file
-        .deepseek
+        .model
         .flash_model
+        .or(file.deepseek.flash_model)
         .unwrap_or_else(|| "deepseek-v4-flash".to_string());
     let pro_wire_id = file
-        .deepseek
+        .model
         .pro_model
+        .or(file.deepseek.pro_model)
         .unwrap_or_else(|| "deepseek-v4-pro".to_string());
 
     let mut policy = AgentPolicy::default();
@@ -404,6 +418,16 @@ fn dirs_home() -> Option<std::path::PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    // `cargo test` runs tests in this file concurrently by default, but
+    // HIVEMIND_API_KEY/DEEPSEEK_API_KEY are process-wide state -- two tests
+    // mutating them at once produces exactly the kind of intermittent
+    // failure that's easy to dismiss as flaky and hard to reproduce later.
+    // Every test below that touches either var locks this first, for its
+    // whole duration (guard held until scope end), so they're serialized
+    // against each other without slowing down or affecting unrelated tests.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn tier_parses_case_insensitively() {
@@ -414,8 +438,12 @@ mod tests {
 
     #[test]
     fn missing_key_is_an_error_when_env_and_credentials_unset() {
-        // SAFETY: test-only env mutation, single-threaded within this test.
-        unsafe { std::env::remove_var("DEEPSEEK_API_KEY") };
+        let _guard = ENV_LOCK.lock().unwrap();
+        // SAFETY: test-only env mutation, serialized via ENV_LOCK above.
+        unsafe {
+            std::env::remove_var("HIVEMIND_API_KEY");
+            std::env::remove_var("DEEPSEEK_API_KEY");
+        };
         let result = resolve(
             Path::new("/nonexistent/config.toml"),
             Path::new("/nonexistent/credentials.toml"),
@@ -426,7 +454,11 @@ mod tests {
 
     #[test]
     fn cli_key_wins_without_env() {
-        unsafe { std::env::remove_var("DEEPSEEK_API_KEY") };
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("HIVEMIND_API_KEY");
+            std::env::remove_var("DEEPSEEK_API_KEY");
+        };
         let cli = CliOverrides {
             api_key: Some("sk-test".into()),
             ..Default::default()
@@ -440,6 +472,77 @@ mod tests {
         assert_eq!(resolved.endpoint.api_key, "sk-test");
         assert_eq!(resolved.flash.wire_id, "deepseek-v4-flash");
         assert_eq!(resolved.policy.default_tier, Tier::Flash);
+    }
+
+    #[test]
+    fn hivemind_api_key_wins_over_legacy_deepseek_api_key() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var("HIVEMIND_API_KEY", "hm-key");
+            std::env::set_var("DEEPSEEK_API_KEY", "ds-key");
+        };
+        let resolved = resolve(
+            Path::new("/nonexistent/config.toml"),
+            Path::new("/nonexistent/credentials.toml"),
+            CliOverrides::default(),
+        )
+        .unwrap();
+        assert_eq!(resolved.endpoint.api_key, "hm-key");
+        unsafe {
+            std::env::remove_var("HIVEMIND_API_KEY");
+            std::env::remove_var("DEEPSEEK_API_KEY");
+        };
+    }
+
+    #[test]
+    fn legacy_deepseek_api_key_still_works_alone() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("HIVEMIND_API_KEY");
+            std::env::set_var("DEEPSEEK_API_KEY", "ds-key");
+        };
+        let resolved = resolve(
+            Path::new("/nonexistent/config.toml"),
+            Path::new("/nonexistent/credentials.toml"),
+            CliOverrides::default(),
+        )
+        .unwrap();
+        assert_eq!(resolved.endpoint.api_key, "ds-key");
+        unsafe { std::env::remove_var("DEEPSEEK_API_KEY") };
+    }
+
+    #[test]
+    fn model_section_wins_over_legacy_deepseek_section() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("HIVEMIND_API_KEY");
+            std::env::remove_var("DEEPSEEK_API_KEY");
+        };
+        let dir =
+            std::env::temp_dir().join(format!("hivemind-test-section-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("config.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+            [model]
+            api_key = "new-section-key"
+
+            [deepseek]
+            api_key = "legacy-section-key"
+            "#,
+        )
+        .unwrap();
+
+        let resolved = resolve(
+            &config_path,
+            Path::new("/nonexistent/credentials.toml"),
+            CliOverrides::default(),
+        )
+        .unwrap();
+        assert_eq!(resolved.endpoint.api_key, "new-section-key");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -470,7 +573,11 @@ mod tests {
 
     #[test]
     fn resolve_falls_back_to_hosted_credentials_when_no_explicit_key() {
-        unsafe { std::env::remove_var("DEEPSEEK_API_KEY") };
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("HIVEMIND_API_KEY");
+            std::env::remove_var("DEEPSEEK_API_KEY");
+        };
         let dir =
             std::env::temp_dir().join(format!("hivemind-test-fallback-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -501,7 +608,11 @@ mod tests {
 
     #[test]
     fn explicit_base_url_override_wins_even_with_hosted_credentials() {
-        unsafe { std::env::remove_var("DEEPSEEK_API_KEY") };
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("HIVEMIND_API_KEY");
+            std::env::remove_var("DEEPSEEK_API_KEY");
+        };
         let dir =
             std::env::temp_dir().join(format!("hivemind-test-override-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
