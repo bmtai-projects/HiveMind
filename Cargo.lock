@@ -416,6 +416,8 @@ dependencies = [
  "harness-provider",
  "harness-tools",
  "harness-types",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 

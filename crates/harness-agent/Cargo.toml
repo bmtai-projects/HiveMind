@@ -12,3 +12,5 @@ harness-provider = { workspace = true }
 harness-tools = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

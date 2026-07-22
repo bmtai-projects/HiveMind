@@ -4,7 +4,7 @@
 use harness_config::Tier;
 
 pub const COMMAND_NAMES: &[&str] = &[
-    "/help", "/clear", "/compact", "/tier", "/cost", "/exit", "/quit",
+    "/help", "/clear", "/compact", "/tier", "/cost", "/undo", "/exit", "/quit",
 ];
 
 pub const HELP_TEXT: &str = "\
@@ -13,6 +13,8 @@ Commands:
   /compact           fold older turns into a summary now
   /tier [flash|pro]  show or switch the active tier
   /cost              show session cost so far
+  /undo [n]          undo the last n turns (default 1): restores edited/written
+                     files and truncates the conversation back to before them
   /clear             clear the terminal
   /exit, /quit       leave
 Reference a file inline with @path/to/file (tab-completes).";
@@ -23,12 +25,18 @@ pub enum TierArg {
     Invalid(String),
 }
 
+pub enum UndoArg {
+    Count(usize),
+    Invalid(String),
+}
+
 pub enum SlashCommand {
     Help,
     Clear,
     Compact,
     Tier(TierArg),
     Cost,
+    Undo(UndoArg),
     Exit,
     Unknown(String),
 }
@@ -53,6 +61,13 @@ pub fn parse(line: &str) -> Option<SlashCommand> {
                 .unwrap_or_else(|_| TierArg::Invalid(a.to_string())),
         }),
         "cost" | "usage" => SlashCommand::Cost,
+        "undo" => SlashCommand::Undo(match arg {
+            None => UndoArg::Count(1),
+            Some(a) => a
+                .parse::<usize>()
+                .map(UndoArg::Count)
+                .unwrap_or_else(|_| UndoArg::Invalid(a.to_string())),
+        }),
         "exit" | "quit" | "q" => SlashCommand::Exit,
         other => SlashCommand::Unknown(other.to_string()),
     })
@@ -108,6 +123,30 @@ mod tests {
         match parse("/tier fastt") {
             Some(SlashCommand::Tier(TierArg::Invalid(s))) => assert_eq!(s, "fastt"),
             other => panic!("expected Invalid(\"fastt\"), got {}", other.is_some()),
+        }
+    }
+
+    #[test]
+    fn undo_with_no_arg_means_one() {
+        assert!(matches!(
+            parse("/undo"),
+            Some(SlashCommand::Undo(UndoArg::Count(1)))
+        ));
+    }
+
+    #[test]
+    fn undo_with_valid_arg_means_that_many() {
+        assert!(matches!(
+            parse("/undo 3"),
+            Some(SlashCommand::Undo(UndoArg::Count(3)))
+        ));
+    }
+
+    #[test]
+    fn undo_with_bad_arg_is_invalid_not_silently_ignored() {
+        match parse("/undo all") {
+            Some(SlashCommand::Undo(UndoArg::Invalid(s))) => assert_eq!(s, "all"),
+            other => panic!("expected Invalid(\"all\"), got {}", other.is_some()),
         }
     }
 

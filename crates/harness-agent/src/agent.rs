@@ -6,9 +6,10 @@ use std::sync::Arc;
 
 use harness_config::{AgentPolicy, ModelInfo, Resolved, Tier};
 use harness_provider::DeepSeekClient;
-use harness_tools::Registry;
+use harness_tools::{Registry, Workspace};
 use harness_types::{ChatRequest, Message, Role, StreamEvent, ToolCall};
 
+use crate::checkpoint::{self, Checkpoint, UndoReport};
 use crate::compaction::{CompactionPolicy, maybe_compact};
 use crate::ui::Ui;
 
@@ -33,12 +34,20 @@ pub struct Agent {
     /// to the previous turn's, or produced a tool error.
     repeat_count: u32,
     last_call_signature: Option<String>,
+
+    /// Used only to snapshot/restore files for `/undo` -- reuses the exact
+    /// same path-escape check the file tools themselves enforce.
+    workspace: Workspace,
+    /// One entry per completed `run()` call, oldest first. See
+    /// `crate::checkpoint` for why `run_shell` doesn't participate.
+    checkpoints: Vec<Checkpoint>,
 }
 
 impl Agent {
     pub fn new(
         resolved: Resolved,
         tools: Registry,
+        workspace: Workspace,
         ui: Arc<dyn Ui>,
         system_prompt: String,
     ) -> Self {
@@ -68,6 +77,8 @@ impl Agent {
             context_window,
             repeat_count: 0,
             last_call_signature: None,
+            workspace,
+            checkpoints: Vec::new(),
         }
     }
 
@@ -139,6 +150,7 @@ impl Agent {
         self.current_tier = self.policy.default_tier;
         self.repeat_count = 0;
         self.last_call_signature = None;
+        let mut checkpoint = Checkpoint::open(user_input, self.messages.len());
         self.messages.push(Message::user(user_input.to_string()));
 
         for _turn in 0..self.policy.max_turns {
@@ -179,18 +191,30 @@ impl Agent {
             });
 
             if !has_tool_calls {
+                checkpoint::push(&mut self.checkpoints, checkpoint);
                 return Ok(());
             }
 
-            self.dispatch_and_record(calls_for_dispatch).await;
+            self.dispatch_and_record(calls_for_dispatch, &mut checkpoint)
+                .await;
             let signature = self.messages_tail_signature();
             self.update_escalation(&signature);
         }
 
+        checkpoint::push(&mut self.checkpoints, checkpoint);
         anyhow::bail!(
             "reached max turns ({}) without completing",
             self.policy.max_turns
         )
+    }
+
+    /// Undo the last `n` completed turns: every file `edit_file`/
+    /// `write_file` touched during them is restored to its pre-turn state
+    /// (or deleted, if the turn created it), and the conversation is
+    /// truncated back to before the oldest of the `n` turns. `None` if
+    /// there was nothing to undo.
+    pub async fn undo(&mut self, n: usize) -> Option<UndoReport> {
+        checkpoint::undo(&mut self.checkpoints, &mut self.messages, n).await
     }
 
     async fn drain_stream(
@@ -220,8 +244,12 @@ impl Agent {
     }
 
     /// Run every requested tool call concurrently, notify the UI, and push
-    /// each result to history in the calls' original order.
-    async fn dispatch_and_record(&mut self, calls: Vec<ToolCall>) {
+    /// each result to history in the calls' original order. Snapshots any
+    /// file an `edit_file`/`write_file` call is about to touch into
+    /// `checkpoint` *before* dispatching, so `/undo` has something to
+    /// restore to.
+    async fn dispatch_and_record(&mut self, calls: Vec<ToolCall>, checkpoint: &mut Checkpoint) {
+        checkpoint.capture(&self.workspace, &calls).await;
         for call in &calls {
             self.ui.tool_start(&call.name, call.args.get());
         }

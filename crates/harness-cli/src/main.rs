@@ -18,7 +18,7 @@ use std::sync::Arc;
 use clap::{Args, Parser, Subcommand};
 use reedline::Signal;
 
-use commands::{SlashCommand, TierArg};
+use commands::{SlashCommand, TierArg, UndoArg};
 use harness_agent::Agent;
 use harness_config::{CliOverrides, Tier};
 use harness_tools::{
@@ -186,6 +186,7 @@ async fn run(args: ActivateArgs) -> anyhow::Result<()> {
     let mut agent = Agent::new(
         resolved.clone(),
         registry,
+        ws.clone(),
         ui.clone(),
         SYSTEM_PROMPT.to_string(),
     );
@@ -247,6 +248,20 @@ async fn repl(agent: &mut Agent, ws: Workspace, ui: Arc<TermUi>) -> anyhow::Resu
                     println!("unknown tier {bad:?} — expected \"flash\" or \"pro\"");
                 }
                 SlashCommand::Cost => println!("session cost so far: ${:.6}", ui.session_cost()),
+                SlashCommand::Undo(UndoArg::Count(n)) => match agent.undo(n).await {
+                    Some(report) => println!(
+                        "undid {} turn(s) (last: {:?}): {} file(s) restored, {} file(s) removed, {} message(s) left",
+                        report.turns_undone,
+                        report.label,
+                        report.files_restored,
+                        report.files_removed,
+                        report.messages_truncated_to
+                    ),
+                    None => println!("nothing to undo yet"),
+                },
+                SlashCommand::Undo(UndoArg::Invalid(bad)) => {
+                    println!("invalid /undo count {bad:?} — expected a number, e.g. /undo 2");
+                }
                 SlashCommand::Exit => return Ok(()),
                 SlashCommand::Unknown(name) => println!("unknown command /{name} — try /help"),
             }

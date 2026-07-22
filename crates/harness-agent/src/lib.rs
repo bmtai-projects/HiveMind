@@ -4,9 +4,11 @@
 //! DeepSeek's two tiers.
 
 mod agent;
+mod checkpoint;
 mod compaction;
 mod ui;
 
 pub use agent::Agent;
+pub use checkpoint::UndoReport;
 pub use compaction::{CompactionPolicy, CompactionReport};
 pub use ui::Ui;
