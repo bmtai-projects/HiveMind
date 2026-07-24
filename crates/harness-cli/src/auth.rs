@@ -63,6 +63,19 @@ pub async fn login(api_base_override: Option<String>) -> anyhow::Result<()> {
         "(or go to {} and enter the code {})",
         start.verification_uri, start.user_code
     );
+
+    // Best-effort: open it automatically, the way `gh auth login` does.
+    // Headless/SSH/container environments have no browser to open (no
+    // $DISPLAY, no xdg-open, etc.) -- that's expected there, not a login
+    // failure, so a failure here only degrades to the manual URL already
+    // printed above rather than aborting.
+    match open::that(&start.verification_uri_complete) {
+        Ok(()) => println!("Opening in your browser..."),
+        Err(e) => {
+            println!("(couldn't open a browser automatically: {e} — open the URL above manually)")
+        }
+    }
+
     println!("\nWaiting for approval...");
 
     let deadline = std::time::Instant::now() + Duration::from_secs(start.expires_in);
