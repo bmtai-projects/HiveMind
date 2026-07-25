@@ -14,3 +14,21 @@ max_turns = 25                      # hard cap on sample<->tool cycles per input
 compaction_threshold_percent = 75   # summarize older turns once usage crosses this % of the context window
 auto_escalate = true                # bump flash -> pro after repeated/failing tool calls on one task
 escalate_after_repeats = 2          # consecutive repeats/errors before escalating
+
+# Zero or more hooks. `event` is "pre_tool_use" (can block a call before it
+# runs) or "post_tool_use" (observes after; can't block). `matcher` limits
+# which tool names it applies to — omit it to match every tool. `command`
+# is spawned the same way run_shell spawns (bash -lc <command>), with a
+# JSON envelope on its stdin: {event, tool_name, tool_args, tool_result?,
+# workspace_root}. A hook denies by either printing
+# {"decision":"deny","reason":"..."} to stdout, or exiting 2 (matching
+# Claude Code's own hook convention) with no output. Any other outcome —
+# including a crash or timeout — allows the call through: a broken hook
+# must never be able to wedge the agent.
+#
+# [[hooks]]
+# name = "block-force-push"
+# event = "pre_tool_use"
+# matcher = ["run_shell"]
+# command = 'grep -q "push --force" && exit 2 || exit 0'
+# timeout_ms = 5000

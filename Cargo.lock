@@ -409,7 +409,7 @@ dependencies = [
 
 [[package]]
 name = "harness-agent"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "anyhow",
  "harness-config",
@@ -423,7 +423,7 @@ dependencies = [
 
 [[package]]
 name = "harness-cli"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "anyhow",
  "clap",
@@ -443,7 +443,7 @@ dependencies = [
 
 [[package]]
 name = "harness-config"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "serde",
  "thiserror 2.0.19",
@@ -452,7 +452,7 @@ dependencies = [
 
 [[package]]
 name = "harness-provider"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "async-trait",
  "bytes",
@@ -468,7 +468,7 @@ dependencies = [
 
 [[package]]
 name = "harness-tools"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "async-trait",
  "harness-types",
@@ -481,7 +481,7 @@ dependencies = [
 
 [[package]]
 name = "harness-types"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "serde",
  "serde_json",

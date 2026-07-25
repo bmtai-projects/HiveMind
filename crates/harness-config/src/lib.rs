@@ -105,6 +105,40 @@ impl Default for AgentPolicy {
     }
 }
 
+/// Which moment a hook fires at. `PreToolUse` can veto a call before it
+/// runs; `PostToolUse` only observes what already happened — see
+/// `harness_agent::hooks` for why that asymmetry is deliberate, not a gap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HookEvent {
+    PreToolUse,
+    PostToolUse,
+}
+
+fn default_hook_timeout_ms() -> u64 {
+    5_000
+}
+
+/// One `[[hooks]]` entry from `config.toml`. Execution (spawning, the
+/// stdin envelope, exit-code/JSON decision parsing) lives in
+/// `harness_agent::hooks`, not here — this crate only owns the declarative
+/// shape, matching how `AgentPolicy` is data and its enforcement lives in
+/// `harness_agent`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct HookSpec {
+    pub name: String,
+    pub event: HookEvent,
+    /// Tool names this hook applies to. `None` (the field omitted) means
+    /// every tool.
+    #[serde(default)]
+    pub matcher: Option<Vec<String>>,
+    /// Spawned the same way `run_shell` spawns (`bash -lc <command>`) in
+    /// the workspace root, with the event envelope written to stdin.
+    pub command: String,
+    #[serde(default = "default_hook_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
 /// Fully resolved runtime configuration.
 #[derive(Debug, Clone)]
 pub struct Resolved {
@@ -112,6 +146,7 @@ pub struct Resolved {
     pub flash: ModelInfo,
     pub pro: ModelInfo,
     pub policy: AgentPolicy,
+    pub hooks: Vec<HookSpec>,
 }
 
 impl Resolved {
@@ -136,6 +171,8 @@ struct File {
     deepseek: ModelSection,
     #[serde(default)]
     agent: AgentSection,
+    #[serde(default)]
+    hooks: Vec<HookSpec>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -317,6 +354,7 @@ pub fn resolve(
             pricing: default_pro_pricing(),
         },
         policy,
+        hooks: file.hooks,
     })
 }
 

@@ -6,6 +6,7 @@
 mod agent;
 mod checkpoint;
 mod compaction;
+mod hooks;
 mod ui;
 
 pub use agent::Agent;

@@ -4,13 +4,14 @@
 
 use std::sync::Arc;
 
-use harness_config::{AgentPolicy, ModelInfo, Resolved, Tier};
+use harness_config::{AgentPolicy, HookSpec, ModelInfo, Resolved, Tier};
 use harness_provider::DeepSeekClient;
 use harness_tools::{Registry, Workspace};
 use harness_types::{ChatRequest, Message, Role, StreamEvent, ToolCall};
 
 use crate::checkpoint::{self, Checkpoint, UndoReport};
 use crate::compaction::{CompactionPolicy, maybe_compact};
+use crate::hooks::{self, HookDecision};
 use crate::ui::Ui;
 
 /// Most-recent messages (after the system prompt) a compaction pass keeps
@@ -41,6 +42,9 @@ pub struct Agent {
     /// One entry per completed `run()` call, oldest first. See
     /// `crate::checkpoint` for why `run_shell` doesn't participate.
     checkpoints: Vec<Checkpoint>,
+    /// From `config.toml`'s `[[hooks]]`. Empty unless the user configured
+    /// any -- see `crate::hooks`.
+    hooks: Vec<HookSpec>,
 }
 
 impl Agent {
@@ -79,6 +83,7 @@ impl Agent {
             last_call_signature: None,
             workspace,
             checkpoints: Vec::new(),
+            hooks: resolved.hooks,
         }
     }
 
@@ -248,15 +253,38 @@ impl Agent {
     /// file an `edit_file`/`write_file` call is about to touch into
     /// `checkpoint` *before* dispatching, so `/undo` has something to
     /// restore to.
+    ///
+    /// Any call a `PreToolUse` hook denies is filtered out before dispatch
+    /// ever sees it -- it never runs, and the model gets a tool-result
+    /// carrying the denial reason (reusing the same `"ERROR:"` convention a
+    /// real tool failure already uses, so escalation/error-detection logic
+    /// downstream doesn't need to know hooks exist). `PostToolUse` hooks
+    /// run after, observationally, for calls that actually executed.
     async fn dispatch_and_record(&mut self, calls: Vec<ToolCall>, checkpoint: &mut Checkpoint) {
         checkpoint.capture(&self.workspace, &calls).await;
         for call in &calls {
             self.ui.tool_start(&call.name, call.args.get());
         }
-        let results = self.tools.dispatch_many(calls).await;
+
+        let workspace_root = self.workspace.root.to_string_lossy().into_owned();
+        let mut allowed = Vec::with_capacity(calls.len());
+        for call in calls {
+            match hooks::run_pre_tool_use(&self.hooks, &call, &workspace_root).await {
+                HookDecision::Allow => allowed.push(call),
+                HookDecision::Deny { reason, hook_name } => {
+                    let result = format!("ERROR: blocked by hook '{hook_name}': {reason}");
+                    self.ui.tool_end(&call.name, &result, true);
+                    self.messages
+                        .push(Message::tool_result(call.id, call.name, result));
+                }
+            }
+        }
+
+        let results = self.tools.dispatch_many(allowed).await;
         for (call, result) in results {
             let is_error = result.starts_with("ERROR:");
             self.ui.tool_end(&call.name, &result, is_error);
+            hooks::run_post_tool_use(&self.hooks, &call, &result, &workspace_root).await;
             self.messages
                 .push(Message::tool_result(call.id, call.name, result));
         }
