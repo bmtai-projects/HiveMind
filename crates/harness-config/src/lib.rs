@@ -699,8 +699,10 @@ mod tests {
             std::env::remove_var("HIVEMIND_API_KEY");
             std::env::remove_var("DEEPSEEK_API_KEY");
         };
-        let dir =
-            std::env::temp_dir().join(format!("hivemind-test-model-override-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "hivemind-test-model-override-{}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let creds_path = dir.join("credentials.toml");
         save_hosted_credentials(
