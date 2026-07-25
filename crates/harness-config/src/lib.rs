@@ -1,5 +1,4 @@
-//! Config resolution: which model endpoint, which tier, and where the key
-//! comes from.
+//! Config resolution: which model, and where the key comes from.
 //!
 //! Resolution order (highest wins): CLI flag > `config.toml` >
 //! `$HIVEMIND_API_KEY` environment variable > stored hosted credentials
@@ -10,66 +9,137 @@
 //! `$HIVEMIND_API_KEY`/`[model]`, so nothing set up before this rename
 //! breaks.
 //!
-//! Scoped to one upstream model provider for now (Flash + Pro tiers), per
-//! the current product decision — but `Endpoint` is kept separate from
-//! tier/pricing data so a second provider is an additive module later, not
-//! a rewrite.
+//! Model selection is a flat id string (`--model`/`config.toml`'s `[model]
+//! model`), not a fixed set of tiers: hosted mode (resolved via stored
+//! credentials) proxies through `HiveMind-server` to OpenRouter and can
+//! reach any of `KNOWN_MODELS`; BYOK mode (an explicit key) talks to the
+//! upstream provider directly, so its model id has to be whatever that
+//! provider actually recognizes.
 
-use std::fmt;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-/// The two model tiers this harness ships. `Flash` is the default for
-/// every turn; `Pro` is used for explicit escalation (harder tasks, or
-/// automatic escalation after repeated failure — see `harness-agent`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Tier {
-    Flash,
-    Pro,
-}
-
-impl fmt::Display for Tier {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Tier::Flash => "flash",
-            Tier::Pro => "pro",
-        })
-    }
-}
-
-impl std::str::FromStr for Tier {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_ascii_lowercase().as_str() {
-            "flash" => Ok(Tier::Flash),
-            "pro" => Ok(Tier::Pro),
-            other => Err(format!(
-                "unknown tier {other:?} (expected \"flash\" or \"pro\")"
-            )),
-        }
-    }
-}
-
-/// $/M-token pricing for one tier, used only for the live cost readout —
-/// never sent to the API. Editable via `config.toml` since providers change
-/// prices without notice.
-#[derive(Debug, Clone, Copy, Deserialize)]
+/// $/M-token wholesale pricing for one known model, used only for the live
+/// cost readout — never sent to the API. Mirrors
+/// `HiveMind-server/src/models.ts`'s `MODEL_ALLOWLIST` exactly (same
+/// numbers); update both together if OpenRouter's prices drift.
+#[derive(Debug, Clone, Copy)]
 pub struct Pricing {
-    pub input_cache_miss_per_m: f64,
-    pub input_cache_hit_per_m: f64,
+    pub input_per_m: f64,
+    pub input_cache_read_per_m: f64,
     pub output_per_m: f64,
 }
 
-/// Everything needed to sample one tier: wire model id, context window, and
-/// pricing for the cost readout.
-#[derive(Debug, Clone)]
-pub struct ModelInfo {
-    pub wire_id: String,
+/// One model HiveMind can select, whether hosted (resolved server-side to
+/// a real OpenRouter slug the client never sees) or a display entry for a
+/// model a BYOK user could point their own key at directly.
+#[derive(Debug, Clone, Copy)]
+pub struct ModelCatalogEntry {
+    pub id: &'static str,
+    pub display_name: &'static str,
     pub context_window: u64,
-    pub pricing: Pricing,
+    /// Wholesale cost. A hosted request is actually billed this times
+    /// `HOSTED_MARKUP_MULTIPLIER`; a BYOK request pays this directly, with
+    /// no HiveMind margin.
+    pub wholesale_pricing: Pricing,
+}
+
+/// Must match `HiveMind-server`'s `config.ts` `MARKUP_MULTIPLIER` default.
+/// There's no API that reports the server's real-time margin back to the
+/// CLI, so the hosted-mode cost readout is a best-effort display estimate,
+/// not a billing guarantee — the server's own reserve/settle is what
+/// actually decides a user's balance.
+pub const HOSTED_MARKUP_MULTIPLIER: f64 = 1.45;
+
+/// The 6 third-party coding models HiveMind resells, plus "hivemind"
+/// itself — branded on purpose; it wire-resolves to DeepSeek V4 Flash
+/// server-side, but nothing client-side ever spells that out; see
+/// `HiveMind-server/src/models.ts` and `src/proxy/upstream.ts` for where
+/// the alias is actually enforced (the stream relay rewrites every
+/// chunk's `model` field back to the alias before it reaches a client, so
+/// even raw traffic inspection doesn't leak it).
+pub const KNOWN_MODELS: &[ModelCatalogEntry] = &[
+    ModelCatalogEntry {
+        id: "hivemind",
+        display_name: "HiveMind",
+        context_window: 1_048_576,
+        wholesale_pricing: Pricing {
+            input_per_m: 0.0938,
+            input_cache_read_per_m: 0.01876,
+            output_per_m: 0.1876,
+        },
+    },
+    ModelCatalogEntry {
+        id: "claude-sonnet-5",
+        display_name: "Claude Sonnet 5",
+        context_window: 1_000_000,
+        wholesale_pricing: Pricing {
+            input_per_m: 2.0,
+            input_cache_read_per_m: 0.2,
+            output_per_m: 10.0,
+        },
+    },
+    ModelCatalogEntry {
+        id: "gpt-5.3-codex",
+        display_name: "GPT-5.3 Codex",
+        context_window: 400_000,
+        wholesale_pricing: Pricing {
+            input_per_m: 1.75,
+            input_cache_read_per_m: 0.175,
+            output_per_m: 14.0,
+        },
+    },
+    ModelCatalogEntry {
+        id: "gemini-3.1-pro",
+        display_name: "Gemini 3.1 Pro",
+        context_window: 1_048_576,
+        wholesale_pricing: Pricing {
+            input_per_m: 2.0,
+            input_cache_read_per_m: 0.2,
+            output_per_m: 12.0,
+        },
+    },
+    ModelCatalogEntry {
+        id: "grok-build",
+        display_name: "Grok Build 0.1",
+        context_window: 256_000,
+        wholesale_pricing: Pricing {
+            input_per_m: 1.0,
+            input_cache_read_per_m: 0.2,
+            output_per_m: 2.0,
+        },
+    },
+    ModelCatalogEntry {
+        id: "qwen3-coder-plus",
+        display_name: "Qwen3 Coder Plus",
+        context_window: 1_000_000,
+        wholesale_pricing: Pricing {
+            input_per_m: 0.65,
+            input_cache_read_per_m: 0.13,
+            output_per_m: 3.25,
+        },
+    },
+    ModelCatalogEntry {
+        id: "kimi-k2-code",
+        display_name: "Kimi K2.7 Code",
+        context_window: 262_144,
+        wholesale_pricing: Pricing {
+            input_per_m: 0.78,
+            input_cache_read_per_m: 0.15,
+            output_per_m: 3.5,
+        },
+    },
+];
+
+/// Look up display metadata for a model id. `None` for anything not in
+/// `KNOWN_MODELS` — a BYOK user can still send an arbitrary provider-native
+/// model string, it just won't have a display name or a live cost
+/// estimate; see callers in `harness-cli` for the graceful-degradation
+/// behavior.
+pub fn lookup_model(id: &str) -> Option<&'static ModelCatalogEntry> {
+    KNOWN_MODELS.iter().find(|m| m.id == id)
 }
 
 /// Resolved model endpoint: where to send requests and with what key.
@@ -80,26 +150,32 @@ pub struct Endpoint {
 }
 
 /// Agent-loop policy knobs, all with sane defaults.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct AgentPolicy {
-    pub default_tier: Tier,
     pub max_turns: u32,
     /// Compact the conversation once usage crosses this percent of the
-    /// active tier's context window.
+    /// active model's context window.
     pub compaction_threshold_percent: u8,
-    /// Escalate Flash → Pro for one retry after this many consecutive
-    /// identical tool calls (a doom-loop symptom) or tool errors.
+    /// Escalate away from "hivemind" for one retry after this many
+    /// consecutive identical tool calls (a doom-loop symptom) or tool
+    /// errors. Scoped to rescuing the cheap default only — unlike the old
+    /// Flash→Pro jump (a ~3x price difference within one provider),
+    /// silently moving a user off a model they explicitly picked among 7
+    /// very differently priced options risks a much bigger, more
+    /// surprising cost jump, so this never fires once a non-default model
+    /// is active.
     pub auto_escalate: bool,
+    pub escalate_to_model: String,
     pub escalate_after_repeats: u32,
 }
 
 impl Default for AgentPolicy {
     fn default() -> Self {
         Self {
-            default_tier: Tier::Flash,
             max_turns: 25,
             compaction_threshold_percent: 75,
             auto_escalate: true,
+            escalate_to_model: "claude-sonnet-5".to_string(),
             escalate_after_repeats: 2,
         }
     }
@@ -143,19 +219,15 @@ pub struct HookSpec {
 #[derive(Debug, Clone)]
 pub struct Resolved {
     pub endpoint: Endpoint,
-    pub flash: ModelInfo,
-    pub pro: ModelInfo,
+    pub default_model: String,
+    /// Whether `endpoint`/`default_model` came from stored hosted
+    /// credentials (`hivemind auth login`) rather than an explicit BYOK
+    /// key. Only consulted to decide whether the live cost readout should
+    /// apply `HOSTED_MARKUP_MULTIPLIER` — a BYOK key pays the upstream
+    /// provider directly, with no HiveMind margin.
+    pub hosted: bool,
     pub policy: AgentPolicy,
     pub hooks: Vec<HookSpec>,
-}
-
-impl Resolved {
-    pub fn model_for(&self, tier: Tier) -> &ModelInfo {
-        match tier {
-            Tier::Flash => &self.flash,
-            Tier::Pro => &self.pro,
-        }
-    }
 }
 
 // ---- on-disk config.toml shape (all fields optional) ----
@@ -179,16 +251,15 @@ struct File {
 struct ModelSection {
     api_key: Option<String>,
     base_url: Option<String>,
-    flash_model: Option<String>,
-    pro_model: Option<String>,
+    model: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
 struct AgentSection {
-    default_tier: Option<String>,
     max_turns: Option<u32>,
     compaction_threshold_percent: Option<u8>,
     auto_escalate: Option<bool>,
+    escalate_to_model: Option<String>,
     escalate_after_repeats: Option<u32>,
 }
 
@@ -211,8 +282,6 @@ pub enum ConfigError {
          --api-key, or add `api_key` under [model] in your config file"
     )]
     MissingKey,
-    #[error("invalid tier: {0}")]
-    InvalidTier(String),
     #[error("writing {path}: {source}")]
     Write {
         path: String,
@@ -226,30 +295,13 @@ pub enum ConfigError {
     },
 }
 
-/// Prices as of 2026-07 — approximate, and the upstream provider can change
-/// them without notice. Override via `config.toml` if these drift.
-fn default_flash_pricing() -> Pricing {
-    Pricing {
-        input_cache_miss_per_m: 0.14,
-        input_cache_hit_per_m: 0.0028,
-        output_per_m: 0.28,
-    }
-}
-fn default_pro_pricing() -> Pricing {
-    Pricing {
-        input_cache_miss_per_m: 0.435,
-        input_cache_hit_per_m: 0.003625,
-        output_per_m: 0.87,
-    }
-}
-
 /// Overrides collected from CLI flags — anything `Some` here wins over the
 /// config file and environment.
 #[derive(Debug, Default)]
 pub struct CliOverrides {
     pub api_key: Option<String>,
     pub base_url: Option<String>,
-    pub tier: Option<Tier>,
+    pub model: Option<String>,
 }
 
 /// A token minted by the hosted backend (`hivemind auth login`), paired
@@ -296,35 +348,38 @@ pub fn resolve(
     // A hosted token is only ever paired with its own api_base — never the
     // bare upstream default — unless an explicit override says otherwise
     // (e.g. pointing a hosted token at a local mock for testing).
-    let (api_key, base_url) = match explicit_key {
+    let (api_key, base_url, hosted) = match explicit_key {
         Some(key) => (
             key,
             base_url_override.unwrap_or_else(|| "https://api.deepseek.com".to_string()),
+            false,
         ),
         None => {
             let creds = load_hosted_credentials(credentials_path).ok_or(ConfigError::MissingKey)?;
             (
                 creds.access_token,
                 base_url_override.unwrap_or(creds.api_base),
+                true,
             )
         }
     };
 
-    let flash_wire_id = file
+    // Hosted mode defaults to the branded "hivemind" alias, which resolves
+    // to the full 7-model catalog server-side. BYOK talks to the upstream
+    // provider directly, so it needs a real provider-native id instead.
+    let default_model = cli
         .model
-        .flash_model
-        .or(file.deepseek.flash_model)
-        .unwrap_or_else(|| "deepseek-v4-flash".to_string());
-    let pro_wire_id = file
-        .model
-        .pro_model
-        .or(file.deepseek.pro_model)
-        .unwrap_or_else(|| "deepseek-v4-pro".to_string());
+        .or_else(|| file.model.model.clone())
+        .or_else(|| file.deepseek.model.clone())
+        .unwrap_or_else(|| {
+            if hosted {
+                "hivemind".to_string()
+            } else {
+                "deepseek-v4-flash".to_string()
+            }
+        });
 
     let mut policy = AgentPolicy::default();
-    if let Some(t) = &file.agent.default_tier {
-        policy.default_tier = t.parse().map_err(ConfigError::InvalidTier)?;
-    }
     if let Some(v) = file.agent.max_turns {
         policy.max_turns = v;
     }
@@ -334,25 +389,17 @@ pub fn resolve(
     if let Some(v) = file.agent.auto_escalate {
         policy.auto_escalate = v;
     }
+    if let Some(v) = file.agent.escalate_to_model {
+        policy.escalate_to_model = v;
+    }
     if let Some(v) = file.agent.escalate_after_repeats {
         policy.escalate_after_repeats = v;
-    }
-    if let Some(t) = cli.tier {
-        policy.default_tier = t;
     }
 
     Ok(Resolved {
         endpoint: Endpoint { base_url, api_key },
-        flash: ModelInfo {
-            wire_id: flash_wire_id,
-            context_window: 128_000,
-            pricing: default_flash_pricing(),
-        },
-        pro: ModelInfo {
-            wire_id: pro_wire_id,
-            context_window: 128_000,
-            pricing: default_pro_pricing(),
-        },
+        default_model,
+        hosted,
         policy,
         hooks: file.hooks,
     })
@@ -468,10 +515,9 @@ mod tests {
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
-    fn tier_parses_case_insensitively() {
-        assert_eq!("Flash".parse::<Tier>().unwrap(), Tier::Flash);
-        assert_eq!("PRO".parse::<Tier>().unwrap(), Tier::Pro);
-        assert!("nope".parse::<Tier>().is_err());
+    fn known_models_lookup_finds_hivemind_and_rejects_unknown() {
+        assert_eq!(lookup_model("hivemind").unwrap().display_name, "HiveMind");
+        assert!(lookup_model("not-a-real-model").is_none());
     }
 
     #[test]
@@ -508,8 +554,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(resolved.endpoint.api_key, "sk-test");
-        assert_eq!(resolved.flash.wire_id, "deepseek-v4-flash");
-        assert_eq!(resolved.policy.default_tier, Tier::Flash);
+        assert_eq!(resolved.default_model, "deepseek-v4-flash");
+        assert!(!resolved.hosted);
     }
 
     #[test]
@@ -640,6 +686,38 @@ mod tests {
             resolved.endpoint.base_url,
             "https://hivemind-server.example/v1"
         );
+        assert_eq!(resolved.default_model, "hivemind");
+        assert!(resolved.hosted);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn explicit_model_override_wins_even_when_hosted() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("HIVEMIND_API_KEY");
+            std::env::remove_var("DEEPSEEK_API_KEY");
+        };
+        let dir =
+            std::env::temp_dir().join(format!("hivemind-test-model-override-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let creds_path = dir.join("credentials.toml");
+        save_hosted_credentials(
+            &creds_path,
+            &HostedCredentials {
+                api_base: "https://hivemind-server.example/v1".to_string(),
+                access_token: "hvm_live_abc123".to_string(),
+            },
+        )
+        .unwrap();
+
+        let cli = CliOverrides {
+            model: Some("claude-sonnet-5".to_string()),
+            ..Default::default()
+        };
+        let resolved = resolve(Path::new("/nonexistent/config.toml"), &creds_path, cli).unwrap();
+        assert_eq!(resolved.default_model, "claude-sonnet-5");
 
         std::fs::remove_dir_all(&dir).ok();
     }

@@ -1,10 +1,11 @@
 //! The core sample↔tools loop: stream a model, execute what it asks for in
-//! parallel, feed results back, repeat — with compaction and Flash→Pro
-//! escalation woven in as turn-boundary policy, not special cases.
+//! parallel, feed results back, repeat — with compaction and escalation
+//! away from the cheap default woven in as turn-boundary policy, not
+//! special cases.
 
 use std::sync::Arc;
 
-use harness_config::{AgentPolicy, HookSpec, ModelInfo, Resolved, Tier};
+use harness_config::{AgentPolicy, HookSpec, Resolved};
 use harness_provider::DeepSeekClient;
 use harness_tools::{Registry, Workspace};
 use harness_types::{ChatRequest, Message, Role, StreamEvent, ToolCall};
@@ -21,13 +22,18 @@ const COMPACTION_KEEP_RECENT: usize = 8;
 pub struct Agent {
     client: DeepSeekClient,
     tools: Registry,
-    flash: ModelInfo,
-    pro: ModelInfo,
     policy: AgentPolicy,
     ui: Arc<dyn Ui>,
 
     messages: Vec<Message>,
-    current_tier: Tier,
+    /// Sticky across `run()` calls; changed only by an explicit `/model`
+    /// command. `current_model` resets to this at the start of every input.
+    default_model: String,
+    current_model: String,
+    /// Whether `default_model` is billed through HiveMind's hosted margin
+    /// (true) or paid directly to the upstream provider via a BYOK key
+    /// (false) -- only affects the live cost readout, see `crate::ui::Ui::usage`.
+    hosted: bool,
     last_total_tokens: u64,
     context_window: u64,
 
@@ -65,18 +71,20 @@ impl Agent {
             ui_for_retry.retrying(attempt, max, delay, &err.to_string());
         }));
 
-        let current_tier = resolved.policy.default_tier;
-        let context_window = resolved.model_for(current_tier).context_window;
+        let default_model = resolved.default_model;
+        let context_window = harness_config::lookup_model(&default_model)
+            .map(|m| m.context_window)
+            .unwrap_or(128_000);
 
         Self {
             client,
             tools,
-            flash: resolved.flash,
-            pro: resolved.pro,
             policy: resolved.policy,
             ui,
             messages: vec![Message::system(system_prompt)],
-            current_tier,
+            current_model: default_model.clone(),
+            default_model,
+            hosted: resolved.hosted,
             last_total_tokens: 0,
             context_window,
             repeat_count: 0,
@@ -91,18 +99,18 @@ impl Agent {
         &self.messages
     }
 
-    pub fn current_tier(&self) -> Tier {
-        self.current_tier
+    pub fn current_model(&self) -> &str {
+        &self.current_model
     }
 
-    /// Set the tier this session runs on, effective immediately and sticky
+    /// Set the model this session runs on, effective immediately and sticky
     /// across future inputs (unlike auto-escalation, which resets to the
     /// configured default at the start of every new `run()` call). Used by
-    /// an explicit user command (e.g. a REPL `/tier` command), not by the
+    /// an explicit user command (e.g. a REPL `/model` command), not by the
     /// doom-loop guard.
-    pub fn set_default_tier(&mut self, tier: Tier) {
-        self.policy.default_tier = tier;
-        self.current_tier = tier;
+    pub fn set_model(&mut self, model: String) {
+        self.default_model = model.clone();
+        self.current_model = model;
     }
 
     /// Force a compaction pass right now, bypassing the usage-threshold
@@ -124,7 +132,7 @@ impl Agent {
             self.context_window,
             &policy,
             &self.client,
-            &self.flash.wire_id,
+            &self.current_model,
         )
         .await
         {
@@ -140,19 +148,12 @@ impl Agent {
         }
     }
 
-    fn model_info_for(&self, tier: Tier) -> &ModelInfo {
-        match tier {
-            Tier::Flash => &self.flash,
-            Tier::Pro => &self.pro,
-        }
-    }
-
     /// Process one user input to completion, streaming to `self.ui`.
-    /// Escalation is scoped to a single call: tier resets to the configured
-    /// default at the start of every new input, so a hard task pays for
-    /// Pro only while it needs it.
+    /// Escalation is scoped to a single call: the active model resets to
+    /// `default_model` at the start of every new input, so a hard task
+    /// pays for a stronger model only while it needs it.
     pub async fn run(&mut self, user_input: &str) -> anyhow::Result<()> {
-        self.current_tier = self.policy.default_tier;
+        self.current_model = self.default_model.clone();
         self.repeat_count = 0;
         self.last_call_signature = None;
         let mut checkpoint = Checkpoint::open(user_input, self.messages.len());
@@ -161,9 +162,8 @@ impl Agent {
         for _turn in 0..self.policy.max_turns {
             self.compact_if_needed().await;
 
-            let model_info = self.model_info_for(self.current_tier).clone();
             let mut req = ChatRequest {
-                model: model_info.wire_id.clone(),
+                model: self.current_model.clone(),
                 messages: std::mem::take(&mut self.messages),
                 tools: self.tools.schemas(),
                 temperature: None,
@@ -180,8 +180,10 @@ impl Agent {
             let resp = self.drain_stream(&mut rx).await?;
 
             self.last_total_tokens = resp.usage.total_tokens;
-            self.context_window = model_info.context_window;
-            self.ui.usage(&resp.usage, self.current_tier, &model_info);
+            self.context_window = harness_config::lookup_model(&self.current_model)
+                .map(|m| m.context_window)
+                .unwrap_or(self.context_window);
+            self.ui.usage(&resp.usage, &self.current_model, self.hosted);
 
             let calls_for_dispatch = resp.tool_calls.clone();
             let has_tool_calls = !calls_for_dispatch.is_empty();
@@ -328,15 +330,15 @@ impl Agent {
         self.last_call_signature = Some(signature.clone());
 
         if self.policy.auto_escalate
-            && self.current_tier == Tier::Flash
+            && self.current_model == "hivemind"
             && self.repeat_count >= self.policy.escalate_after_repeats
         {
-            self.ui.tier_escalated(
-                Tier::Flash,
-                Tier::Pro,
+            self.ui.model_escalated(
+                &self.current_model,
+                &self.policy.escalate_to_model,
                 "repeated or failing tool calls on this task",
             );
-            self.current_tier = Tier::Pro;
+            self.current_model = self.policy.escalate_to_model.clone();
             self.repeat_count = 0;
         }
     }
@@ -352,7 +354,7 @@ impl Agent {
             self.context_window,
             &policy,
             &self.client,
-            &self.flash.wire_id,
+            &self.current_model,
         )
         .await
         {

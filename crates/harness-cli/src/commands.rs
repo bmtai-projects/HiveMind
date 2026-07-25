@@ -1,17 +1,15 @@
 //! REPL slash commands: parsing, and the fixed name list the completer
 //! reuses so `/`-completion and dispatch can never drift apart.
 
-use harness_config::Tier;
-
 pub const COMMAND_NAMES: &[&str] = &[
-    "/help", "/clear", "/compact", "/tier", "/cost", "/undo", "/exit", "/quit",
+    "/help", "/clear", "/compact", "/model", "/cost", "/undo", "/exit", "/quit",
 ];
 
 pub const HELP_TEXT: &str = "\
 Commands:
   /help              show this list
   /compact           fold older turns into a summary now
-  /tier [flash|pro]  show or switch the active tier
+  /model [id]        show available models, or switch the active one
   /cost              show session cost so far
   /undo [n]          undo the last n turns (default 1): restores edited/written
                      files and truncates the conversation back to before them
@@ -19,10 +17,11 @@ Commands:
   /exit, /quit       leave
 Reference a file inline with @path/to/file (tab-completes).";
 
-pub enum TierArg {
+pub enum ModelArg {
     Show,
-    Set(Tier),
-    Invalid(String),
+    /// Any string is accepted, unvalidated — a BYOK key can point at a
+    /// provider-native model id `KNOWN_MODELS` has never heard of.
+    Set(String),
 }
 
 pub enum UndoArg {
@@ -34,7 +33,7 @@ pub enum SlashCommand {
     Help,
     Clear,
     Compact,
-    Tier(TierArg),
+    Model(ModelArg),
     Cost,
     Undo(UndoArg),
     Exit,
@@ -53,12 +52,9 @@ pub fn parse(line: &str) -> Option<SlashCommand> {
         "help" | "h" | "?" => SlashCommand::Help,
         "clear" | "cls" => SlashCommand::Clear,
         "compact" => SlashCommand::Compact,
-        "tier" => SlashCommand::Tier(match arg {
-            None => TierArg::Show,
-            Some(a) => a
-                .parse::<Tier>()
-                .map(TierArg::Set)
-                .unwrap_or_else(|_| TierArg::Invalid(a.to_string())),
+        "model" => SlashCommand::Model(match arg {
+            None => ModelArg::Show,
+            Some(a) => ModelArg::Set(a.to_string()),
         }),
         "cost" | "usage" => SlashCommand::Cost,
         "undo" => SlashCommand::Undo(match arg {
@@ -95,34 +91,25 @@ mod tests {
     }
 
     #[test]
-    fn tier_with_no_arg_means_show() {
+    fn model_with_no_arg_means_show() {
         assert!(matches!(
-            parse("/tier"),
-            Some(SlashCommand::Tier(TierArg::Show))
+            parse("/model"),
+            Some(SlashCommand::Model(ModelArg::Show))
         ));
     }
 
     #[test]
-    fn tier_with_valid_arg_means_set() {
-        assert!(matches!(
-            parse("/tier pro"),
-            Some(SlashCommand::Tier(TierArg::Set(Tier::Pro)))
-        ));
-        assert!(matches!(
-            parse("/tier flash"),
-            Some(SlashCommand::Tier(TierArg::Set(Tier::Flash)))
-        ));
-        assert!(matches!(
-            parse("/tier PRO"),
-            Some(SlashCommand::Tier(TierArg::Set(Tier::Pro)))
-        ));
-    }
-
-    #[test]
-    fn tier_with_bad_arg_is_invalid_not_silently_ignored() {
-        match parse("/tier fastt") {
-            Some(SlashCommand::Tier(TierArg::Invalid(s))) => assert_eq!(s, "fastt"),
-            other => panic!("expected Invalid(\"fastt\"), got {}", other.is_some()),
+    fn model_with_arg_means_set_to_that_exact_string() {
+        match parse("/model claude-sonnet-5") {
+            Some(SlashCommand::Model(ModelArg::Set(id))) => assert_eq!(id, "claude-sonnet-5"),
+            _ => panic!("expected Model(Set(..))"),
+        }
+        // Unrecognized strings are accepted too -- validation, if any,
+        // happens downstream (a BYOK key might point at a model id
+        // KNOWN_MODELS has never heard of).
+        match parse("/model some-custom-id") {
+            Some(SlashCommand::Model(ModelArg::Set(id))) => assert_eq!(id, "some-custom-id"),
+            _ => panic!("expected Model(Set(..))"),
         }
     }
 

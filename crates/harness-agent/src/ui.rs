@@ -3,13 +3,13 @@
 
 use std::time::Duration;
 
-use harness_config::{ModelInfo, Tier};
 use harness_types::Usage;
 
 pub trait Ui: Send + Sync {
     /// One streamed fragment of the assistant's visible reply.
     fn assistant_delta(&self, text: &str);
-    /// One streamed fragment of chain-of-thought (deepseek-v4-pro).
+    /// One streamed fragment of chain-of-thought (reasoning-capable models
+    /// only, e.g. deepseek-v4-pro).
     fn reasoning_delta(&self, text: &str);
     /// Fired once after the assistant's text stream completes (only if any
     /// text was actually streamed — a tool-only turn skips this).
@@ -19,14 +19,17 @@ pub trait Ui: Send + Sync {
     fn tool_end(&self, name: &str, result: &str, is_error: bool);
 
     /// Fired after every sampled response, whether or not it called tools.
-    fn usage(&self, usage: &Usage, tier: Tier, model: &ModelInfo);
+    /// `hosted` says whether `model_id` is billed through HiveMind's hosted
+    /// margin or paid directly to the upstream provider — see
+    /// `harness_config::HOSTED_MARKUP_MULTIPLIER`.
+    fn usage(&self, usage: &Usage, model_id: &str, hosted: bool);
 
     /// Fired before each retry sleep (429/5xx/network hiccup).
     fn retrying(&self, attempt: u32, max: u32, delay: Duration, err: &str);
 
-    /// Fired when the agent bumps Flash → Pro after repeated/failing tool
-    /// calls on the current task.
-    fn tier_escalated(&self, from: Tier, to: Tier, reason: &str);
+    /// Fired when the agent bumps away from the cheap "hivemind" default
+    /// after repeated/failing tool calls on the current task.
+    fn model_escalated(&self, from: &str, to: &str, reason: &str);
 
     /// Fired after a compaction pass folds older turns into a summary.
     fn compacted(&self, messages_before: usize, messages_after: usize, tokens_before: u64);

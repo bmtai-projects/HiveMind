@@ -1,8 +1,10 @@
 //! `hivemind` — a fast, cost-optimized AI coding agent.
 //!
-//! Two tiers only, for now: Flash (default, cheap) and Pro (escalated to
-//! automatically when the agent looks stuck). See the workspace README for
-//! the full architecture and optimization notes.
+//! "hivemind" (a branded DeepSeek alias) is the cheap default model; six
+//! real third-party coding models are selectable alongside it in hosted
+//! mode via `--model`/`/model`, and the agent escalates off "hivemind"
+//! automatically when it looks stuck. See the workspace README for the
+//! full architecture and optimization notes.
 
 mod auth;
 mod banner;
@@ -18,9 +20,9 @@ use std::sync::Arc;
 use clap::{Args, Parser, Subcommand};
 use reedline::Signal;
 
-use commands::{SlashCommand, TierArg, UndoArg};
+use commands::{ModelArg, SlashCommand, UndoArg};
 use harness_agent::Agent;
-use harness_config::{CliOverrides, Tier};
+use harness_config::CliOverrides;
 use harness_tools::{
     Bash, EditFile, ListDir, ReadFile, Registry, Search, SemanticSearch, Workspace, WriteFile,
 };
@@ -65,6 +67,10 @@ enum Command {
     Activate(ActivateArgs),
     /// Manage your HiveMind hosted account (sign in, sign out, check balance).
     Auth(AuthArgs),
+    /// List models selectable with --model (hosted mode: "hivemind" plus 6
+    /// real third-party coding models; BYOK: whatever your provider key
+    /// itself supports).
+    Models,
 }
 
 #[derive(Args)]
@@ -101,9 +107,11 @@ struct ActivateArgs {
     #[arg(long)]
     config: Option<PathBuf>,
 
-    /// Tier to start on: "flash" (default) or "pro".
+    /// Model to start on. Hosted mode: "hivemind" (default) or one of the 6
+    /// real coding models (run `hivemind models` to list them). BYOK: a
+    /// model id your own provider key recognizes.
     #[arg(long)]
-    tier: Option<String>,
+    model: Option<String>,
 
     /// Override the HiveMind API key (else $HIVEMIND_API_KEY or config.toml).
     #[arg(long)]
@@ -117,9 +125,24 @@ struct ActivateArgs {
     #[arg(long)]
     yolo: bool,
 
-    /// Print streamed model reasoning (Pro tier only).
+    /// Print streamed model reasoning (reasoning-capable models only).
     #[arg(long)]
     show_reasoning: bool,
+}
+
+fn print_model_catalog() {
+    println!("Available models:");
+    for m in harness_config::KNOWN_MODELS {
+        println!(
+            "  {:<18} {:<18} ${:.2} in / ${:.2} out per M tok · {}K context",
+            m.id,
+            m.display_name,
+            m.wholesale_pricing.input_per_m,
+            m.wholesale_pricing.output_per_m,
+            m.context_window / 1000,
+        );
+    }
+    println!("Pick with --model <id>, or /model <id> in the REPL.");
 }
 
 #[tokio::main]
@@ -132,6 +155,10 @@ async fn main() -> anyhow::Result<()> {
             AuthAction::Logout => auth::logout().await,
             AuthAction::Status => auth::status().await,
         },
+        Command::Models => {
+            print_model_catalog();
+            Ok(())
+        }
     };
     if let Err(e) = result {
         eprintln!("\nerror: {e:#}");
@@ -148,12 +175,7 @@ async fn run(args: ActivateArgs) -> anyhow::Result<()> {
     let overrides = CliOverrides {
         api_key: args.api_key.clone(),
         base_url: args.base_url.clone(),
-        tier: args
-            .tier
-            .as_deref()
-            .map(str::parse::<Tier>)
-            .transpose()
-            .map_err(|e| anyhow::anyhow!("{e}"))?,
+        model: args.model.clone(),
     };
     let resolved = harness_config::resolve(
         &config_path,
@@ -239,13 +261,13 @@ async fn repl(agent: &mut Agent, ws: Workspace, ui: Arc<TermUi>) -> anyhow::Resu
                         println!("nothing to compact yet");
                     }
                 }
-                SlashCommand::Tier(TierArg::Show) => println!("tier: {}", agent.current_tier()),
-                SlashCommand::Tier(TierArg::Set(tier)) => {
-                    agent.set_default_tier(tier);
-                    println!("tier set to {tier}");
+                SlashCommand::Model(ModelArg::Show) => {
+                    println!("model: {}", agent.current_model());
+                    print_model_catalog();
                 }
-                SlashCommand::Tier(TierArg::Invalid(bad)) => {
-                    println!("unknown tier {bad:?} — expected \"flash\" or \"pro\"");
+                SlashCommand::Model(ModelArg::Set(id)) => {
+                    agent.set_model(id.clone());
+                    println!("model set to {id}");
                 }
                 SlashCommand::Cost => println!("session cost so far: ${:.6}", ui.session_cost()),
                 SlashCommand::Undo(UndoArg::Count(n)) => match agent.undo(n).await {

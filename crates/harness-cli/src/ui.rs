@@ -1,14 +1,14 @@
 //! Terminal implementation of [`harness_agent::Ui`]: ANSI-colored streaming
 //! output plus a live cost readout computed from each response's usage and
-//! the active tier's pricing — the whole point of the caching/tiering work
-//! is to make that number small, so it's surfaced every turn, not hidden.
+//! the active model's pricing — the whole point of the caching/model-tiering
+//! work is to make that number small, so it's surfaced every turn, not hidden.
 
 use std::io::{self, Write};
 use std::sync::Mutex;
 use std::time::Duration;
 
 use harness_agent::Ui;
-use harness_config::{ModelInfo, Pricing, Tier};
+use harness_config::{HOSTED_MARKUP_MULTIPLIER, Pricing, lookup_model};
 use harness_types::Usage;
 
 pub struct TermUi {
@@ -62,11 +62,27 @@ impl Ui for TermUi {
         }
     }
 
-    fn usage(&self, usage: &Usage, tier: Tier, model: &ModelInfo) {
+    fn usage(&self, usage: &Usage, model_id: &str, hosted: bool) {
         if usage.total_tokens == 0 {
             return;
         }
-        let turn_cost = estimate_cost_usd(usage, &model.pricing);
+        let cache_note = usage
+            .cache_hit_rate()
+            .map(|r| format!(", cache {:.0}%", r * 100.0))
+            .unwrap_or_default();
+
+        // Unrecognized model id (a BYOK user's own custom string, not in
+        // KNOWN_MODELS) -- show token counts with no cost estimate rather
+        // than a wrong or fabricated one.
+        let Some(entry) = lookup_model(model_id) else {
+            println!(
+                "\x1b[90m  ↳ [{model_id}] {} in / {} out{cache_note}\x1b[0m",
+                usage.prompt_tokens, usage.completion_tokens,
+            );
+            return;
+        };
+
+        let turn_cost = estimate_cost_usd(usage, &entry.wholesale_pricing, hosted);
         let session_total = {
             let mut total = self
                 .session_cost_usd
@@ -75,16 +91,12 @@ impl Ui for TermUi {
             *total += turn_cost;
             *total
         };
-        let cache_note = usage
-            .cache_hit_rate()
-            .map(|r| format!(", cache {:.0}%", r * 100.0))
-            .unwrap_or_default();
-        // 6 decimals: a single Flash turn is routinely sub-$0.0001 — at 4
-        // decimals the running total looked like a stuck "$0.0000" even
-        // while correctly accumulating (caught by end-to-end testing, not
-        // a logic bug — just not enough resolution to show it).
+        // 6 decimals: a single "hivemind" turn is routinely sub-$0.0001 —
+        // at 4 decimals the running total looked like a stuck "$0.0000"
+        // even while correctly accumulating (caught by end-to-end testing,
+        // not a logic bug — just not enough resolution to show it).
         println!(
-            "\x1b[90m  ↳ [{tier}] {} in / {} out{cache_note} · ${turn_cost:.6} turn / ${session_total:.6} session\x1b[0m",
+            "\x1b[90m  ↳ [{model_id}] {} in / {} out{cache_note} · ${turn_cost:.6} turn / ${session_total:.6} session\x1b[0m",
             usage.prompt_tokens, usage.completion_tokens,
         );
     }
@@ -96,7 +108,7 @@ impl Ui for TermUi {
         );
     }
 
-    fn tier_escalated(&self, from: Tier, to: Tier, reason: &str) {
+    fn model_escalated(&self, from: &str, to: &str, reason: &str) {
         println!("\x1b[35m  ⤴ escalating {from} → {to}: {reason}\x1b[0m");
     }
 
@@ -107,17 +119,25 @@ impl Ui for TermUi {
     }
 }
 
-/// DeepSeek bills cache-miss and cache-hit prompt tokens at different rates;
-/// when a provider doesn't report the split, treat the whole prompt as a
-/// cache miss (the conservative, never-underestimate default).
-fn estimate_cost_usd(usage: &Usage, pricing: &Pricing) -> f64 {
+/// A model's provider bills cache-miss and cache-hit prompt tokens at
+/// different rates; when a response doesn't report the split, treat the
+/// whole prompt as a cache miss (the conservative, never-underestimate
+/// default). `hosted` applies HiveMind's margin on top of the wholesale
+/// price, since that's what a hosted user is actually billed; a BYOK key
+/// pays the upstream provider's wholesale price directly.
+fn estimate_cost_usd(usage: &Usage, pricing: &Pricing, hosted: bool) -> f64 {
     let miss = usage.cache_miss_tokens.unwrap_or(usage.prompt_tokens) as f64;
     let hit = usage.cache_hit_tokens.unwrap_or(0) as f64;
     let out = usage.completion_tokens as f64;
-    (miss * pricing.input_cache_miss_per_m
-        + hit * pricing.input_cache_hit_per_m
+    let wholesale = (miss * pricing.input_per_m
+        + hit * pricing.input_cache_read_per_m
         + out * pricing.output_per_m)
-        / 1_000_000.0
+        / 1_000_000.0;
+    if hosted {
+        wholesale * HOSTED_MARKUP_MULTIPLIER
+    } else {
+        wholesale
+    }
 }
 
 fn one_line(s: &str, max_chars: usize) -> String {

@@ -5,14 +5,15 @@
 [model]
 # api_key = "sk-..."        # prefer $HIVEMIND_API_KEY; only set this for local experiments
 # base_url = "https://api.deepseek.com"
-# flash_model = "deepseek-v4-flash"
-# pro_model = "deepseek-v4-pro"
+# model = "hivemind"        # hosted mode: "hivemind" (default) or one of the 6 real coding
+                             # models `hivemind models` lists; BYOK: a model id your own
+                             # provider key recognizes (e.g. "deepseek-v4-pro")
 
 [agent]
-default_tier = "flash"              # "flash" | "pro" — the tier each new task starts on
 max_turns = 25                      # hard cap on sample<->tool cycles per input
 compaction_threshold_percent = 75   # summarize older turns once usage crosses this % of the context window
-auto_escalate = true                # bump flash -> pro after repeated/failing tool calls on one task
+auto_escalate = true                # bump off "hivemind" after repeated/failing tool calls on one task
+escalate_to_model = "claude-sonnet-5" # model to escalate to (only fires while "hivemind" is active)
 escalate_after_repeats = 2          # consecutive repeats/errors before escalating
 
 # Zero or more hooks. `event` is "pre_tool_use" (can block a call before it
