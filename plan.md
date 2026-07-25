@@ -1,176 +1,160 @@
-# Next feature: turn-level undo (`/undo`), ported from grok-build's rewind system
+# Done: turn-level undo (`/undo`)
 
-Comparison of xAI's `grok-build` (`/Users/soulknower/Documents/projects/grok-build-main`, 62
-crates, full TUI + ACP + MCP + sandboxing) against HiveMind (6 crates, REPL + headless
-CLI, no TUI) to pick the next feature worth porting. Four candidates were investigated in
-grok-build's actual source (not guessed from crate names) before picking one.
+Shipped in commit `675c5f0` (v0.4.2). Ported from grok-build's rewind system,
+scoped down to in-memory-only, no redo, no shell-tool coverage, REPL-only —
+see git history for the full original design writeup.
 
-## Candidates investigated
+Re-validated fresh before writing this update: `cargo fmt --all -- --check`,
+`cargo clippy --workspace --all-targets -- -D warnings`, `cargo test
+--workspace` (all green, including the 10-test `harness-agent` checkpoint
+suite), `cargo build --workspace --release --locked` — all pass against the
+current `main`. Live end-to-end validation (real `Agent` + real
+`DeepSeekClient` + real file I/O against a local fake model server, both
+edit→undo and create→undo) was performed when the feature was built and the
+checkpoint code hasn't changed since.
 
-| Feature | grok-build crate(s) | Core size (excl. tests/TUI) | TUI-coupled? | Verdict |
-|---|---|---|---|---|
-| **Checkpoints / rewind** | `xai-grok-workspace` (`checkpoint.rs`, `checkpoint_store.rs`, `file_state.rs`) | ~2,000–2,500 lines in grok-build; a HiveMind-scoped version is far smaller (see below) | No — restore is a plain method call (ACP extension in grok-build); only the `/rewind` picker UI is pager-specific | **Picked** |
-| **Hooks** (`PreToolUse` veto, `PostToolUse`, etc.) | `xai-grok-hooks` | ~5,000 lines full parity; minimal (command handlers, 2-3 events, no HTTP/SSRF/Claude-alias layer) is ~1-2 days | No — pure `tokio::process` + JSON stdin, consumed by session/agent logic, not the pager | Strong runner-up, next after this |
-| **Self-update** (`grok update`) | `xai-grok-update` | ~6,000 lines full; most of the bulk is Windows locked-exe handling and 3 redundant version-source fallbacks (CDN/npm/gh) | No | Lower priority — infra polish, not agent capability. HiveMind already has the GitHub Releases pipeline; a minimal single-source-plus-atomic-rename version is a half-day port whenever it's wanted |
-| **Shell sandboxing** | `xai-grok-sandbox` | ~3,700 lines; wraps an external xAI crate `nono` (Landlock/Seatbelt) + bubblewrap + a hand-rolled seccomp filter | No, but **no Windows support even in grok-build** | Highest long-term security value (especially for `--yolo`), but real risk: `nono` is pinned to an internal xAI crate whose public availability on crates.io is unconfirmed — first step for this one is a spike, not an implementation. Deferred. |
+---
 
-## Why checkpoints, not hooks
+# Next feature: tool hooks (`PreToolUse` veto), ported from grok-build's hook system
 
-Both are well-scoped and genuinely portable. Checkpoints won because:
+Per the earlier comparison in this file's history, hooks was the clear
+runner-up to checkpoints: it closes a real safety gap checkpoints
+deliberately don't cover (checkpoints only undo file edits *after* the fact,
+and never cover `run_shell` at all — grok-build's own scoping choice, which
+HiveMind's checkpoint feature matches). A `PreToolUse` hook can block a
+dangerous `run_shell` call *before* it ever executes, which is a materially
+different and stronger safety property.
 
-- It's the direct extension of a value HiveMind already states as a selling point —
-  `edit_file`'s own doc comment (`crates/harness-tools/src/edit.rs:14-17`) says edits
-  "can't corrupt code it never re-typed." That's per-call safety. Checkpoints add the
-  missing per-**turn** safety net: if the model's plan itself was wrong (edited the right
-  file the wrong way, or the wrong file entirely), there is currently no way back except
-  the user's own `git`. Every comparable agent (Claude Code, Cursor, and grok-build
-  itself) treats this as a baseline trust feature, not a nice-to-have.
-- It needs zero new dependencies. Hooks need a subprocess/JSON-envelope contract; this
-  is pure in-memory Rust operating on data HiveMind already has (`Agent.messages`,
-  `Workspace::resolve`).
-- It's independently, deterministically testable — no live model, no subprocess, no
-  network. Hooks and self-update both need live process/network validation to prove
-  end-to-end; sandboxing needs OS-level enforcement testing per platform. Checkpoints
-  can be proven correct with pure unit tests plus one live REPL smoke test, fitting a
-  single implementation session end-to-end as asked.
+## What grok-build actually does (confirmed by reading the real source)
 
-Hooks is the clear next pick after this — `PreToolUse` veto (block a dangerous
-`run_shell` call before it executes) is a real safety gap checkpoints don't cover, since
-checkpoints only undo file edits *after* the fact and explicitly don't cover shell-driven
-changes at all (see below — that's grok-build's own scoping choice, not a HiveMind
-shortcut).
+`crates/codegen/xai-grok-hooks` in grok-build, 7,613 lines across:
 
-## What grok-build actually does (informing the design, not copied wholesale)
+| File | Lines | What it does |
+|---|---|---|
+| `event.rs` | 545 | 14 event types (session lifecycle, tool, subagent, compaction, notification); JSON envelope shape |
+| `config.rs` | 1,293 | Hook spec parsing, matcher config, per-hook timeout/env |
+| `discovery.rs` | 996 | Multi-location hook auto-discovery (project/user/plugin dirs) + precedence layering |
+| `dispatcher.rs` | 895 | Fan-out to matching hooks, aggregates blocking decisions |
+| `env_expand.rs` | 856 | `${VAR}` substitution in hook commands/URLs, with secret-redaction for display |
+| `runner/http.rs` | 1,012 | HTTP-handler-type hooks (POST to a URL instead of spawning a process) |
+| `runner/command.rs` | 1,272 | Subprocess handler: spawn, write JSON envelope to stdin, timeout, parse result |
+| `trust.rs` | 171 | SSRF allowlist for HTTP hooks |
+| `matcher.rs` | 217 | Tool-name/glob matching for which hooks fire on which calls |
+| `result.rs` | 70 | `HookDecision::Allow \| Deny{reason, hook_name}`; fail-open on crash/timeout |
 
-Confirmed by reading the real source, not inferred from names:
+**The actual execution contract** (`runner/command.rs`, confirmed by reading
+it, not guessed): the event envelope is JSON on the child process's stdin.
+The hook's outcome is read from **either** structured JSON on stdout
+(`{"decision": "...", "reason": "..."}`) **or**, as a fallback, the exit
+code: `0` = allow, `2` = deny (`DENY_EXIT_CODE`, deliberately matching Claude
+Code's own hook convention so a script can plausibly be reused across
+tools), anything else = the hook itself failed. A failed/crashed/timed-out
+hook is **fail-open** — `HookRunResult::Failed`, explicitly documented as
+not blocking the agent. This fail-open behavior is a real, deliberate safety
+property (a broken hook script must never be able to wedge the agent) and
+is being ported as-is, not reconsidered.
 
-- Checkpointing is **per-turn** (grok-build: per-prompt), not generic tool-call
-  middleware. Each mutating tool explicitly emits a `FileWritten{previous_content,
-  is_new_file}` notification; a central bridge captures it. **Shell-driven file changes
-  are not checkpointed at all** — only the dedicated file-edit tools participate. This
-  is grok-build's own considered scope, and it maps directly onto HiveMind: HiveMind
-  has exactly two mutating tools, `edit_file` and `write_file`; `run_shell` is out of
-  scope for both codebases, for the same reason (a shell command's effects are
-  unbounded and can't be captured generically without a much heavier mechanism like a
-  shadow git commit of the whole tree).
-- What's stored is **full before/after file content** (plain strings, `None` = didn't
-  exist), not diffs and not git objects. Git involvement in grok-build is a separate,
-  off-by-default, best-effort "domain" alongside the file-content domain — not the
-  restore mechanism.
-- Restore is a plain method call (`rewind_to(session_id, target_prompt_index)`) exposed
-  over grok-build's ACP JSON-RPC layer; the `/rewind` slash command just opens a picker
-  UI in the pager that calls it. The restore logic itself has no TUI dependency.
-- Default storage is **in-memory only**; a durable JSON-file mirror is opt-in
-  (`GROK_WORKSPACE_REWIND_DURABLE=1`) and explicitly documented as "a durability mirror,
-  not the restore mechanism." Retention cap: 64 checkpoints per session, oldest evicted.
+`PostToolUse` hooks are observational only — `result.rs`'s own doc comment
+scopes `HookDecision` to "the outcome of a **blocking** (`pre_tool_use`)
+hook dispatch," meaning post-hooks never produce a decision to act on, only
+a success/fail outcome to log. This asymmetry is grok-build's own design,
+carried over rather than inventing veto-after-the-fact semantics that
+wouldn't mean anything (the tool already ran).
 
-## HiveMind design (scoped down from the above, not a straight port)
+## HiveMind design (scoped down, matching the "1-2 days minimal" estimate)
 
-**Explicitly cut, on purpose, to keep this a one-session feature:**
-- No disk persistence (matches grok-build's own *default*, not a shortcut relative to it).
-- No redo stack — `/undo` only ever moves backward. Re-doing means asking the model again.
-- No shell-tool coverage — matches grok-build's own scope, not a gap relative to it.
-- No picker UI / no listing command — `/undo [n]` (default 1) walks back sequentially.
-  A `/checkpoints` listing command is a natural, cheap follow-up, not built now.
-- No conversation-only vs. files-only rewind mode — every checkpoint restores both
-  together, always. grok-build's `RewindMode::All` is the sensible single default;
-  its `ConversationOnly` variant is a scope cut here.
+**Cut, on purpose:**
+- Only `PreToolUse` and `PostToolUse` — not the other 12 event types
+  (session lifecycle, subagent, compaction, notifications). Nothing in
+  HiveMind's `Agent` currently models those moments as discrete events, and
+  none of them carry the safety motivation `PreToolUse` does.
+- Command handler only — **no HTTP handler type**. This alone cuts
+  `runner/http.rs` (1,012 lines) and `trust.rs`'s SSRF allowlist (171 lines)
+  entirely; a use case that genuinely needs an HTTP callback can shell out
+  to `curl` from a command hook.
+- No `${VAR}` templating/expansion (`env_expand.rs`, 856 lines) — a hook
+  command is a plain string passed to the same shell-execution path
+  `run_shell` already uses; if a script needs a secret, it reads its own
+  process environment normally, no HiveMind-side substitution layer.
+- No multi-location auto-discovery (`discovery.rs`, 996 lines) — hooks are
+  declared directly in `config.toml`'s new `[[hooks]]` array, one place, no
+  plugin/project/user precedence stack.
+- Matching is exact tool name or `*` (all tools) — HiveMind has exactly 7
+  tool names total, so `matcher.rs`'s glob/regex machinery (217 lines) has
+  no real problem to solve here.
+- Fail-open and the exit-code-2-deny convention are **kept as-is** (see
+  above — these aren't scope cuts, they're the load-bearing safety/
+  compatibility properties).
 
-**Granularity:** one checkpoint per user input to `Agent::run()` (i.e., one REPL line),
-covering however many internal model↔tool rounds that input takes to resolve — not one
-checkpoint per internal turn and not one per tool call. This matches grok-build's
-per-prompt granularity exactly.
-
-**Data model** (new `crates/harness-agent/src/checkpoint.rs`, sibling to the existing
-`compaction.rs`):
+**Data model** (new `crates/harness-agent/src/hooks.rs`, sibling to
+`checkpoint.rs`):
 
 ```rust
-struct FileSnapshot { path: PathBuf, before: Option<String> } // None = file didn't exist
-struct Checkpoint {
-    label: String,              // the user input, truncated, for the /undo confirmation message
-    message_len_before: usize,  // Agent.messages.len() before this input was pushed
-    files: Vec<FileSnapshot>,   // first-touch-wins within this checkpoint
+pub enum HookEvent { PreToolUse, PostToolUse }
+
+pub struct HookSpec {
+    pub name: String,
+    pub event: HookEvent,
+    pub matcher: Option<Vec<String>>, // tool names this hook applies to; None = all
+    pub command: String,              // spawned the same way run_shell spawns
+    pub timeout_ms: u64,              // default 5000
+}
+
+pub enum HookDecision {
+    Allow,
+    Deny { reason: String, hook_name: String },
 }
 ```
 
-**Capture:** in `Agent::dispatch_and_record`, before calling `self.tools.dispatch_many`,
-scan the batch for calls named `edit_file` or `write_file` (both already carry a `path`
-field in their JSON args — `crates/harness-tools/src/{fs,edit}.rs` — parsed with a
-2-field-ignoring local struct, no changes needed to the tool implementations or the
-`Tool` trait). For each such path not already captured in the in-progress checkpoint,
-read its current content via `Workspace::resolve` + `tokio::fs::read_to_string` (or
-record `None` if it doesn't exist) *before* dispatch runs. Snapshotting a file whose
-edit then fails validation and never actually writes is harmless — just one wasted read
-in the error case — and is the accepted tradeoff against the complexity of only
-snapshotting after confirming success under concurrent dispatch.
+**Config wiring:** new `[[hooks]]` array in `config.toml`, parsed in
+`harness-config` alongside the existing `[model]`/`[agent]` sections —
+same TOML file, same parsing pattern, no new config mechanism.
 
-**Restore, and why "just pop and repeat" is provably correct for `/undo n`:** each
-`undo_one()` pops the newest `Checkpoint`, writes back every `before` (or deletes the
-file if `before` is `None`), and truncates `Agent.messages` to `message_len_before`.
-Calling this in a loop `n` times — not a separate batch/merge code path — already
-produces the correct composed result for multi-step undo: each successive truncate can
-only shrink `messages` further, so after `n` pops the length is exactly the oldest of
-the `n` checkpoints' `message_len_before`; each write to a given path is overwritten by
-every subsequent (older) pop that also touched it, so after `n` pops every file sits at
-its state from the *oldest* checkpoint among the `n` that touched it. No path→snapshot
-merge map needed — proven by the fact that repeated overwrite naturally converges to
-the last (oldest) writer.
+**Envelope on stdin:** a minimal HiveMind-specific JSON shape (event name,
+tool name, tool args, workspace root) — not grok-build's full metadata
+envelope. Reuse their 128 KB truncation constant for tool args/results
+(`event.rs`'s `MAX_PAYLOAD_SIZE`) as a sane default against a giant
+`write_file` content blowing up a hook's stdin.
 
-**Bound:** `const MAX_CHECKPOINTS: usize = 20` (oldest evicted on overflow) — an
-in-memory-only design needs a smaller cap than grok-build's 64-per-durable-session,
-since large files held as full strings for an entire REPL session's lifetime is the
-real memory cost here, not disk space.
-
-**Wiring (no new crate, no new dependency):**
-- `Agent` gains one field: `workspace: harness_tools::fs::Workspace` (already `Clone`,
-  already does the exact path-escape check needed) and `checkpoints: Vec<Checkpoint>`.
-  `Agent::new` gains one parameter for this — the CLI already constructs a `Workspace`
-  for the tool registry, so this is passing something that already exists, not building
-  something new.
-- `crates/harness-cli/src/commands.rs`: new `SlashCommand::Undo(usize)`, parsed the same
-  way `/tier`'s optional argument already is; `/undo` added to `COMMAND_NAMES` and
-  `HELP_TEXT`.
-- `crates/harness-cli/src/main.rs` REPL loop: new match arm calling `agent.undo(n).await`
-  and printing the result directly with `println!` — the same pattern already used for
-  `/compact` (`agent.force_compact()` + direct print), not routed through the `Ui` trait,
-  since like `/compact` this is a REPL-command-initiated action, not an automatic
-  in-loop event the way compaction/escalation are.
-- Headless one-shot mode (`hivemind activate -p "..."`) does not get an `--undo` flag —
-  a single process invocation has nothing to undo *to*, so this is REPL-only by design,
-  not an oversight.
+**Execution point:** `Agent::dispatch_and_record` in `agent.rs`, which
+already does `checkpoint.capture(...)` before `self.tools.dispatch_many
+(calls)`. For each call: run matching `PreToolUse` hooks first; on `Deny`,
+skip dispatching *that* call and synthesize a tool-result message carrying
+the denial reason (the same shape a real tool error already takes), so the
+model sees "blocked: \<reason\>" and can react instead of the turn silently
+losing a call. After dispatch, fire matching `PostToolUse` hooks per call,
+observationally (log success/fail, no effect on the result already
+returned to the model) — matching grok-build's own asymmetry.
 
 ## Test plan
 
-**Unit tests, `crates/harness-agent/src/checkpoint.rs`** (no live model, no subprocess):
-1. Capture correctly extracts `path` from `edit_file`/`write_file` calls; ignores
-   `read_file`/`list_dir`/`run_shell` calls entirely.
-2. Restoring a checkpoint whose file existed before → content restored exactly.
-3. Restoring a checkpoint whose file did **not** exist before (newly created by the
-   agent) → file is deleted on restore.
-4. `Agent.messages` truncates back to exactly `message_len_before`.
-5. **The core correctness property**: edit file `A` in turn 1, edit it again
-   (differently) in turn 2, `undo(2)` → file `A` ends at its turn-1 *pre*-edit content
-   (proves the "repeated single pop" composition claim above, not just that undo runs
-   without panicking).
-6. `MAX_CHECKPOINTS` eviction: pushing past the cap drops the oldest, not the newest.
-7. `undo()` against an empty stack is a clean no-op ("nothing to undo"), not a panic.
+**Unit tests, `crates/harness-agent/src/hooks.rs`:**
+1. Matcher: hook with `matcher: Some(["run_shell"])` fires only for that
+   tool; `None` fires for all; a non-matching call is untouched.
+2. Exit code `0` → `Allow`; exit code `2` → `Deny` with a synthesized
+   reason; any other exit code → treated as failed, not denied.
+3. Structured JSON on stdout (`{"decision":"deny","reason":"..."}`) takes
+   precedence over the exit-code fallback.
+4. Timeout and a crashing command both fail open (`Allow`), not panic and
+   not block.
+5. A `Deny` on `PreToolUse` prevents `dispatch_many` from ever being called
+   for that specific tool call, and the resulting message the model sees is
+   a tool-result containing the denial reason, not a crash or a silently
+   dropped call.
+6. `PostToolUse` hook outcome never changes what was already returned to
+   the model, even if the hook itself fails.
 
-**Live end-to-end validation** (what "end to end" means for this feature specifically,
-since it's a REPL-only interactive feature with no non-interactive equivalent to script
-around):
-1. Build the real release binary.
-2. Start a real `hivemind activate` REPL session against a scratch workspace with one
-   seed file of known content.
-3. Give it a prompt that edits that file via `edit_file`.
-4. Confirm on disk, independently of the CLI's own output, that the file changed.
-5. Run `/undo` in the same session.
-6. Confirm on disk, independently again, that the file is back to its exact original
-   byte content.
-7. Repeat once more for the "file didn't exist before" case: prompt it to create a new
-   file, confirm it exists on disk, `/undo`, confirm the file is gone.
+**Live end-to-end validation:** build the release binary; write a real
+`config.toml` with a `[[hooks]]` entry whose command is a small script that
+denies (`exit 2`) any `run_shell` call whose args contain `rm -rf`; run a
+real REPL session (or the same fake-model-server pattern used for `/undo`'s
+validation) that prompts exactly that dangerous command; confirm — checking
+independently, not trusting the CLI's own output — that the shell command
+never actually ran, and that the model's next turn shows it received the
+denial reason.
 
 ## Verification gates before calling this done
 
-`cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
-`cargo test --workspace`, `cargo build --workspace --release`, all four green — plus the
-live end-to-end steps above, actually run, not assumed.
+`cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D
+warnings`, `cargo test --workspace`, `cargo build --workspace --release
+--locked`, all green — plus the live end-to-end step above, actually run.
