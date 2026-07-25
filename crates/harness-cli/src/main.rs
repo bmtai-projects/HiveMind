@@ -13,6 +13,7 @@ mod completion;
 mod input;
 mod mentions;
 mod ui;
+mod update_check;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -219,12 +220,12 @@ async fn run(args: ActivateArgs) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    repl(&mut agent, ws, ui).await
+    repl(&mut agent, ws, ui, args.yolo).await
 }
 
-async fn repl(agent: &mut Agent, ws: Workspace, ui: Arc<TermUi>) -> anyhow::Result<()> {
-    banner::print();
-    println!("\x1b[90mTry /help for commands · @ to reference a file · Ctrl-D to quit\x1b[0m");
+async fn repl(agent: &mut Agent, ws: Workspace, ui: Arc<TermUi>, yolo: bool) -> anyhow::Result<()> {
+    banner::print().await;
+    println!("\x1b[90m@ to reference a file\x1b[0m");
 
     let history_path = harness_config::default_config_path()
         .parent()
@@ -232,8 +233,12 @@ async fn repl(agent: &mut Agent, ws: Workspace, ui: Arc<TermUi>) -> anyhow::Resu
     let mut line_editor = input::build_line_editor(&ws.root, history_path);
 
     loop {
+        let prompt = HivePrompt {
+            model: agent.current_model().to_string(),
+            yolo,
+        };
         let (returned_editor, sig) = tokio::task::spawn_blocking(move || {
-            let sig = line_editor.read_line(&HivePrompt);
+            let sig = line_editor.read_line(&prompt);
             (line_editor, sig)
         })
         .await?;

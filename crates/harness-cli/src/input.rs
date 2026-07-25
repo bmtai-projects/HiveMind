@@ -68,7 +68,14 @@ pub fn build_line_editor(workdir: &Path, history_path: Option<PathBuf>) -> Reedl
     line_editor
 }
 
-pub struct HivePrompt;
+/// Rebuilt fresh before every `read_line()` call (see `crate::repl`) so it
+/// always reflects the model actually active for the *next* input --
+/// `/model` can change it mid-session, and there's no cheaper way to keep
+/// a `Prompt` impl in sync with that than just reconstructing it each turn.
+pub struct HivePrompt {
+    pub model: String,
+    pub yolo: bool,
+}
 
 impl Prompt for HivePrompt {
     fn render_prompt_left(&self) -> Cow<'_, str> {
@@ -76,7 +83,8 @@ impl Prompt for HivePrompt {
     }
 
     fn render_prompt_right(&self) -> Cow<'_, str> {
-        Cow::Borrowed("")
+        let mode = if self.yolo { "yolo" } else { "approve" };
+        Cow::Owned(format!("\x1b[90m{} · {mode}\x1b[0m", self.model))
     }
 
     fn render_prompt_indicator(&self, _edit_mode: PromptEditMode) -> Cow<'_, str> {
