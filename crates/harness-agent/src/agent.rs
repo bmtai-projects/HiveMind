@@ -40,6 +40,20 @@ pub struct Agent {
     /// doesn't support whatever was requested (or doesn't support the
     /// parameter at all). Sticky like `default_model`.
     reasoning_effort: Option<String>,
+    /// Hard cap on cumulative estimated USD spend across the *whole*
+    /// session (every `run()` call, not just the current one) -- matches
+    /// what `/cost` already reports as "session cost so far". Checked at
+    /// the start of every turn, not mid-stream: the in-flight turn is
+    /// always allowed to finish (mirrors the server's own reserve-then-
+    /// settle philosophy -- never interrupt something already committed
+    /// to, just don't start another). `None` means unbounded, the default.
+    budget_usd: Option<f64>,
+    /// Running total this estimate is checked against. Computed from the
+    /// exact same formula the UI's own readout uses (`crate::cost`), so
+    /// the two can never quietly disagree -- but this is HiveMind's own
+    /// best-effort client-side estimate, not what the server actually
+    /// bills; see `crate::cost::estimate_cost_usd`'s doc comment.
+    session_cost_usd: f64,
     last_total_tokens: u64,
     context_window: u64,
 
@@ -92,6 +106,8 @@ impl Agent {
             default_model,
             hosted: resolved.hosted,
             reasoning_effort: resolved.reasoning_effort,
+            budget_usd: resolved.budget_usd,
+            session_cost_usd: 0.0,
             last_total_tokens: 0,
             context_window,
             repeat_count: 0,
@@ -145,6 +161,25 @@ impl Agent {
         self.reasoning_effort = effort;
     }
 
+    pub fn budget_usd(&self) -> Option<f64> {
+        self.budget_usd
+    }
+
+    /// Best-effort cumulative spend estimate for the whole session so far
+    /// -- the same number `/cost` reports, and what `budget_usd` is
+    /// checked against.
+    pub fn session_cost_usd(&self) -> f64 {
+        self.session_cost_usd
+    }
+
+    /// Set (or clear, with `None`) the session budget, effective from the
+    /// next turn boundary -- lowering it below what's already been spent
+    /// stops the session on the very next check, same as if it had been
+    /// set that low from the start.
+    pub fn set_budget_usd(&mut self, budget: Option<f64>) {
+        self.budget_usd = budget;
+    }
+
     /// Force a compaction pass right now, bypassing the usage-threshold
     /// check (an explicit user command, not the automatic turn-boundary
     /// check `run()` already does). Returns `true` if there was enough
@@ -192,6 +227,18 @@ impl Agent {
         self.messages.push(Message::user(user_input.to_string()));
 
         for _turn in 0..self.policy.max_turns {
+            // Checked here, not mid-stream: a turn already in flight always
+            // finishes (same philosophy as the server's own reserve-then-
+            // settle -- never interrupt something already committed to,
+            // just don't start another).
+            if let Some(budget) = self.budget_usd
+                && self.session_cost_usd >= budget
+            {
+                self.ui.stopped_for_budget(self.session_cost_usd, budget);
+                checkpoint::push(&mut self.checkpoints, checkpoint);
+                return Ok(());
+            }
+
             self.compact_if_needed().await;
 
             // Gated fresh every turn, not just at set_reasoning_effort time
@@ -226,7 +273,17 @@ impl Agent {
             self.context_window = harness_config::lookup_model(&self.current_model)
                 .map(|m| m.context_window)
                 .unwrap_or(self.context_window);
-            self.ui.usage(&resp.usage, &self.current_model, self.hosted);
+            if let Some(cost) =
+                crate::cost::estimate_cost_usd(&resp.usage, &self.current_model, self.hosted)
+            {
+                self.session_cost_usd += cost;
+            }
+            self.ui.usage(
+                &resp.usage,
+                &self.current_model,
+                self.hosted,
+                self.session_cost_usd,
+            );
 
             let calls_for_dispatch = resp.tool_calls.clone();
             let has_tool_calls = !calls_for_dispatch.is_empty();

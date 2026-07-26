@@ -21,8 +21,10 @@ pub trait Ui: Send + Sync {
     /// Fired after every sampled response, whether or not it called tools.
     /// `hosted` says whether `model_id` is billed through HiveMind's hosted
     /// margin or paid directly to the upstream provider — see
-    /// `harness_config::HOSTED_MARKUP_MULTIPLIER`.
-    fn usage(&self, usage: &Usage, model_id: &str, hosted: bool);
+    /// `harness_config::HOSTED_MARKUP_MULTIPLIER`. `session_cost_usd` is
+    /// `Agent`'s own running total (already includes this turn) — the UI
+    /// displays it rather than keeping a second, redundant copy.
+    fn usage(&self, usage: &Usage, model_id: &str, hosted: bool, session_cost_usd: f64);
 
     /// Fired before each retry sleep (429/5xx/network hiccup).
     fn retrying(&self, attempt: u32, max: u32, delay: Duration, err: &str);
@@ -33,4 +35,10 @@ pub trait Ui: Send + Sync {
 
     /// Fired after a compaction pass folds older turns into a summary.
     fn compacted(&self, messages_before: usize, messages_after: usize, tokens_before: u64);
+
+    /// Fired when a session budget is set and cumulative estimated spend
+    /// has reached it -- the agent stops *before* starting another turn,
+    /// never mid-stream, so whatever was already in flight always finishes
+    /// (see `Agent::run`).
+    fn stopped_for_budget(&self, spent_usd: f64, budget_usd: f64);
 }

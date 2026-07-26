@@ -19,6 +19,9 @@ compaction_threshold_percent = 75   # summarize older turns once usage crosses t
 auto_escalate = true                # bump off "hivemind" after repeated/failing tool calls on one task
 escalate_to_model = "claude-sonnet-5" # model to escalate to (only fires while "hivemind" is active)
 escalate_after_repeats = 2          # consecutive repeats/errors before escalating
+# budget_usd = 0.50                 # unbounded by default. Stops the session (cleanly, not an
+                                     # error) once estimated spend reaches this, at the next turn
+                                     # boundary -- an in-flight turn always finishes first.
 
 # Zero or more hooks. `event` is "pre_tool_use" (can block a call before it
 # runs) or "post_tool_use" (observes after; can't block). `matcher` limits

@@ -266,6 +266,11 @@ pub struct Resolved {
     /// `harness_agent::Agent`, not here (the active model can change
     /// mid-session via `/model`; this crate just carries the user's intent).
     pub reasoning_effort: Option<String>,
+    /// Hard cap on cumulative estimated USD spend for the session. `None`
+    /// (the default) means unbounded. Enforced by `harness_agent::Agent`,
+    /// not here -- this crate just carries the user's intent through from
+    /// `--budget` / `config.toml`'s `[agent] budget_usd`.
+    pub budget_usd: Option<f64>,
     pub policy: AgentPolicy,
     pub hooks: Vec<HookSpec>,
 }
@@ -302,6 +307,7 @@ struct AgentSection {
     auto_escalate: Option<bool>,
     escalate_to_model: Option<String>,
     escalate_after_repeats: Option<u32>,
+    budget_usd: Option<f64>,
 }
 
 #[derive(Debug, Error)]
@@ -344,6 +350,7 @@ pub struct CliOverrides {
     pub base_url: Option<String>,
     pub model: Option<String>,
     pub reasoning_effort: Option<String>,
+    pub budget_usd: Option<f64>,
 }
 
 /// A token minted by the hosted backend (`hivemind auth login`), paired
@@ -424,6 +431,7 @@ pub fn resolve(
     let reasoning_effort = cli
         .reasoning_effort
         .or_else(|| file.model.reasoning_effort.clone());
+    let budget_usd = cli.budget_usd.or(file.agent.budget_usd);
 
     let mut policy = AgentPolicy::default();
     if let Some(v) = file.agent.max_turns {
@@ -447,6 +455,7 @@ pub fn resolve(
         default_model,
         hosted,
         reasoning_effort,
+        budget_usd,
         policy,
         hooks: file.hooks,
     })

@@ -21,7 +21,7 @@ use std::sync::Arc;
 use clap::{Args, Parser, Subcommand};
 use reedline::Signal;
 
-use commands::{ModelArg, ReasoningArg, SlashCommand, UndoArg};
+use commands::{BudgetArg, ModelArg, ReasoningArg, SlashCommand, UndoArg};
 use harness_agent::Agent;
 use harness_config::CliOverrides;
 use harness_tools::{
@@ -151,6 +151,12 @@ struct ActivateArgs {
     /// only controls whether the full raw text is also dumped.
     #[arg(long)]
     show_reasoning: bool,
+
+    /// Hard cap on cumulative estimated USD spend for the session. Stops
+    /// cleanly (not an error) once reached, at the next turn boundary --
+    /// an in-flight turn always finishes first. Unbounded by default.
+    #[arg(long)]
+    budget: Option<f64>,
 }
 
 fn print_model_catalog() {
@@ -205,6 +211,7 @@ async fn run(args: ActivateArgs) -> anyhow::Result<()> {
         base_url: args.base_url.clone(),
         model: args.model.clone(),
         reasoning_effort: args.reasoning_effort.clone(),
+        budget_usd: args.budget,
     };
     let resolved = harness_config::resolve(
         &config_path,
@@ -234,7 +241,7 @@ async fn run(args: ActivateArgs) -> anyhow::Result<()> {
     }
     registry.register(Arc::new(bash));
 
-    let ui: Arc<TermUi> = Arc::new(TermUi::new(args.show_reasoning));
+    let ui: Arc<TermUi> = Arc::new(TermUi::new(args.show_reasoning, resolved.budget_usd));
     let mut agent = Agent::new(
         resolved.clone(),
         registry,
@@ -344,7 +351,35 @@ async fn repl(agent: &mut Agent, ws: Workspace, ui: Arc<TermUi>, yolo: bool) -> 
                         );
                     }
                 }
-                SlashCommand::Cost => println!("session cost so far: ${:.6}", ui.session_cost()),
+                SlashCommand::Budget(BudgetArg::Show) => match agent.budget_usd() {
+                    Some(b) => println!(
+                        "budget: ${b:.2} (spent ${:.6} so far)",
+                        agent.session_cost_usd()
+                    ),
+                    None => println!("budget: off (unbounded)"),
+                },
+                SlashCommand::Budget(BudgetArg::Off) => {
+                    agent.set_budget_usd(None);
+                    ui.set_budget_display(None);
+                    println!("budget off");
+                }
+                SlashCommand::Budget(BudgetArg::Set(amount)) => {
+                    if amount <= 0.0 {
+                        println!("budget must be a positive number of dollars, e.g. /budget 0.50");
+                    } else {
+                        agent.set_budget_usd(Some(amount));
+                        ui.set_budget_display(Some(amount));
+                        println!("budget set to ${amount:.2}");
+                    }
+                }
+                SlashCommand::Budget(BudgetArg::Invalid(bad)) => {
+                    println!(
+                        "invalid budget {bad:?} — expected a number, e.g. /budget 0.50, or /budget off"
+                    );
+                }
+                SlashCommand::Cost => {
+                    println!("session cost so far: ${:.6}", agent.session_cost_usd())
+                }
                 SlashCommand::Undo(UndoArg::Count(n)) => match agent.undo(n).await {
                     Some(report) => println!(
                         "undid {} turn(s) (last: {:?}): {} file(s) restored, {} file(s) removed, {} message(s) left",

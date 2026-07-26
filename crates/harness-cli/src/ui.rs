@@ -8,13 +8,19 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use harness_agent::Ui;
-use harness_config::{HOSTED_MARKUP_MULTIPLIER, Pricing, lookup_model};
+use harness_agent::{Ui, estimate_cost_usd};
 use harness_types::Usage;
 
 pub struct TermUi {
     show_reasoning: bool,
-    session_cost_usd: Mutex<f64>,
+    /// Display-only -- `Agent` is the actual source of truth for
+    /// cumulative spend and the budget it's checked against (it has to
+    /// track both anyway, to enforce it). Mutable because `/budget` can
+    /// change it mid-session; kept in sync by the REPL dispatch site
+    /// alongside the matching `Agent::set_budget_usd` call. Shown on every
+    /// turn's usage line when set, so headroom is visible continuously,
+    /// not just at the moment the cap is hit.
+    budget_usd: Mutex<Option<f64>>,
     /// Whether the "thinking..." indicator has already fired for the turn
     /// currently in flight -- reset in `usage()`, which fires exactly once
     /// per turn right after the full response (reasoning, content, and any
@@ -27,20 +33,18 @@ pub struct TermUi {
 }
 
 impl TermUi {
-    pub fn new(show_reasoning: bool) -> Self {
+    pub fn new(show_reasoning: bool, budget_usd: Option<f64>) -> Self {
         Self {
             show_reasoning,
-            session_cost_usd: Mutex::new(0.0),
+            budget_usd: Mutex::new(budget_usd),
             thinking_shown: AtomicBool::new(false),
         }
     }
 
-    /// Running total for a `/cost` command to read on demand.
-    pub fn session_cost(&self) -> f64 {
-        *self
-            .session_cost_usd
-            .lock()
-            .expect("session cost mutex poisoned")
+    /// Keep the displayed budget in sync with `Agent::set_budget_usd` --
+    /// call both together (see the REPL's `/budget` dispatch).
+    pub fn set_budget_display(&self, budget_usd: Option<f64>) {
+        *self.budget_usd.lock().expect("budget mutex poisoned") = budget_usd;
     }
 }
 
@@ -92,7 +96,7 @@ impl Ui for TermUi {
         println!("\x1b[32m  ✓ {name}\x1b[0m {}", one_line(result, 160));
     }
 
-    fn usage(&self, usage: &Usage, model_id: &str, hosted: bool) {
+    fn usage(&self, usage: &Usage, model_id: &str, hosted: bool, session_cost_usd: f64) {
         // Fires unconditionally, ahead of the early return below -- this is
         // the one guaranteed once-per-turn boundary, so it's the correct
         // place to re-arm the thinking indicator for the next turn.
@@ -104,33 +108,29 @@ impl Ui for TermUi {
             .cache_hit_rate()
             .map(|r| format!(", cache {:.0}%", r * 100.0))
             .unwrap_or_default();
+        let budget_note = self
+            .budget_usd
+            .lock()
+            .expect("budget mutex poisoned")
+            .map(|b| format!(" (of ${b:.2} budget)"))
+            .unwrap_or_default();
 
         // Unrecognized model id (a BYOK user's own custom string, not in
         // KNOWN_MODELS) -- show token counts with no cost estimate rather
         // than a wrong or fabricated one.
-        let Some(entry) = lookup_model(model_id) else {
+        let Some(turn_cost) = estimate_cost_usd(usage, model_id, hosted) else {
             println!(
                 "\x1b[90m  ↳ [{model_id}] {} in / {} out{cache_note}\x1b[0m",
                 usage.prompt_tokens, usage.completion_tokens,
             );
             return;
         };
-
-        let turn_cost = estimate_cost_usd(usage, &entry.wholesale_pricing, hosted);
-        let session_total = {
-            let mut total = self
-                .session_cost_usd
-                .lock()
-                .expect("session cost mutex poisoned");
-            *total += turn_cost;
-            *total
-        };
         // 6 decimals: a single "hivemind" turn is routinely sub-$0.0001 —
         // at 4 decimals the running total looked like a stuck "$0.0000"
         // even while correctly accumulating (caught by end-to-end testing,
         // not a logic bug — just not enough resolution to show it).
         println!(
-            "\x1b[90m  ↳ [{model_id}] {} in / {} out{cache_note} · ${turn_cost:.6} turn / ${session_total:.6} session\x1b[0m",
+            "\x1b[90m  ↳ [{model_id}] {} in / {} out{cache_note} · ${turn_cost:.6} turn / ${session_cost_usd:.6} session{budget_note}\x1b[0m",
             usage.prompt_tokens, usage.completion_tokens,
         );
     }
@@ -151,26 +151,12 @@ impl Ui for TermUi {
             "\x1b[90m  ⤵ compacted context: {messages_before} → {messages_after} messages ({tokens_before} tokens before)\x1b[0m"
         );
     }
-}
 
-/// A model's provider bills cache-miss and cache-hit prompt tokens at
-/// different rates; when a response doesn't report the split, treat the
-/// whole prompt as a cache miss (the conservative, never-underestimate
-/// default). `hosted` applies HiveMind's margin on top of the wholesale
-/// price, since that's what a hosted user is actually billed; a BYOK key
-/// pays the upstream provider's wholesale price directly.
-fn estimate_cost_usd(usage: &Usage, pricing: &Pricing, hosted: bool) -> f64 {
-    let miss = usage.cache_miss_tokens.unwrap_or(usage.prompt_tokens) as f64;
-    let hit = usage.cache_hit_tokens.unwrap_or(0) as f64;
-    let out = usage.completion_tokens as f64;
-    let wholesale = (miss * pricing.input_per_m
-        + hit * pricing.input_cache_read_per_m
-        + out * pricing.output_per_m)
-        / 1_000_000.0;
-    if hosted {
-        wholesale * HOSTED_MARKUP_MULTIPLIER
-    } else {
-        wholesale
+    fn stopped_for_budget(&self, spent_usd: f64, budget_usd: f64) {
+        println!(
+            "\x1b[33m⛔ stopped: session cost ${spent_usd:.6} has reached the ${budget_usd:.2} budget\x1b[0m"
+        );
+        println!("\x1b[90m  raise it with --budget, or /budget <amount>, or /budget off\x1b[0m");
     }
 }
 

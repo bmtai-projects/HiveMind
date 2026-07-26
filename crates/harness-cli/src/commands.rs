@@ -7,6 +7,7 @@ pub const COMMAND_NAMES: &[&str] = &[
     "/compact",
     "/model",
     "/reasoning",
+    "/budget",
     "/cost",
     "/undo",
     "/exit",
@@ -19,6 +20,7 @@ Commands:
   /compact           fold older turns into a summary now
   /model [id]        show available models, or switch the active one
   /reasoning [level]  show/set reasoning effort for the active model, or `off`
+  /budget [amount]   show/set a session USD spend cap, or `off` (default: unbounded)
   /cost              show session cost so far
   /undo [n]          undo the last n turns (default 1): restores edited/written
                      files and truncates the conversation back to before them
@@ -43,6 +45,13 @@ pub enum ReasoningArg {
     Set(String),
 }
 
+pub enum BudgetArg {
+    Show,
+    Off,
+    Set(f64),
+    Invalid(String),
+}
+
 pub enum UndoArg {
     Count(usize),
     Invalid(String),
@@ -54,6 +63,7 @@ pub enum SlashCommand {
     Compact,
     Model(ModelArg),
     Reasoning(ReasoningArg),
+    Budget(BudgetArg),
     Cost,
     Undo(UndoArg),
     Exit,
@@ -80,6 +90,14 @@ pub fn parse(line: &str) -> Option<SlashCommand> {
             None => ReasoningArg::Show,
             Some("off") => ReasoningArg::Off,
             Some(a) => ReasoningArg::Set(a.to_string()),
+        }),
+        "budget" => SlashCommand::Budget(match arg {
+            None => BudgetArg::Show,
+            Some("off") => BudgetArg::Off,
+            Some(a) => a
+                .parse::<f64>()
+                .map(BudgetArg::Set)
+                .unwrap_or_else(|_| BudgetArg::Invalid(a.to_string())),
         }),
         "cost" | "usage" => SlashCommand::Cost,
         "undo" => SlashCommand::Undo(match arg {
@@ -159,6 +177,40 @@ mod tests {
         match parse("/reasoning high") {
             Some(SlashCommand::Reasoning(ReasoningArg::Set(level))) => assert_eq!(level, "high"),
             _ => panic!("expected Reasoning(Set(..))"),
+        }
+    }
+
+    #[test]
+    fn budget_with_no_arg_means_show() {
+        assert!(matches!(
+            parse("/budget"),
+            Some(SlashCommand::Budget(BudgetArg::Show))
+        ));
+    }
+
+    #[test]
+    fn budget_off_is_its_own_variant() {
+        assert!(matches!(
+            parse("/budget off"),
+            Some(SlashCommand::Budget(BudgetArg::Off))
+        ));
+    }
+
+    #[test]
+    fn budget_with_a_number_means_set() {
+        match parse("/budget 0.50") {
+            Some(SlashCommand::Budget(BudgetArg::Set(amount))) => {
+                assert!((amount - 0.5).abs() < 1e-9)
+            }
+            _ => panic!("expected Budget(Set(..))"),
+        }
+    }
+
+    #[test]
+    fn budget_with_a_non_number_is_invalid_not_silently_ignored() {
+        match parse("/budget lots") {
+            Some(SlashCommand::Budget(BudgetArg::Invalid(s))) => assert_eq!(s, "lots"),
+            other => panic!("expected Invalid(\"lots\"), got {}", other.is_some()),
         }
     }
 
