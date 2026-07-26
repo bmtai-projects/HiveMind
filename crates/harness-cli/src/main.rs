@@ -21,7 +21,7 @@ use std::sync::Arc;
 use clap::{Args, Parser, Subcommand};
 use reedline::Signal;
 
-use commands::{ModelArg, SlashCommand, UndoArg};
+use commands::{ModelArg, ReasoningArg, SlashCommand, UndoArg};
 use harness_agent::Agent;
 use harness_config::CliOverrides;
 use harness_tools::{
@@ -139,7 +139,16 @@ struct ActivateArgs {
     #[arg(long)]
     yolo: bool,
 
-    /// Print streamed model reasoning (reasoning-capable models only).
+    /// Reasoning effort for models that support it (e.g. "high", "medium";
+    /// valid values vary per model -- run `hivemind models` or `/reasoning`
+    /// with no argument to check). Off by default: reasoning-capable
+    /// models run slower and cost more, so it's opt-in, not assumed.
+    #[arg(long)]
+    reasoning_effort: Option<String>,
+
+    /// Print streamed model reasoning (reasoning-capable models only). A
+    /// lightweight "thinking..." indicator shows either way -- this flag
+    /// only controls whether the full raw text is also dumped.
     #[arg(long)]
     show_reasoning: bool,
 }
@@ -147,8 +156,13 @@ struct ActivateArgs {
 fn print_model_catalog() {
     println!("Available models:");
     for m in harness_config::KNOWN_MODELS {
+        let reasoning = if m.reasoning_efforts.is_empty() {
+            String::new()
+        } else {
+            format!(" · reasoning: {}", m.reasoning_efforts.join("/"))
+        };
         println!(
-            "  {:<18} {:<18} ${:.2} in / ${:.2} out per M tok · {}K context",
+            "  {:<18} {:<18} ${:.2} in / ${:.2} out per M tok · {}K context{reasoning}",
             m.id,
             m.display_name,
             m.wholesale_pricing.input_per_m,
@@ -190,6 +204,7 @@ async fn run(args: ActivateArgs) -> anyhow::Result<()> {
         api_key: args.api_key.clone(),
         base_url: args.base_url.clone(),
         model: args.model.clone(),
+        reasoning_effort: args.reasoning_effort.clone(),
     };
     let resolved = harness_config::resolve(
         &config_path,
@@ -287,6 +302,47 @@ async fn repl(agent: &mut Agent, ws: Workspace, ui: Arc<TermUi>, yolo: bool) -> 
                 SlashCommand::Model(ModelArg::Set(id)) => {
                     agent.set_model(id.clone());
                     println!("model set to {id}");
+                }
+                SlashCommand::Reasoning(ReasoningArg::Show) => {
+                    match agent.reasoning_effort() {
+                        Some(level) => println!("reasoning: {level}"),
+                        None => println!("reasoning: off"),
+                    }
+                    let valid = agent.reasoning_efforts_for_current_model();
+                    if valid.is_empty() {
+                        println!(
+                            "  {} doesn't support adjustable reasoning effort",
+                            agent.current_model()
+                        );
+                    } else {
+                        println!(
+                            "  valid for {}: {} (or \"off\")",
+                            agent.current_model(),
+                            valid.join(", ")
+                        );
+                    }
+                }
+                SlashCommand::Reasoning(ReasoningArg::Off) => {
+                    agent.set_reasoning_effort(None);
+                    println!("reasoning off");
+                }
+                SlashCommand::Reasoning(ReasoningArg::Set(level)) => {
+                    let valid = agent.reasoning_efforts_for_current_model();
+                    if valid.is_empty() {
+                        println!(
+                            "{} doesn't support adjustable reasoning effort",
+                            agent.current_model()
+                        );
+                    } else if valid.contains(&level.as_str()) {
+                        agent.set_reasoning_effort(Some(level.clone()));
+                        println!("reasoning set to {level}");
+                    } else {
+                        println!(
+                            "invalid reasoning level {level:?} for {} -- valid: {}",
+                            agent.current_model(),
+                            valid.join(", ")
+                        );
+                    }
                 }
                 SlashCommand::Cost => println!("session cost so far: ${:.6}", ui.session_cost()),
                 SlashCommand::Undo(UndoArg::Count(n)) => match agent.undo(n).await {

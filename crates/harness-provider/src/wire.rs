@@ -20,10 +20,13 @@ pub(crate) struct WireRequest<'a> {
     pub temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
-    // Note: reasoning effort is deliberately NOT sent — DeepSeek has no
-    // confirmed `reasoning_effort` parameter; v4-pro reasons unconditionally
-    // and streams it back as `reasoning_content`. Sending an unverified
-    // field risks a hard 400 on strict deployments.
+    // Sent only when the caller has already confirmed the active model
+    // supports this exact value (see harness_config::ModelCatalogEntry's
+    // `reasoning_efforts` and harness_agent::Agent's per-turn gating) --
+    // never sent speculatively, since an unsupported value is a hard 400
+    // on some deployments.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<&'a str>,
 }
 
 #[derive(Serialize)]

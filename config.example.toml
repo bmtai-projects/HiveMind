@@ -8,6 +8,10 @@
 # model = "hivemind"        # hosted mode: "hivemind" (default) or one of the 6 real coding
                              # models `hivemind models` lists; BYOK: a model id your own
                              # provider key recognizes (e.g. "deepseek-v4-pro")
+# reasoning_effort = "high" # off by default (reasoning-capable models cost more / run slower).
+                             # Valid values differ per model -- `hivemind models` lists them,
+                             # or run `/reasoning` with no argument in the REPL. Silently not
+                             # sent if the active model doesn't support the value you set.
 
 [agent]
 max_turns = 60                      # hard cap on sample<->tool cycles per input (one turn can batch several tool calls)

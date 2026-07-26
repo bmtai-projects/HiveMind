@@ -34,6 +34,12 @@ pub struct Agent {
     /// (true) or paid directly to the upstream provider via a BYOK key
     /// (false) -- only affects the live cost readout, see `crate::ui::Ui::usage`.
     hosted: bool,
+    /// User intent, not necessarily what gets sent -- gated per-model
+    /// against `harness_config::lookup_model(...).reasoning_efforts` fresh
+    /// every turn in `run()`, since `/model` can switch to a model that
+    /// doesn't support whatever was requested (or doesn't support the
+    /// parameter at all). Sticky like `default_model`.
+    reasoning_effort: Option<String>,
     last_total_tokens: u64,
     context_window: u64,
 
@@ -85,6 +91,7 @@ impl Agent {
             current_model: default_model.clone(),
             default_model,
             hosted: resolved.hosted,
+            reasoning_effort: resolved.reasoning_effort,
             last_total_tokens: 0,
             context_window,
             repeat_count: 0,
@@ -111,6 +118,31 @@ impl Agent {
     pub fn set_model(&mut self, model: String) {
         self.default_model = model.clone();
         self.current_model = model;
+    }
+
+    pub fn reasoning_effort(&self) -> Option<&str> {
+        self.reasoning_effort.as_deref()
+    }
+
+    /// Which `reasoning_effort` values the *current* model actually
+    /// accepts -- empty means it either doesn't support the parameter, or
+    /// (for a couple of models that reason unconditionally but only expose
+    /// OpenRouter's richer `reasoning: {...}` object) isn't wired up here.
+    /// Callers (the REPL's `/reasoning` command) should validate against
+    /// this before calling `set_reasoning_effort`, since this type doesn't
+    /// -- same trust boundary as `set_model` not validating BYOK ids.
+    pub fn reasoning_efforts_for_current_model(&self) -> &'static [&'static str] {
+        harness_config::lookup_model(&self.current_model)
+            .map(|m| m.reasoning_efforts)
+            .unwrap_or(&[])
+    }
+
+    /// Set the requested reasoning effort, sticky like `set_model`. Not
+    /// validated here -- gated fresh against the active model every turn
+    /// in `run()`, since `/model` can switch to a model that doesn't
+    /// support it after this was set.
+    pub fn set_reasoning_effort(&mut self, effort: Option<String>) {
+        self.reasoning_effort = effort;
     }
 
     /// Force a compaction pass right now, bypassing the usage-threshold
@@ -162,13 +194,24 @@ impl Agent {
         for _turn in 0..self.policy.max_turns {
             self.compact_if_needed().await;
 
+            // Gated fresh every turn, not just at set_reasoning_effort time
+            // -- /model can switch to something that doesn't support
+            // whatever was requested (or doesn't support the parameter at
+            // all), and this must silently omit it rather than send a
+            // value the active model will 400 on.
+            let gated_reasoning_effort = self.reasoning_effort.as_deref().and_then(|effort| {
+                self.reasoning_efforts_for_current_model()
+                    .contains(&effort)
+                    .then(|| effort.to_string())
+            });
+
             let mut req = ChatRequest {
                 model: self.current_model.clone(),
                 messages: std::mem::take(&mut self.messages),
                 tools: self.tools.schemas(),
                 temperature: None,
                 max_tokens: None,
-                reasoning_effort: None,
+                reasoning_effort: gated_reasoning_effort,
             };
 
             let mut rx = self.client.stream(&req);

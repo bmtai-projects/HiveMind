@@ -2,7 +2,15 @@
 //! reuses so `/`-completion and dispatch can never drift apart.
 
 pub const COMMAND_NAMES: &[&str] = &[
-    "/help", "/clear", "/compact", "/model", "/cost", "/undo", "/exit", "/quit",
+    "/help",
+    "/clear",
+    "/compact",
+    "/model",
+    "/reasoning",
+    "/cost",
+    "/undo",
+    "/exit",
+    "/quit",
 ];
 
 pub const HELP_TEXT: &str = "\
@@ -10,6 +18,7 @@ Commands:
   /help              show this list
   /compact           fold older turns into a summary now
   /model [id]        show available models, or switch the active one
+  /reasoning [level]  show/set reasoning effort for the active model, or `off`
   /cost              show session cost so far
   /undo [n]          undo the last n turns (default 1): restores edited/written
                      files and truncates the conversation back to before them
@@ -24,6 +33,16 @@ pub enum ModelArg {
     Set(String),
 }
 
+/// Unlike `ModelArg`, validity genuinely depends on the active model (see
+/// `harness_config::ModelCatalogEntry::reasoning_efforts`), so this stays a
+/// raw string here too -- validated at the dispatch site in `main.rs`,
+/// which has the live `Agent` to check against.
+pub enum ReasoningArg {
+    Show,
+    Off,
+    Set(String),
+}
+
 pub enum UndoArg {
     Count(usize),
     Invalid(String),
@@ -34,6 +53,7 @@ pub enum SlashCommand {
     Clear,
     Compact,
     Model(ModelArg),
+    Reasoning(ReasoningArg),
     Cost,
     Undo(UndoArg),
     Exit,
@@ -55,6 +75,11 @@ pub fn parse(line: &str) -> Option<SlashCommand> {
         "model" => SlashCommand::Model(match arg {
             None => ModelArg::Show,
             Some(a) => ModelArg::Set(a.to_string()),
+        }),
+        "reasoning" => SlashCommand::Reasoning(match arg {
+            None => ReasoningArg::Show,
+            Some("off") => ReasoningArg::Off,
+            Some(a) => ReasoningArg::Set(a.to_string()),
         }),
         "cost" | "usage" => SlashCommand::Cost,
         "undo" => SlashCommand::Undo(match arg {
@@ -110,6 +135,30 @@ mod tests {
         match parse("/model some-custom-id") {
             Some(SlashCommand::Model(ModelArg::Set(id))) => assert_eq!(id, "some-custom-id"),
             _ => panic!("expected Model(Set(..))"),
+        }
+    }
+
+    #[test]
+    fn reasoning_with_no_arg_means_show() {
+        assert!(matches!(
+            parse("/reasoning"),
+            Some(SlashCommand::Reasoning(ReasoningArg::Show))
+        ));
+    }
+
+    #[test]
+    fn reasoning_off_is_its_own_variant_not_a_literal_string_set() {
+        assert!(matches!(
+            parse("/reasoning off"),
+            Some(SlashCommand::Reasoning(ReasoningArg::Off))
+        ));
+    }
+
+    #[test]
+    fn reasoning_with_a_level_means_set_to_that_exact_string() {
+        match parse("/reasoning high") {
+            Some(SlashCommand::Reasoning(ReasoningArg::Set(level))) => assert_eq!(level, "high"),
+            _ => panic!("expected Reasoning(Set(..))"),
         }
     }
 

@@ -80,6 +80,7 @@ impl DeepSeekClient {
             },
             temperature: req.temperature,
             max_tokens: req.max_tokens,
+            reasoning_effort: req.reasoning_effort.as_deref(),
         };
         let body: Bytes = match serde_json::to_vec(&wire_req) {
             Ok(b) => Bytes::from(b),

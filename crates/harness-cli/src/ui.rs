@@ -5,6 +5,7 @@
 
 use std::io::{self, Write};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use harness_agent::Ui;
@@ -14,6 +15,15 @@ use harness_types::Usage;
 pub struct TermUi {
     show_reasoning: bool,
     session_cost_usd: Mutex<f64>,
+    /// Whether the "thinking..." indicator has already fired for the turn
+    /// currently in flight -- reset in `usage()`, which fires exactly once
+    /// per turn right after the full response (reasoning, content, and any
+    /// tool calls together) finishes draining. This is deliberately a
+    /// lightweight always-on signal, separate from `show_reasoning`: a user
+    /// should always be able to tell the model is thinking (not stalled),
+    /// even if they never want the full raw chain-of-thought dumped to
+    /// the terminal.
+    thinking_shown: AtomicBool,
 }
 
 impl TermUi {
@@ -21,6 +31,7 @@ impl TermUi {
         Self {
             show_reasoning,
             session_cost_usd: Mutex::new(0.0),
+            thinking_shown: AtomicBool::new(false),
         }
     }
 
@@ -40,6 +51,14 @@ impl Ui for TermUi {
     }
 
     fn reasoning_delta(&self, text: &str) {
+        // Fires once per turn, on the very first reasoning fragment --
+        // works for every reasoning-capable model, including the ones that
+        // reason unconditionally (see harness_config::ModelCatalogEntry's
+        // reasoning_efforts doc comment) and never had a reasoning_effort
+        // request sent for them at all.
+        if !self.thinking_shown.swap(true, Ordering::Relaxed) {
+            println!("\x1b[2;3m⟡ thinking...\x1b[0m");
+        }
         if self.show_reasoning {
             print!("\x1b[90m{text}\x1b[0m");
             flush_stdout();
@@ -74,6 +93,10 @@ impl Ui for TermUi {
     }
 
     fn usage(&self, usage: &Usage, model_id: &str, hosted: bool) {
+        // Fires unconditionally, ahead of the early return below -- this is
+        // the one guaranteed once-per-turn boundary, so it's the correct
+        // place to re-arm the thinking indicator for the next turn.
+        self.thinking_shown.store(false, Ordering::Relaxed);
         if usage.total_tokens == 0 {
             return;
         }

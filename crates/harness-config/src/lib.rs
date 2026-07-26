@@ -44,6 +44,17 @@ pub struct ModelCatalogEntry {
     /// `HOSTED_MARKUP_MULTIPLIER`; a BYOK request pays this directly, with
     /// no HiveMind margin.
     pub wholesale_pricing: Pricing,
+    /// Valid `reasoning_effort` values this model actually accepts, per
+    /// OpenRouter's own published per-model metadata (verified live against
+    /// https://openrouter.ai/api/v1/models on 2026-07-26) -- NOT a fixed
+    /// global enum, because it isn't one: e.g. "hivemind" only accepts
+    /// "high"/"xhigh", qwen3-coder-plus doesn't support this parameter at
+    /// all, and several models (grok-build, kimi-k2-code) reason
+    /// unconditionally but only expose OpenRouter's richer `reasoning:
+    /// {...}` object, not this string shorthand -- deliberately not
+    /// implemented here, so their list is empty even though they do
+    /// reason. Empty means "don't send reasoning_effort for this model."
+    pub reasoning_efforts: &'static [&'static str],
 }
 
 /// Must match `HiveMind-server`'s `config.ts` `MARKUP_MULTIPLIER` default.
@@ -70,6 +81,7 @@ pub const KNOWN_MODELS: &[ModelCatalogEntry] = &[
             input_cache_read_per_m: 0.01876,
             output_per_m: 0.1876,
         },
+        reasoning_efforts: &["high", "xhigh"],
     },
     ModelCatalogEntry {
         id: "claude-sonnet-5",
@@ -80,6 +92,7 @@ pub const KNOWN_MODELS: &[ModelCatalogEntry] = &[
             input_cache_read_per_m: 0.2,
             output_per_m: 10.0,
         },
+        reasoning_efforts: &["low", "medium", "high", "xhigh", "max"],
     },
     ModelCatalogEntry {
         id: "gpt-5.3-codex",
@@ -90,6 +103,7 @@ pub const KNOWN_MODELS: &[ModelCatalogEntry] = &[
             input_cache_read_per_m: 0.175,
             output_per_m: 14.0,
         },
+        reasoning_efforts: &["none", "low", "medium", "high", "xhigh"],
     },
     ModelCatalogEntry {
         id: "gemini-3.1-pro",
@@ -100,6 +114,10 @@ pub const KNOWN_MODELS: &[ModelCatalogEntry] = &[
             input_cache_read_per_m: 0.2,
             output_per_m: 12.0,
         },
+        // Reasoning is mandatory for this model (always on regardless of
+        // this parameter) -- listing efforts still lets a user pick how
+        // hard it thinks, just never lets them turn it off.
+        reasoning_efforts: &["low", "medium", "high"],
     },
     ModelCatalogEntry {
         id: "grok-build",
@@ -110,6 +128,10 @@ pub const KNOWN_MODELS: &[ModelCatalogEntry] = &[
             input_cache_read_per_m: 0.2,
             output_per_m: 2.0,
         },
+        // Reasons unconditionally, but only exposes OpenRouter's `reasoning:
+        // {...}` object, not the reasoning_effort string -- empty on
+        // purpose (see the field doc comment).
+        reasoning_efforts: &[],
     },
     ModelCatalogEntry {
         id: "qwen3-coder-plus",
@@ -120,6 +142,8 @@ pub const KNOWN_MODELS: &[ModelCatalogEntry] = &[
             input_cache_read_per_m: 0.13,
             output_per_m: 3.25,
         },
+        // Genuinely no reasoning support, per OpenRouter's own metadata.
+        reasoning_efforts: &[],
     },
     ModelCatalogEntry {
         id: "kimi-k2-code",
@@ -130,6 +154,8 @@ pub const KNOWN_MODELS: &[ModelCatalogEntry] = &[
             input_cache_read_per_m: 0.15,
             output_per_m: 3.5,
         },
+        // Reasons unconditionally, same caveat as grok-build above.
+        reasoning_efforts: &[],
     },
 ];
 
@@ -233,6 +259,13 @@ pub struct Resolved {
     /// apply `HOSTED_MARKUP_MULTIPLIER` — a BYOK key pays the upstream
     /// provider directly, with no HiveMind margin.
     pub hosted: bool,
+    /// Off (`None`) unless the user opts in via `--reasoning-effort` or
+    /// `config.toml`'s `[model] reasoning_effort` -- not every model
+    /// supports this, and the ones that do bill more/run slower for it, so
+    /// it's never assumed on. Gated per-model at request time by
+    /// `harness_agent::Agent`, not here (the active model can change
+    /// mid-session via `/model`; this crate just carries the user's intent).
+    pub reasoning_effort: Option<String>,
     pub policy: AgentPolicy,
     pub hooks: Vec<HookSpec>,
 }
@@ -259,6 +292,7 @@ struct ModelSection {
     api_key: Option<String>,
     base_url: Option<String>,
     model: Option<String>,
+    reasoning_effort: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -309,6 +343,7 @@ pub struct CliOverrides {
     pub api_key: Option<String>,
     pub base_url: Option<String>,
     pub model: Option<String>,
+    pub reasoning_effort: Option<String>,
 }
 
 /// A token minted by the hosted backend (`hivemind auth login`), paired
@@ -386,6 +421,10 @@ pub fn resolve(
             }
         });
 
+    let reasoning_effort = cli
+        .reasoning_effort
+        .or_else(|| file.model.reasoning_effort.clone());
+
     let mut policy = AgentPolicy::default();
     if let Some(v) = file.agent.max_turns {
         policy.max_turns = v;
@@ -407,6 +446,7 @@ pub fn resolve(
         endpoint: Endpoint { base_url, api_key },
         default_model,
         hosted,
+        reasoning_effort,
         policy,
         hooks: file.hooks,
     })

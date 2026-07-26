@@ -124,15 +124,6 @@ impl Usage {
     }
 }
 
-/// Reasoning effort passthrough for models that support it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ReasoningEffort {
-    Low,
-    Medium,
-    High,
-}
-
 /// A single sampling request, provider-neutral.
 #[derive(Debug, Clone)]
 pub struct ChatRequest {
@@ -141,7 +132,14 @@ pub struct ChatRequest {
     pub tools: Vec<ToolSchema>,
     pub temperature: Option<f32>,
     pub max_tokens: Option<u32>,
-    pub reasoning_effort: Option<ReasoningEffort>,
+    /// Passthrough for models that support OpenRouter's `reasoning_effort`
+    /// parameter -- deliberately a free string, not a closed enum: valid
+    /// values genuinely differ per model (e.g. "hivemind" only accepts
+    /// "high"/"xhigh"; others add "xhigh"/"max"/"none"), so the real
+    /// validation lives per-model in `harness_config::ModelCatalogEntry`,
+    /// not in this type. The caller is expected to have already checked
+    /// the active model actually supports whatever value is set here.
+    pub reasoning_effort: Option<String>,
 }
 
 /// The assembled result of one sampling request.
