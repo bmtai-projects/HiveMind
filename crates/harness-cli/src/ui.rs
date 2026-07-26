@@ -57,9 +57,20 @@ impl Ui for TermUi {
     fn tool_end(&self, name: &str, result: &str, is_error: bool) {
         if is_error {
             println!("\x1b[31m  ✗ {name}\x1b[0m {}", one_line(result, 160));
-        } else {
-            println!("\x1b[32m  ✓ {name}\x1b[0m {}", one_line(result, 160));
+            return;
         }
+        // todo_write's result is a multi-line checklist -- one_line() would
+        // collapse it to an unreadable single line, defeating the entire
+        // point of a visible plan. Every other tool's result is fine
+        // flattened; this is the one deliberate exception.
+        if name == "todo_write" {
+            println!("\x1b[32m  ✓ {name}\x1b[0m");
+            for line in result.lines() {
+                println!("\x1b[90m      {line}\x1b[0m");
+            }
+            return;
+        }
+        println!("\x1b[32m  ✓ {name}\x1b[0m {}", one_line(result, 160));
     }
 
     fn usage(&self, usage: &Usage, model_id: &str, hosted: bool) {

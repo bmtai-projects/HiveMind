@@ -10,7 +10,7 @@
                              # provider key recognizes (e.g. "deepseek-v4-pro")
 
 [agent]
-max_turns = 25                      # hard cap on sample<->tool cycles per input
+max_turns = 60                      # hard cap on sample<->tool cycles per input (one turn can batch several tool calls)
 compaction_threshold_percent = 75   # summarize older turns once usage crosses this % of the context window
 auto_escalate = true                # bump off "hivemind" after repeated/failing tool calls on one task
 escalate_to_model = "claude-sonnet-5" # model to escalate to (only fires while "hivemind" is active)

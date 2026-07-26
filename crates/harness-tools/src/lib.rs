@@ -7,6 +7,7 @@ mod error;
 mod fs;
 mod search;
 mod semantic;
+mod todo;
 mod tool;
 mod walk;
 
@@ -16,4 +17,5 @@ pub use error::ToolError;
 pub use fs::{ListDir, ReadFile, Workspace, WriteFile};
 pub use search::Search;
 pub use semantic::{Embedder, HashingEmbedder, SemanticSearch};
+pub use todo::TodoWrite;
 pub use tool::{Registry, Tool, obj_schema};

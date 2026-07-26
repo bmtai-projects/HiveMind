@@ -25,7 +25,8 @@ use commands::{ModelArg, SlashCommand, UndoArg};
 use harness_agent::Agent;
 use harness_config::CliOverrides;
 use harness_tools::{
-    Bash, EditFile, ListDir, ReadFile, Registry, Search, SemanticSearch, Workspace, WriteFile,
+    Bash, EditFile, ListDir, ReadFile, Registry, Search, SemanticSearch, TodoWrite, Workspace,
+    WriteFile,
 };
 use input::HivePrompt;
 use ui::TermUi;
@@ -33,9 +34,16 @@ use ui::TermUi;
 const SYSTEM_PROMPT: &str =
     "You are a terminal-based coding agent operating inside a user's workspace.
 
-You can search, read, create, and edit files, list directories, and run shell
-commands via the provided tools. Work in small, verifiable steps:
+You can search, read, create, and edit files, list directories, run shell
+commands, and track a plan via the provided tools. Work in small, verifiable
+steps:
 
+- For any task with 3+ distinct steps -- especially ones spanning several
+  files or components (e.g. \"build a backend and a frontend and wire them
+  together\") -- call `todo_write` with the full breakdown before starting.
+  Keep exactly one item in_progress at a time, and mark an item completed
+  immediately after finishing it, not in a batch at the end. Skip it for
+  single-step or trivial requests.
 - Investigate before acting: use `search` for an exact string, or
   `semantic_search` to find code by concept when you don't know the symbol
   (prefer both over shell grep); then `read_file` and `list_dir` for detail.
@@ -44,7 +52,12 @@ commands via the provided tools. Work in small, verifiable steps:
   parts you leave untouched. Copy `old_string` verbatim from the file
   (whitespace included) and give enough context that it matches one place.
   Reserve `write_file` for creating new files.
-- Make focused changes, then verify them (build/test/inspect) with run_shell.
+- Make focused changes, then verify them with run_shell -- and mean it: if
+  you scaffolded or changed a server, script, or app, actually install
+  dependencies and run it, then hit it (curl an endpoint, run the test
+  suite, execute the script) and read the real output. Passing a build/typecheck
+  is not the same as confirming the thing works. Never claim something runs,
+  passes, or is fixed without having just observed that yourself.
 - Prefer tools over guessing. Never claim you did something you did not do.
 - When the task is complete, stop calling tools and give a short final summary
   of what you changed and how you verified it.
@@ -198,6 +211,7 @@ async fn run(args: ActivateArgs) -> anyhow::Result<()> {
     registry.register(Arc::new(ListDir(ws.clone())));
     registry.register(Arc::new(Search(ws.clone())));
     registry.register(Arc::new(SemanticSearch::new(ws.clone())));
+    registry.register(Arc::new(TodoWrite));
 
     let mut bash = Bash::new(workdir.clone());
     if !args.yolo && !headless {

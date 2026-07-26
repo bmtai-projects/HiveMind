@@ -152,6 +152,13 @@ pub struct Endpoint {
 /// Agent-loop policy knobs, all with sane defaults.
 #[derive(Debug, Clone)]
 pub struct AgentPolicy {
+    /// A turn is one sample-then-dispatch round, not one file -- a single
+    /// turn can batch many tool calls (`Registry::dispatch_many` runs a
+    /// whole turn's calls concurrently). 25 was tuned for small, focused
+    /// edits; a task that scaffolds multiple files, installs dependencies,
+    /// runs them, and fixes what's broken burns turns much faster and can
+    /// legitimately need this many. Configurable via `[agent] max_turns`
+    /// in config.toml if even this isn't enough for a given task.
     pub max_turns: u32,
     /// Compact the conversation once usage crosses this percent of the
     /// active model's context window.
@@ -172,7 +179,7 @@ pub struct AgentPolicy {
 impl Default for AgentPolicy {
     fn default() -> Self {
         Self {
-            max_turns: 25,
+            max_turns: 60,
             compaction_threshold_percent: 75,
             auto_escalate: true,
             escalate_to_model: "claude-sonnet-5".to_string(),
