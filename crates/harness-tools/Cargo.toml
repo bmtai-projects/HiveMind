@@ -13,3 +13,10 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }
 walkdir = { workspace = true }
+rust_xlsxwriter = "0.96.0"
+# default-features off: printpdf's defaults pull in "html" -> a full HTML/CSS
+# layout engine (azul-layout) + fontconfig, meant for HTML-to-PDF rendering.
+# We only ever emit hand-placed text/lines/rects with the 14 built-in PDF
+# fonts (no embedding, no HTML), which needs none of that -- keeps the
+# release binary lean across all 5 cross-compiled targets.
+printpdf = { version = "0.12.4", default-features = false }

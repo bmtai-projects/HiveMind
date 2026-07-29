@@ -140,6 +140,15 @@ pub struct ChatRequest {
     /// not in this type. The caller is expected to have already checked
     /// the active model actually supports whatever value is set here.
     pub reasoning_effort: Option<String>,
+    /// Ask the provider to cache the prompt prefix (system prompt + tool
+    /// manifest) by marking it with an explicit breakpoint on the wire.
+    ///
+    /// Same contract as `reasoning_effort` above: purely a passthrough that
+    /// the *caller* is responsible for gating, because only some providers
+    /// accept it (see `harness_config::ModelCatalogEntry::
+    /// needs_explicit_cache_control`). Providers that cache automatically
+    /// need this off — sending it to them buys nothing and risks a 400.
+    pub cache_prompt_prefix: bool,
 }
 
 /// The assembled result of one sampling request.

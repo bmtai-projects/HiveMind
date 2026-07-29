@@ -13,11 +13,21 @@ use harness_types::{ChatRequest, Message, Role, StreamEvent, ToolCall};
 use crate::checkpoint::{self, Checkpoint, UndoReport};
 use crate::compaction::{CompactionPolicy, maybe_compact};
 use crate::hooks::{self, HookDecision};
+use crate::interjection::InterjectionQueue;
+use crate::session::{SessionRecord, SessionStore, derive_title, unix_now};
 use crate::ui::Ui;
 
 /// Most-recent messages (after the system prompt) a compaction pass keeps
 /// verbatim. Not user-configurable yet — a reasonable fixed default.
 const COMPACTION_KEEP_RECENT: usize = 8;
+
+/// Last-resort ceiling, as a percent of the active model's context window,
+/// past which a request is refused rather than sent. Deliberately higher
+/// than `compaction_threshold_percent` (75% default) -- compaction is the
+/// first line of defense and should already have acted well before this;
+/// this exists only for what compaction *can't* fix (no older turns left
+/// to fold) or when the estimate itself runs a little hot.
+const SEND_GUARD_PERCENT: u64 = 95;
 
 pub struct Agent {
     client: DeepSeekClient,
@@ -71,6 +81,24 @@ pub struct Agent {
     /// From `config.toml`'s `[[hooks]]`. Empty unless the user configured
     /// any -- see `crate::hooks`.
     hooks: Vec<HookSpec>,
+
+    /// Messages the user sent *while* a turn was already running, delivered
+    /// at the next turn boundary. Cloneable handle: hosts hand a clone to
+    /// whatever reads input concurrently (see `crate::interjection`).
+    interjections: InterjectionQueue,
+
+    /// Where this conversation is persisted, if anywhere. `None` disables
+    /// persistence entirely (used by tests and one-shot `-p` runs, which
+    /// have nothing worth resuming).
+    persistence: Option<Persistence>,
+}
+
+/// Bookkeeping for a session that's being written to disk.
+struct Persistence {
+    store: SessionStore,
+    id: String,
+    workspace: String,
+    created_at: u64,
 }
 
 impl Agent {
@@ -115,6 +143,95 @@ impl Agent {
             workspace,
             checkpoints: Vec::new(),
             hooks: resolved.hooks,
+            interjections: InterjectionQueue::new(),
+            persistence: None,
+        }
+    }
+
+    /// Handle for delivering mid-turn messages. Clone it and hand it to
+    /// whatever reads user input concurrently with `run()`; anything pushed
+    /// is delivered to the model at the next turn boundary.
+    pub fn interjections(&self) -> InterjectionQueue {
+        self.interjections.clone()
+    }
+
+    /// Start persisting this conversation to `store` under a fresh id.
+    /// Returns the id, so a host can print it for `--resume`.
+    pub fn enable_persistence(&mut self, store: SessionStore, workspace: String) -> String {
+        let id = SessionStore::new_id(&workspace);
+        self.persistence = Some(Persistence {
+            store,
+            id: id.clone(),
+            workspace,
+            created_at: unix_now(),
+        });
+        id
+    }
+
+    /// Adopt a previously saved conversation, continuing to persist under
+    /// its original id so `--continue` keeps following the same session
+    /// rather than forking a new one on every resume.
+    ///
+    /// The **system prompt is deliberately not restored**: `messages[0]` is
+    /// replaced with the current one. A resumed session runs on today's
+    /// binary, whose tools and guidance may differ from whenever the
+    /// session started -- replaying a stale prompt would describe tools
+    /// that no longer exist (or omit ones that now do).
+    pub fn restore(&mut self, record: SessionRecord, store: SessionStore, system_prompt: String) {
+        let mut messages = record.messages;
+        match messages.first_mut() {
+            Some(first) if first.role == Role::System => *first = Message::system(system_prompt),
+            _ => messages.insert(0, Message::system(system_prompt)),
+        }
+        self.messages = messages;
+        self.default_model = record.model.clone();
+        self.current_model = record.model;
+        self.reasoning_effort = record.reasoning_effort;
+        // Restored, not reset: resuming under a budget must continue the
+        // same allowance, not silently grant a fresh one.
+        self.session_cost_usd = record.session_cost_usd;
+        if record.budget_usd.is_some() {
+            self.budget_usd = record.budget_usd;
+        }
+        self.context_window = harness_config::lookup_model(&self.current_model)
+            .map(|m| m.context_window)
+            .unwrap_or(self.context_window);
+        self.persistence = Some(Persistence {
+            store,
+            id: record.id,
+            workspace: record.workspace,
+            created_at: record.created_at,
+        });
+    }
+
+    /// The id this session is being saved under, if persistence is on.
+    pub fn session_id(&self) -> Option<&str> {
+        self.persistence.as_ref().map(|p| p.id.as_str())
+    }
+
+    /// Write the current conversation out. Called at every turn boundary
+    /// and once more when a run settles, so a crash mid-task still leaves a
+    /// resumable session rather than losing everything since the last clean
+    /// exit. A failed save is reported and otherwise ignored -- losing
+    /// persistence is bad, but killing a working agent over it is worse.
+    fn persist(&self) {
+        let Some(p) = &self.persistence else {
+            return;
+        };
+        let record = SessionRecord {
+            id: p.id.clone(),
+            workspace: p.workspace.clone(),
+            model: self.default_model.clone(),
+            reasoning_effort: self.reasoning_effort.clone(),
+            budget_usd: self.budget_usd,
+            session_cost_usd: self.session_cost_usd,
+            messages: self.messages.clone(),
+            created_at: p.created_at,
+            updated_at: unix_now(),
+            title: derive_title(&self.messages),
+        };
+        if let Err(e) = p.store.save(&record) {
+            eprintln!("\x1b[33mwarning: could not save session: {e}\x1b[0m");
         }
     }
 
@@ -172,18 +289,10 @@ impl Agent {
         self.session_cost_usd
     }
 
-    /// Set (or clear, with `None`) the session budget, effective from the
-    /// next turn boundary -- lowering it below what's already been spent
-    /// stops the session on the very next check, same as if it had been
-    /// set that low from the start.
     pub fn set_budget_usd(&mut self, budget: Option<f64>) {
         self.budget_usd = budget;
     }
 
-    /// Force a compaction pass right now, bypassing the usage-threshold
-    /// check (an explicit user command, not the automatic turn-boundary
-    /// check `run()` already does). Returns `true` if there was enough
-    /// history to actually compact.
     pub async fn force_compact(&mut self) -> bool {
         let policy = CompactionPolicy {
             threshold_percent: 0,
@@ -203,10 +312,12 @@ impl Agent {
         )
         .await
         {
+            let summary_cost_usd = self.account_for_compaction_cost(&report);
             self.ui.compacted(
                 report.messages_before,
                 report.messages_after,
                 report.tokens_before,
+                summary_cost_usd,
             );
             self.last_total_tokens = 0;
             true
@@ -236,16 +347,29 @@ impl Agent {
             {
                 self.ui.stopped_for_budget(self.session_cost_usd, budget);
                 checkpoint::push(&mut self.checkpoints, checkpoint);
+                self.persist();
                 return Ok(());
             }
 
-            self.compact_if_needed().await;
+            let pending = self.interjections.len();
+            if let Some(text) = self.interjections.drain_formatted() {
+                self.messages.push(Message::user(text));
+                self.ui.interjected(pending);
+            }
 
-            // Gated fresh every turn, not just at set_reasoning_effort time
-            // -- /model can switch to something that doesn't support
-            // whatever was requested (or doesn't support the parameter at
-            // all), and this must silently omit it rather than send a
-            // value the active model will 400 on.
+            self.compact_if_needed().await;
+            let estimated_tokens = crate::tokens::estimate_tokens(&self.messages);
+            if self.context_window > 0
+                && estimated_tokens.saturating_mul(100)
+                    >= self.context_window.saturating_mul(SEND_GUARD_PERCENT)
+            {
+                self.ui
+                    .stopped_for_context_limit(estimated_tokens, self.context_window);
+                checkpoint::push(&mut self.checkpoints, checkpoint);
+                self.persist();
+                return Ok(());
+            }
+
             let gated_reasoning_effort = self.reasoning_effort.as_deref().and_then(|effort| {
                 self.reasoning_efforts_for_current_model()
                     .contains(&effort)
@@ -259,12 +383,15 @@ impl Agent {
                 temperature: None,
                 max_tokens: None,
                 reasoning_effort: gated_reasoning_effort,
+                // Gated per-model exactly like reasoning_effort above:
+                // only Anthropic needs (and understands) an explicit
+                // breakpoint; the rest cache automatically.
+                cache_prompt_prefix: harness_config::lookup_model(&self.current_model)
+                    .is_some_and(|m| m.needs_explicit_cache_control),
             };
 
+            self.ui.turn_started();
             let mut rx = self.client.stream(&req);
-            // `stream()` only borrowed `req` synchronously to serialize the
-            // wire request; ownership is ours again immediately, so we
-            // never had to clone the conversation just to send it.
             self.messages = std::mem::take(&mut req.messages);
 
             let resp = self.drain_stream(&mut rx).await?;
@@ -299,6 +426,7 @@ impl Agent {
 
             if !has_tool_calls {
                 checkpoint::push(&mut self.checkpoints, checkpoint);
+                self.persist();
                 return Ok(());
             }
 
@@ -306,13 +434,30 @@ impl Agent {
                 .await;
             let signature = self.messages_tail_signature();
             self.update_escalation(&signature);
+
+            // Saved per turn, not just per run: a crash (or a kill) part-way
+            // through a 20-step task must still leave everything up to here
+            // resumable.
+            self.persist();
         }
 
         checkpoint::push(&mut self.checkpoints, checkpoint);
+        self.persist();
         anyhow::bail!(
             "reached max turns ({}) without completing",
             self.policy.max_turns
         )
+    }
+
+    pub fn repair_after_interrupt(&mut self) -> bool {
+        match incomplete_tool_group_start(&self.messages) {
+            Some(idx) => {
+                self.messages.truncate(idx);
+                self.persist();
+                true
+            }
+            None => false,
+        }
     }
 
     /// Undo the last `n` completed turns: every file `edit_file`/
@@ -448,9 +593,20 @@ impl Agent {
             threshold_percent: self.policy.compaction_threshold_percent,
             keep_recent: COMPACTION_KEEP_RECENT,
         };
+        // `last_total_tokens` is the previous *response's* real usage --
+        // accurate, but stale by exactly one user message, since it can't
+        // know about whatever was just appended for the turn about to be
+        // sent. `estimate_tokens` is approximate but always current. Taking
+        // the larger of the two never under-triggers relative to either
+        // signal, which matters more here than being precise: this is what
+        // catches a huge single paste on what would otherwise look like an
+        // early, low-usage turn.
+        let effective_tokens = self
+            .last_total_tokens
+            .max(crate::tokens::estimate_tokens(&self.messages));
         if let Some(report) = maybe_compact(
             &mut self.messages,
-            self.last_total_tokens,
+            effective_tokens,
             self.context_window,
             &policy,
             &self.client,
@@ -458,14 +614,156 @@ impl Agent {
         )
         .await
         {
+            let summary_cost_usd = self.account_for_compaction_cost(&report);
             self.ui.compacted(
                 report.messages_before,
                 report.messages_after,
                 report.tokens_before,
+                summary_cost_usd,
             );
             // The next request's usage will reflect the smaller prompt;
             // reset our tracked total so we don't immediately re-trigger.
             self.last_total_tokens = 0;
         }
+    }
+
+    /// Fold a compaction pass's own summarization-call cost into
+    /// `session_cost_usd` -- without this, every compaction is a real,
+    /// billed model call that's invisible to both `/cost` and `--budget`
+    /// enforcement, a leak in the exact accounting `budget_usd` exists to
+    /// guarantee. Returns the cost added, for the UI to surface immediately.
+    fn account_for_compaction_cost(
+        &mut self,
+        report: &crate::compaction::CompactionReport,
+    ) -> Option<f64> {
+        let usage = report.summary_usage.as_ref()?;
+        let cost = crate::cost::estimate_cost_usd(usage, &self.current_model, self.hosted)?;
+        self.session_cost_usd += cost;
+        Some(cost)
+    }
+}
+
+/// Index to truncate a transcript to so it no longer ends with an assistant
+/// message whose `tool_calls` never received all their results. `None` when
+/// the transcript is already well-formed.
+///
+/// Pure and free-standing so the rule can be tested directly -- building a
+/// whole `Agent` (client, registry, workspace, UI) to exercise a list
+/// operation would test the scaffolding, not the rule.
+fn incomplete_tool_group_start(messages: &[Message]) -> Option<usize> {
+    let idx = messages
+        .iter()
+        .rposition(|m| m.role == Role::Assistant && !m.tool_calls.is_empty())?;
+    let expected = messages[idx].tool_calls.len();
+    let recorded = messages[idx + 1..]
+        .iter()
+        .filter(|m| m.role == Role::Tool)
+        .count();
+    (recorded < expected).then_some(idx)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use harness_types::ToolCall;
+
+    fn asst_calls(n: usize) -> Message {
+        Message {
+            role: Role::Assistant,
+            content: String::new(),
+            reasoning: String::new(),
+            tool_calls: (0..n)
+                .map(|i| ToolCall {
+                    id: format!("c{i}"),
+                    name: "read_file".into(),
+                    args: serde_json::value::RawValue::from_string("{}".into()).unwrap(),
+                })
+                .collect(),
+            tool_call_id: None,
+            name: None,
+        }
+    }
+
+    #[test]
+    fn a_well_formed_transcript_needs_no_repair() {
+        let msgs = vec![
+            Message::system("sys"),
+            Message::user("go"),
+            asst_calls(2),
+            Message::tool_result("c0", "read_file", "ok"),
+            Message::tool_result("c1", "read_file", "ok"),
+        ];
+        assert_eq!(incomplete_tool_group_start(&msgs), None);
+    }
+
+    #[test]
+    fn an_interrupt_before_any_result_truncates_the_whole_group() {
+        // Cancelled while dispatching: the assistant's tool_calls are in the
+        // transcript but nothing came back. Left as-is, the next request is
+        // a hard 400.
+        let msgs = vec![Message::system("sys"), Message::user("go"), asst_calls(1)];
+        assert_eq!(incomplete_tool_group_start(&msgs), Some(2));
+    }
+
+    #[test]
+    fn a_partially_dispatched_batch_is_also_repaired() {
+        // Batched calls: two of three came back before the interrupt.
+        let msgs = vec![
+            Message::user("go"),
+            asst_calls(3),
+            Message::tool_result("c0", "read_file", "ok"),
+            Message::tool_result("c1", "read_file", "ok"),
+        ];
+        assert_eq!(incomplete_tool_group_start(&msgs), Some(1));
+    }
+
+    #[test]
+    fn a_transcript_with_no_tool_calls_at_all_is_untouched() {
+        let msgs = vec![
+            Message::system("sys"),
+            Message::user("hi"),
+            Message::assistant("hello"),
+        ];
+        assert_eq!(incomplete_tool_group_start(&msgs), None);
+    }
+
+    #[test]
+    fn only_the_most_recent_group_matters() {
+        // An earlier complete group must not be re-flagged just because a
+        // later one is broken -- and truncation must cut at the later one.
+        let msgs = vec![
+            Message::user("go"),
+            asst_calls(1),
+            Message::tool_result("c0", "read_file", "ok"),
+            Message::assistant("done step one"),
+            Message::user("next"),
+            asst_calls(2),
+            Message::tool_result("c0", "read_file", "ok"),
+        ];
+        assert_eq!(incomplete_tool_group_start(&msgs), Some(5));
+    }
+
+    #[test]
+    fn truncating_at_the_reported_index_leaves_a_valid_transcript() {
+        // Ties the rule to the property it exists to protect.
+        let mut msgs = vec![
+            Message::user("go"),
+            asst_calls(2),
+            Message::tool_result("c0", "read_file", "ok"),
+        ];
+        let idx = incomplete_tool_group_start(&msgs).expect("should need repair");
+        msgs.truncate(idx);
+        assert!(
+            !msgs
+                .iter()
+                .any(|m| m.role == Role::Assistant && !m.tool_calls.is_empty()),
+            "no dangling tool_calls may remain"
+        );
+        assert!(msgs.iter().all(|m| m.role != Role::Tool));
+    }
+
+    #[test]
+    fn an_empty_transcript_is_handled_without_panicking() {
+        assert_eq!(incomplete_tool_group_start(&[]), None);
     }
 }

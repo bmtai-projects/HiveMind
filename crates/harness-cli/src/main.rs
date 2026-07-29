@@ -11,10 +11,12 @@ mod banner;
 mod commands;
 mod completion;
 mod input;
+mod json_ui;
 mod mentions;
 mod ui;
 mod update_check;
 
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -25,10 +27,11 @@ use commands::{BudgetArg, ModelArg, ReasoningArg, SlashCommand, UndoArg};
 use harness_agent::Agent;
 use harness_config::CliOverrides;
 use harness_tools::{
-    Bash, EditFile, ListDir, ReadFile, Registry, Search, SemanticSearch, TodoWrite, Workspace,
-    WriteFile,
+    Bash, CreatePdf, CreateSpreadsheet, EditFile, ListDir, ProjectMap, ReadFile, Registry, Search,
+    SemanticSearch, TodoWrite, Workspace, WriteFile,
 };
 use input::HivePrompt;
+use json_ui::JsonUi;
 use ui::TermUi;
 
 const SYSTEM_PROMPT: &str =
@@ -43,10 +46,39 @@ steps:
   together\") -- call `todo_write` with the full breakdown before starting.
   Keep exactly one item in_progress at a time, and mark an item completed
   immediately after finishing it, not in a batch at the end. Skip it for
-  single-step or trivial requests.
+  single-step or trivial requests. This tracks progress for the user; it
+  does not mean one tool call per turn -- `todo_write` costs nothing extra
+  when sent alongside the work it describes, so include it in the same turn
+  rather than spending a turn on it by itself.
+- Orient before reading. In an unfamiliar codebase, or when asked to
+  understand/explain/audit one, call `project_map` FIRST: one call returns
+  the whole tree plus every file's definitions with line numbers. Reading
+  files one by one to discover what they contain wastes context you will
+  need later for the actual work -- map first, then `read_file` only the
+  few files the map showed to be relevant. Scope big repos with its `path`
+  argument rather than mapping everything at once.
 - Investigate before acting: use `search` for an exact string, or
   `semantic_search` to find code by concept when you don't know the symbol
   (prefer both over shell grep); then `read_file` and `list_dir` for detail.
+- Request independent tool calls together in one turn -- they are executed
+  in parallel, so several files scaffolded, or several files read before
+  you plan, cost about the same wall-clock time as one. Batch only calls
+  that do not depend on each other's results: reading four files, or
+  creating four new files whose contents you already know, all belong in a
+  single turn. Never batch a call whose arguments depend on another call's
+  output (read a file, then edit it based on what it said), and never batch
+  a `run_shell` whose effect the next command relies on (install, then
+  build). When in doubt, split the turn -- a wrong batch costs a retry,
+  which is slower than the turn it saved.
+- To produce a PDF or an Excel workbook, use `create_pdf` / `create_spreadsheet`
+  directly -- they need no installed runtime and always produce a valid file.
+  They cover structured content (headings, paragraphs, bullets, tables /
+  sheets of cells and formulas), not charts, images, or pixel-precise layout.
+  For a PowerPoint deck, or anything past what those two tools can express,
+  write a small script using a well-known library (e.g. python-pptx,
+  reportlab, openpyxl) and run it with `run_shell` -- check the runtime/
+  library is available first and install it if not, then verify the output
+  file actually exists afterward.
 - To change an existing file, use `edit_file` — an exact old_string→new_string
   replacement. It is cheaper than rewriting the file and cannot corrupt the
   parts you leave untouched. Copy `old_string` verbatim from the file
@@ -85,6 +117,15 @@ enum Command {
     /// real third-party coding models; BYOK: whatever your provider key
     /// itself supports).
     Models,
+    /// List saved sessions for a workspace, newest first, for `--resume`.
+    Sessions(SessionsArgs),
+}
+
+#[derive(Args)]
+struct SessionsArgs {
+    /// Workspace whose sessions to list (default: current directory).
+    #[arg(long, default_value = ".")]
+    workdir: PathBuf,
 }
 
 #[derive(Args)]
@@ -107,11 +148,31 @@ enum AuthAction {
     Status,
 }
 
+/// Machine-readable protocol `activate` can speak instead of the
+/// interactive terminal REPL -- for driving `hivemind` as a subprocess
+/// (e.g. from an editor extension) rather than a human typing at a
+/// terminal. Only one value exists so far; anything else is a clap parse
+/// error, not a silent no-op, since `--protocol` is otherwise unset (`None`)
+/// and silently ignored.
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum Protocol {
+    /// Newline-delimited JSON events on stdout, newline-delimited JSON
+    /// commands on stdin. See `json_ui::JsonUi` for the event shapes and
+    /// `run_json_protocol` for the dispatch loop.
+    Json,
+}
+
 #[derive(Args)]
 struct ActivateArgs {
     /// Run one prompt headlessly (auto-approves shell), then exit.
     #[arg(short = 'p', long = "prompt")]
     prompt: Option<String>,
+
+    /// Speak a machine-readable protocol on stdin/stdout instead of the
+    /// interactive terminal REPL. Only "json" is implemented -- see
+    /// `json_ui` for the wire format.
+    #[arg(long, value_enum)]
+    protocol: Option<Protocol>,
 
     /// Workspace root the agent operates in.
     #[arg(long, default_value = ".")]
@@ -157,6 +218,17 @@ struct ActivateArgs {
     /// an in-flight turn always finishes first. Unbounded by default.
     #[arg(long)]
     budget: Option<f64>,
+
+    /// Resume the most recent session for this workspace. Restores the
+    /// conversation, model, and accumulated spend -- but not `/undo`
+    /// history, which is deliberately never carried across processes (the
+    /// files it would restore may have changed since).
+    #[arg(long = "continue", conflicts_with = "resume")]
+    continue_session: bool,
+
+    /// Resume one specific session by id (see `hivemind sessions`).
+    #[arg(long, value_name = "ID")]
+    resume: Option<String>,
 }
 
 fn print_model_catalog() {
@@ -179,6 +251,55 @@ fn print_model_catalog() {
     println!("Pick with --model <id>, or /model <id> in the REPL.");
 }
 
+/// Roughly how long ago, in the coarsest unit that's still informative --
+/// a session list is scanned, not studied, so "3h ago" beats a timestamp.
+fn humanize_age(secs_ago: u64) -> String {
+    match secs_ago {
+        0..=59 => "just now".to_string(),
+        60..=3599 => format!("{}m ago", secs_ago / 60),
+        3600..=86_399 => format!("{}h ago", secs_ago / 3600),
+        _ => format!("{}d ago", secs_ago / 86_400),
+    }
+}
+
+fn list_sessions(args: SessionsArgs) -> anyhow::Result<()> {
+    let workdir = args
+        .workdir
+        .canonicalize()
+        .map_err(|e| anyhow::anyhow!("workdir {:?}: {e}", args.workdir))?;
+    let workspace = workdir.to_string_lossy().to_string();
+    let store = harness_agent::SessionStore::new(harness_config::default_sessions_dir());
+    let sessions = store.list_for_workspace(&workspace);
+
+    if sessions.is_empty() {
+        println!("No saved sessions for {workspace}");
+        println!(
+            "Sessions are recorded automatically; resume the latest with `hivemind activate --continue`."
+        );
+        return Ok(());
+    }
+
+    println!("Sessions for {workspace}:");
+    let now = harness_agent::unix_now();
+    for s in &sessions {
+        let title = if s.title.is_empty() {
+            "(no prompt yet)"
+        } else {
+            &s.title
+        };
+        println!(
+            "  {:<22} {:>9}  {:>3} turns  ${:.4}  {}",
+            s.id,
+            humanize_age(now.saturating_sub(s.updated_at)),
+            s.turns,
+            s.cost_usd,
+            title,
+        );
+    }
+    println!("\nResume with `hivemind activate --resume <ID>`, or `--continue` for the newest.");
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -193,6 +314,7 @@ async fn main() -> anyhow::Result<()> {
             print_model_catalog();
             Ok(())
         }
+        Command::Sessions(args) => list_sessions(args),
     };
     if let Err(e) = result {
         eprintln!("\nerror: {e:#}");
@@ -231,15 +353,52 @@ async fn run(args: ActivateArgs) -> anyhow::Result<()> {
     registry.register(Arc::new(WriteFile(ws.clone())));
     registry.register(Arc::new(EditFile(ws.clone())));
     registry.register(Arc::new(ListDir(ws.clone())));
+    registry.register(Arc::new(ProjectMap(ws.clone())));
     registry.register(Arc::new(Search(ws.clone())));
     registry.register(Arc::new(SemanticSearch::new(ws.clone())));
     registry.register(Arc::new(TodoWrite));
+    registry.register(Arc::new(CreatePdf(ws.clone())));
+    registry.register(Arc::new(CreateSpreadsheet(ws.clone())));
 
+    let protocol_json = matches!(args.protocol, Some(Protocol::Json));
+
+    // Shell approval has three shapes:
+    // - `--yolo` (either mode): auto-approved, no round-trip at all.
+    // - `--protocol json`, not yolo: round-trips through JsonUi's
+    //   approval_request/approve handshake (see `json_ui::JsonUi::request_shell_approval`).
+    // - interactive terminal, not headless, not yolo: the existing stdin
+    //   y/N prompt. Headless `-p` (no `--protocol`) keeps its pre-existing
+    //   behavior of auto-approving, unchanged.
     let mut bash = Bash::new(workdir.clone());
-    if !args.yolo && !headless {
+    let json_ui: Option<Arc<JsonUi>> = protocol_json.then(|| Arc::new(JsonUi::new()));
+    if let Some(json_ui) = &json_ui {
+        if !args.yolo {
+            let json_ui = json_ui.clone();
+            bash = bash.with_approval(Arc::new(move |cmd: &str| {
+                json_ui.request_shell_approval(cmd)
+            }));
+        }
+    } else if !args.yolo && !headless {
         bash = bash.with_approval(Arc::new(ui::terminal_approve));
     }
     registry.register(Arc::new(bash));
+
+    let workspace = workdir.to_string_lossy().to_string();
+    let store = harness_agent::SessionStore::new(harness_config::default_sessions_dir());
+
+    if let Some(json_ui) = json_ui {
+        let mut agent = Agent::new(
+            resolved.clone(),
+            registry,
+            ws.clone(),
+            json_ui.clone(),
+            SYSTEM_PROMPT.to_string(),
+        );
+        // Protocol mode persists too: an editor window reloading is exactly
+        // the kind of ordinary interruption a session must survive.
+        attach_or_restore_session(&mut agent, &args, store, workspace, false)?;
+        return run_json_protocol(&mut agent, ws, json_ui).await;
+    }
 
     let ui: Arc<TermUi> = Arc::new(TermUi::new(args.show_reasoning, resolved.budget_usd));
     let mut agent = Agent::new(
@@ -251,12 +410,197 @@ async fn run(args: ActivateArgs) -> anyhow::Result<()> {
     );
 
     if let Some(prompt) = &args.prompt {
+        // A one-shot `-p` run has nothing worth resuming later, so it stays
+        // unpersisted -- no session file, no clutter in `hivemind sessions`.
         let expanded = mentions::expand_mentions(prompt, &ws);
         agent.run(&expanded).await?;
         return Ok(());
     }
 
+    attach_or_restore_session(&mut agent, &args, store, workspace, true)?;
+
     repl(&mut agent, ws, ui, args.yolo).await
+}
+
+/// Resolve `--continue` / `--resume` into either a restored session or a
+/// fresh one, and turn persistence on either way.
+/// `announce` is off in protocol mode: stdout there carries ndjson only, so
+/// a human-readable banner would be an unparseable line to the client.
+fn attach_or_restore_session(
+    agent: &mut Agent,
+    args: &ActivateArgs,
+    store: harness_agent::SessionStore,
+    workspace: String,
+    announce: bool,
+) -> anyhow::Result<()> {
+    let restored = if let Some(id) = &args.resume {
+        // An explicit id that doesn't exist is a real error: silently
+        // starting fresh would look like the resume worked and quietly
+        // strand the session the user asked for.
+        Some(store.load(id)?)
+    } else if args.continue_session {
+        match store.latest_for_workspace(&workspace) {
+            Some(rec) => Some(rec),
+            None => {
+                if announce {
+                    println!(
+                        "\x1b[90mno previous session for this workspace — starting a new one\x1b[0m"
+                    );
+                }
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    match restored {
+        Some(record) => {
+            let turns = record.turn_count();
+            let title = record.title.clone();
+            let cost = record.session_cost_usd;
+            agent.restore(record, store, SYSTEM_PROMPT.to_string());
+            if announce {
+                println!(
+                    "\x1b[90m⟲ resumed session {} — {turns} turns, ${cost:.4} spent{}\x1b[0m",
+                    agent.session_id().unwrap_or("?"),
+                    if title.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" · {title}")
+                    }
+                );
+            }
+        }
+        None => {
+            agent.enable_persistence(store, workspace);
+        }
+    }
+    Ok(())
+}
+
+/// Headless dispatch loop for `--protocol json`: emits `ready`, then reads
+/// ndjson commands from stdin and drives the same `Agent` the terminal REPL
+/// uses, dispatching to the exact same public methods (`run`, `set_model`,
+/// `set_reasoning_effort`, `set_budget_usd`, `undo`, `force_compact`) the
+/// REPL's slash-command match arms already call. Exits with `Ok(())`
+/// (process code 0) on stdin EOF.
+///
+/// Split into two concurrent halves, not one straight-line loop, because
+/// shell-command approval genuinely needs it: `agent.run()` can block deep
+/// inside `spawn_blocking` (see `harness_tools::bash::Bash::approved`)
+/// waiting on an `approve` reply for a request it just emitted. If reading
+/// stdin and calling `agent.run()` happened in the same loop iteration,
+/// that `.await` would starve the very stdin read that could unblock it --
+/// a real deadlock (caught by this implementation's own smoke test, not
+/// just a theoretical concern). So a dedicated reader task owns stdin for
+/// the whole process lifetime and resolves `approve` replies immediately,
+/// off to the side; every other command is forwarded over a channel to
+/// this function's main loop, which is the sole owner of `&mut Agent` and
+/// processes them strictly one at a time, in arrival order.
+async fn run_json_protocol(
+    agent: &mut Agent,
+    ws: Workspace,
+    ui: Arc<JsonUi>,
+) -> anyhow::Result<()> {
+    use tokio::io::AsyncBufReadExt;
+
+    ui.emit_ready();
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<json_ui::Command>();
+    let reader_ui = ui.clone();
+    let reader_queue = agent.interjections();
+    let reader = tokio::spawn(async move {
+        let stdin = tokio::io::stdin();
+        let mut lines = tokio::io::BufReader::new(stdin).lines();
+        loop {
+            let line = match lines.next_line().await {
+                Ok(Some(line)) => line,
+                Ok(None) => break, // stdin EOF -- unblocks the main loop below via tx's drop.
+                Err(e) => {
+                    reader_ui.emit_error(&format!("stdin read error: {e}"));
+                    break;
+                }
+            };
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let cmd: json_ui::Command = match serde_json::from_str(line) {
+                Ok(c) => c,
+                Err(e) => {
+                    reader_ui.emit_error(&format!("invalid command: {e}"));
+                    continue;
+                }
+            };
+            match cmd {
+                // Both of these are resolved right here rather than
+                // forwarded: they are the commands that exist *because* a
+                // turn is already in flight, so queueing them behind the
+                // main loop -- which is busy awaiting that very turn --
+                // would deadlock the one thing they're for.
+                json_ui::Command::Approve {
+                    request_id,
+                    approved,
+                } => reader_ui.resolve_approval(&request_id, approved),
+                json_ui::Command::Interject { text } => {
+                    reader_queue.push(text);
+                }
+                other => {
+                    if tx.send(other).is_err() {
+                        break; // main loop already gone
+                    }
+                }
+            }
+        }
+        // `tx` drops here at task exit either way, which ends the main
+        // loop's `rx.recv()` below -- the single EOF signal both error
+        // exits and a clean stdin close funnel through.
+    });
+
+    while let Some(cmd) = rx.recv().await {
+        match cmd {
+            json_ui::Command::UserMessage { text } => {
+                let expanded = mentions::expand_mentions(&text, &ws);
+                if let Err(e) = agent.run(&expanded).await {
+                    ui.emit_error(&format!("{e:#}"));
+                }
+                // Always emitted after a user_message's run() settles,
+                // success or error -- signals the extension may send the
+                // next line.
+                ui.emit_turn_done();
+            }
+            json_ui::Command::SetModel { model } => {
+                agent.set_model(model);
+                ui.emit_turn_done();
+            }
+            json_ui::Command::SetReasoningEffort { effort } => {
+                agent.set_reasoning_effort(effort);
+                ui.emit_turn_done();
+            }
+            json_ui::Command::SetBudget { budget_usd } => {
+                agent.set_budget_usd(budget_usd);
+                ui.emit_turn_done();
+            }
+            json_ui::Command::Undo { n } => {
+                let report = agent.undo(n).await;
+                ui.emit_undo_result(report.as_ref());
+                ui.emit_turn_done();
+            }
+            json_ui::Command::ForceCompact => {
+                // force_compact() itself fires Ui::compacted() when it did
+                // anything; nothing else to report on the no-op path.
+                agent.force_compact().await;
+                ui.emit_turn_done();
+            }
+            json_ui::Command::Approve { .. } | json_ui::Command::Interject { .. } => {
+                unreachable!("filtered out and resolved directly by the reader task above")
+            }
+        }
+    }
+
+    let _ = reader.await;
+    Ok(())
 }
 
 async fn repl(agent: &mut Agent, ws: Workspace, ui: Arc<TermUi>, yolo: bool) -> anyhow::Result<()> {
@@ -402,15 +746,72 @@ async fn repl(agent: &mut Agent, ws: Workspace, ui: Arc<TermUi>, yolo: bool) -> 
 
         let expanded = mentions::expand_mentions(input, &ws);
 
+        run_steerable(agent, &expanded).await;
+    }
+}
+
+/// Run one input to completion, with Ctrl+C repurposed from "abort" to
+/// "steer".
+///
+/// The run future is pinned and re-polled after the prompt instead of being
+/// dropped, so a long multi-step task doesn't throw away everything it has
+/// already done just because the user wants to redirect it. Pressing Enter
+/// on an empty prompt still aborts -- the historical behaviour is preserved
+/// as the deliberate choice rather than the only option.
+///
+/// While the prompt is awaiting input the run future isn't polled at all, so
+/// the turn is genuinely paused and streamed output can't interleave with
+/// what the user is typing.
+async fn run_steerable(agent: &mut Agent, input: &str) {
+    let queue = agent.interjections();
+    let mut running = Box::pin(agent.run(input));
+
+    loop {
         tokio::select! {
-            result = agent.run(&expanded) => {
+            result = &mut running => {
                 if let Err(e) = result {
                     eprintln!("\nerror: {e:#}");
                 }
+                return;
             }
             _ = tokio::signal::ctrl_c() => {
-                println!("\n^C interrupted");
+                match read_interjection().await {
+                    Some(text) => {
+                        queue.push(text);
+                        println!(
+                            "\x1b[36m  ↩ queued — delivered at the next step\x1b[0m"
+                        );
+                    }
+                    None => {
+                        // Dropping `running` here is what makes the repair
+                        // below necessary; see `repair_after_interrupt`.
+                        drop(running);
+                        println!("\x1b[33m^C aborted\x1b[0m");
+                        if agent.repair_after_interrupt() {
+                            println!(
+                                "\x1b[90m  (dropped an incomplete tool call from the transcript)\x1b[0m"
+                            );
+                        }
+                        return;
+                    }
+                }
             }
         }
     }
+}
+
+/// Prompt for a mid-turn steer. `None` means abort (empty line, or EOF).
+async fn read_interjection() -> Option<String> {
+    print!("\n\x1b[36m↩ steer the agent (empty = abort): \x1b[0m");
+    let _ = std::io::stdout().flush();
+    let line = tokio::task::spawn_blocking(|| {
+        let mut buf = String::new();
+        // `Ok(0)` is EOF (Ctrl+D) -- an empty string, which reads as abort.
+        std::io::stdin().read_line(&mut buf).ok().map(|_| buf)
+    })
+    .await
+    .ok()
+    .flatten()?;
+    let trimmed = line.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
 }

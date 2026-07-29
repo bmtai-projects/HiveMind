@@ -40,6 +40,12 @@ pub struct EditFile(pub Workspace);
 
 #[async_trait]
 impl Tool for EditFile {
+    /// `edit_file` is a read-modify-write (see `execute`), so two edits to
+    /// one file *must not* run concurrently -- both would read the same
+    /// original and the second write would silently discard the first.
+    fn conflict_key(&self, args: &RawValue) -> Option<String> {
+        crate::fs::path_conflict_key(&self.0, args)
+    }
     fn name(&self) -> &str {
         "edit_file"
     }

@@ -72,7 +72,7 @@ impl DeepSeekClient {
 
         let wire_req = WireRequest {
             model: &req.model,
-            messages: wire::to_wire_messages(&req.messages),
+            messages: wire::to_wire_messages(&req.messages, req.cache_prompt_prefix),
             tools: wire::to_wire_tools(&req.tools),
             stream: true,
             stream_options: WireStreamOptions {
@@ -211,8 +211,8 @@ impl DeepSeekClient {
                         prompt_tokens: u.prompt_tokens,
                         completion_tokens: u.completion_tokens,
                         total_tokens: u.total_tokens,
-                        cache_hit_tokens: u.prompt_cache_hit_tokens,
-                        cache_miss_tokens: u.prompt_cache_miss_tokens,
+                        cache_hit_tokens: u.cache_hit_tokens(),
+                        cache_miss_tokens: u.cache_miss_tokens(),
                     };
                 }
 

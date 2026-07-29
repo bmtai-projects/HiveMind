@@ -14,6 +14,24 @@ pub struct Workspace {
     pub root: PathBuf,
 }
 
+/// Shared [`crate::tool::Tool::conflict_key`] implementation for every tool
+/// that writes to a single `path` argument. Keys on the *canonical*
+/// resolved path, so two calls naming one file differently (`./a.txt` vs
+/// `a.txt`) still collide and get serialized rather than racing.
+///
+/// `None` when the args don't parse or the path escapes the workspace: such
+/// a call fails on its own during `execute`, so it can never win a write
+/// race it wasn't going to participate in.
+pub(crate) fn path_conflict_key(ws: &Workspace, args: &RawValue) -> Option<String> {
+    #[derive(Deserialize)]
+    struct PathOnly {
+        path: String,
+    }
+    let parsed: PathOnly = serde_json::from_str(args.get()).ok()?;
+    let resolved = ws.resolve(&parsed.path).ok()?;
+    Some(resolved.to_string_lossy().into_owned())
+}
+
 impl Workspace {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self { root: root.into() }
@@ -111,6 +129,9 @@ pub struct WriteFile(pub Workspace);
 
 #[async_trait]
 impl Tool for WriteFile {
+    fn conflict_key(&self, args: &RawValue) -> Option<String> {
+        path_conflict_key(&self.0, args)
+    }
     fn name(&self) -> &str {
         "write_file"
     }

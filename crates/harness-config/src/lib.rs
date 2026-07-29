@@ -55,6 +55,22 @@ pub struct ModelCatalogEntry {
     /// implemented here, so their list is empty even though they do
     /// reason. Empty means "don't send reasoning_effort for this model."
     pub reasoning_efforts: &'static [&'static str],
+    /// Whether this model only caches the prompt prefix when the request
+    /// carries an explicit `cache_control` breakpoint.
+    ///
+    /// Most providers (DeepSeek, OpenAI, xAI, Qwen, Moonshot) cache
+    /// automatically once a prompt is long enough, and need nothing from
+    /// the client. Anthropic does not: with no breakpoint you pay full
+    /// price for the entire prefix on *every* turn -- and since the tool
+    /// manifest plus system prompt alone are ~3k tokens that never change,
+    /// that's the single most expensive thing to get wrong on the priciest
+    /// model in the catalog.
+    ///
+    /// `true` makes the wire layer send the system message as a content
+    /// part carrying `cache_control` (see `harness_provider`'s wire
+    /// module). Kept per-model rather than always-on because sending it to
+    /// a provider that doesn't expect it risks a hard 400 for no benefit.
+    pub needs_explicit_cache_control: bool,
 }
 
 /// Must match `HiveMind-server`'s `config.ts` `MARKUP_MULTIPLIER` default.
@@ -82,6 +98,7 @@ pub const KNOWN_MODELS: &[ModelCatalogEntry] = &[
             output_per_m: 0.1876,
         },
         reasoning_efforts: &["high", "xhigh"],
+        needs_explicit_cache_control: false,
     },
     ModelCatalogEntry {
         id: "claude-sonnet-5",
@@ -93,6 +110,10 @@ pub const KNOWN_MODELS: &[ModelCatalogEntry] = &[
             output_per_m: 10.0,
         },
         reasoning_efforts: &["low", "medium", "high", "xhigh", "max"],
+        // Anthropic is the one provider in this catalog that caches nothing
+        // without an explicit breakpoint -- and it's also the most
+        // expensive input in the catalog, so the miss costs the most here.
+        needs_explicit_cache_control: true,
     },
     ModelCatalogEntry {
         id: "gpt-5.3-codex",
@@ -104,6 +125,7 @@ pub const KNOWN_MODELS: &[ModelCatalogEntry] = &[
             output_per_m: 14.0,
         },
         reasoning_efforts: &["none", "low", "medium", "high", "xhigh"],
+        needs_explicit_cache_control: false,
     },
     ModelCatalogEntry {
         id: "gemini-3.1-pro",
@@ -118,6 +140,7 @@ pub const KNOWN_MODELS: &[ModelCatalogEntry] = &[
         // this parameter) -- listing efforts still lets a user pick how
         // hard it thinks, just never lets them turn it off.
         reasoning_efforts: &["low", "medium", "high"],
+        needs_explicit_cache_control: false,
     },
     ModelCatalogEntry {
         id: "grok-build",
@@ -132,6 +155,7 @@ pub const KNOWN_MODELS: &[ModelCatalogEntry] = &[
         // {...}` object, not the reasoning_effort string -- empty on
         // purpose (see the field doc comment).
         reasoning_efforts: &[],
+        needs_explicit_cache_control: false,
     },
     ModelCatalogEntry {
         id: "qwen3-coder-plus",
@@ -144,6 +168,7 @@ pub const KNOWN_MODELS: &[ModelCatalogEntry] = &[
         },
         // Genuinely no reasoning support, per OpenRouter's own metadata.
         reasoning_efforts: &[],
+        needs_explicit_cache_control: false,
     },
     ModelCatalogEntry {
         id: "kimi-k2-code",
@@ -156,6 +181,7 @@ pub const KNOWN_MODELS: &[ModelCatalogEntry] = &[
         },
         // Reasons unconditionally, same caveat as grok-build above.
         reasoning_efforts: &[],
+        needs_explicit_cache_control: false,
     },
 ];
 
@@ -492,6 +518,15 @@ pub fn default_credentials_path() -> PathBuf {
             .join("credentials.toml");
     }
     PathBuf::from("hivemind-credentials.toml")
+}
+
+/// Default session-store location: `~/.config/hivemind/sessions/`. One JSON
+/// file per saved conversation — see `harness_agent::SessionStore`.
+pub fn default_sessions_dir() -> PathBuf {
+    if let Some(home) = dirs_home() {
+        return home.join(".config").join("hivemind").join("sessions");
+    }
+    PathBuf::from("hivemind-sessions")
 }
 
 /// Returns `None` on any failure (missing file, bad TOML, ...) rather than

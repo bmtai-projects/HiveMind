@@ -77,6 +77,7 @@ Every one of these is real, wired-up behavior — not a roadmap item:
 |---|---|---|
 | **Prefix-stable requests + cache-hit visibility** | [`harness-cli/src/ui.rs`](crates/harness-cli/src/ui.rs), [`harness-provider/src/wire.rs`](crates/harness-provider/src/wire.rs) | Tool schemas serialize in sorted, deterministic order; DeepSeek's `prompt_cache_hit_tokens`/`prompt_cache_miss_tokens` are parsed and shown live (`cache 92%`) so the win is visible, not assumed. |
 | **Context compaction** | [`harness-agent/src/compaction.rs`](crates/harness-agent/src/compaction.rs) | At `compaction_threshold_percent` (default 75%) of the context window, older turns are folded into one model-generated summary via a cheap Flash call — never silently truncated, never re-billed forever. |
+| **Anchored edits over full rewrites** | [`harness-tools/src/edit.rs`](crates/harness-tools/src/edit.rs) | `edit_file` replaces just an `old_string`→`new_string` span, so modifying a file emits tens of output tokens instead of re-emitting the whole thing. Output is the priciest token class (never cached), which makes this the largest single lever on a coding session's cost — and it can't corrupt untouched code, so fewer botched edits means fewer retry turns and less Pro escalation. |
 | **Two-tier routing with auto-escalation** | [`harness-agent/src/agent.rs`](crates/harness-agent/src/agent.rs) | Every task starts on Flash. If the model repeats an identical tool call or hits repeated tool errors (a doom-loop symptom), the harness auto-escalates to Pro for that task only, then resets to Flash on the next input. |
 | **Parallel tool dispatch** | [`harness-tools/src/tool.rs`](crates/harness-tools/src/tool.rs) | Multiple tool calls in one turn run concurrently via `tokio::JoinSet`, then are reassembled in original call order — concurrent latency, deterministic transcript. |
 | **Retry/backoff with jitter** | [`harness-provider/src/retry.rs`](crates/harness-provider/src/retry.rs) | 429/5xx/network errors retry with exponential backoff + jitter, honoring a server's `Retry-After` header, surfaced to the UI via a retry hook. |
@@ -113,10 +114,27 @@ abstraction with one implementation is just indirection.
 
 ## Tools
 
-Four built-ins, all workspace-confined (`--workdir`, default `.`):
+Seven built-ins, all workspace-confined (`--workdir`, default `.`):
 
 - `read_file`, `write_file`, `list_dir` — path-escape-checked against the
   workspace root.
+- `edit_file` — exact `old_string`→`new_string` replacement in an existing
+  file. The model rewrites only the changed span instead of re-emitting the
+  whole file, so a one-line change costs tens of output tokens, not thousands
+  — and can't corrupt the parts it never re-typed. The system prompt steers
+  modifications here; `write_file` is for creating new files.
+- `search` — read-only, workspace-confined literal content search returning
+  `path:line: text` hits. Needs no approval (it only reads), so the model
+  locates code in one cheap turn without a shell round-trip or a `grep`/`rg`
+  dependency, skipping `.git`/`target`/`node_modules` and large/binary files.
+- `semantic_search` — ranked *similarity* search (the retrieval half of a
+  "modern agent"): the repo is chunked and embedded into an incrementally
+  cached vector index, the query is embedded, and the closest chunks come back
+  as `path:startLine-endLine` ranges. Lets the model find code by concept, not
+  just exact string. The default embedder is local and dependency-free
+  (feature-hashing — lexical/fuzzy, ships lean); it's behind an `Embedder`
+  trait so a real neural model (e.g. `fastembed`/BGE) drops in without
+  touching the index or tool. See [`semantic.rs`](crates/harness-tools/src/semantic.rs).
 - `run_shell` — gated by an interactive `[y/N]` approval prompt by default;
   `--yolo` or headless (`-p`) mode auto-approves. Runs under a timeout with
   `kill_on_drop` so a cancelled/timed-out command can't orphan a process.
@@ -172,7 +190,8 @@ Scoped out of this pass on purpose — natural next additions, each behind an
 existing seam:
 
 - **A second provider** (OpenAI/Anthropic/xAI) — see [Provider abstraction](#provider-abstraction-kept-honest).
-- **Diff-based edits** — `write_file` is full-rewrite today; a patch/diff tool plus an undo stack is the natural upgrade.
+- **Undo stack for edits** — `edit_file` (shipped) already scopes each change to a span; a per-session undo/redo over file writes is the natural follow-on.
+- **Neural `semantic_search`** — the retrieval pipeline (chunk/index/cosine/cache) is shipped behind an `Embedder` trait with a lean local default; swapping in a real embedding model (`fastembed`/BGE locally, or a hosted embeddings API) behind a cargo feature makes it truly semantic. Persist the index to disk to skip the cold-start rebuild.
 - **MCP client** — mount external tool servers.
 - **Session persistence** — `Agent::history()` already exposes the full transcript; save/resume is a serialization layer away.
 - **Explicit `anthropic-style` cache breakpoints** — not needed for DeepSeek (caching is automatic), but relevant the moment a second provider needs it.

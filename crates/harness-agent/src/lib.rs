@@ -8,10 +8,18 @@ mod checkpoint;
 mod compaction;
 mod cost;
 mod hooks;
+mod interjection;
+mod session;
+mod tokens;
 mod ui;
 
 pub use agent::Agent;
 pub use checkpoint::UndoReport;
 pub use compaction::{CompactionPolicy, CompactionReport};
 pub use cost::estimate_cost_usd;
+pub use interjection::InterjectionQueue;
+pub use session::{
+    SessionError, SessionRecord, SessionStore, SessionSummary, derive_title, unix_now,
+};
+pub use tokens::estimate_tokens;
 pub use ui::Ui;

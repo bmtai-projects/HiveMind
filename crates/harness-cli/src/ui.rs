@@ -49,6 +49,17 @@ impl TermUi {
 }
 
 impl Ui for TermUi {
+    fn turn_started(&self) {
+        // Unconditional -- unlike `reasoning_delta` below, this doesn't
+        // depend on the model actually streaming chain-of-thought, so it's
+        // the one signal guaranteed to show up the instant a request goes
+        // out. `reasoning_delta`'s own swap becomes a no-op right after
+        // this (already-true), so there's no double print if reasoning
+        // does show up.
+        self.thinking_shown.store(true, Ordering::Relaxed);
+        println!("\x1b[2;3m⟡ thinking...\x1b[0m");
+    }
+
     fn assistant_delta(&self, text: &str) {
         print!("{text}");
         flush_stdout();
@@ -146,9 +157,24 @@ impl Ui for TermUi {
         println!("\x1b[35m  ⤴ escalating {from} → {to}: {reason}\x1b[0m");
     }
 
-    fn compacted(&self, messages_before: usize, messages_after: usize, tokens_before: u64) {
+    fn interjected(&self, count: usize) {
+        let noun = if count == 1 { "message" } else { "messages" };
+        println!("\x1b[36m  ↩ delivered your {noun} to the model\x1b[0m");
+    }
+
+    fn compacted(
+        &self,
+        messages_before: usize,
+        messages_after: usize,
+        tokens_before: u64,
+        summary_cost_usd: Option<f64>,
+    ) {
+        let cost_suffix = match summary_cost_usd {
+            Some(cost) => format!(", summary cost ${cost:.6}"),
+            None => String::new(),
+        };
         println!(
-            "\x1b[90m  ⤵ compacted context: {messages_before} → {messages_after} messages ({tokens_before} tokens before)\x1b[0m"
+            "\x1b[90m  ⤵ compacted context: {messages_before} → {messages_after} messages ({tokens_before} tokens before{cost_suffix})\x1b[0m"
         );
     }
 
@@ -157,6 +183,15 @@ impl Ui for TermUi {
             "\x1b[33m⛔ stopped: session cost ${spent_usd:.6} has reached the ${budget_usd:.2} budget\x1b[0m"
         );
         println!("\x1b[90m  raise it with --budget, or /budget <amount>, or /budget off\x1b[0m");
+    }
+
+    fn stopped_for_context_limit(&self, estimated_tokens: u64, context_window: u64) {
+        println!(
+            "\x1b[33m⛔ stopped: this request is ~{estimated_tokens} tokens, too large for the active model's {context_window}-token context window\x1b[0m"
+        );
+        println!(
+            "\x1b[90m  trim the input, /clear and start fresh, or /model to a bigger-context one\x1b[0m"
+        );
     }
 }
 
