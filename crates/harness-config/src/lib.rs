@@ -279,6 +279,9 @@ pub struct HookSpec {
 pub struct Resolved {
     pub endpoint: Endpoint,
     pub default_model: String,
+    /// Product tier for this session. Precedence, highest first:
+    /// `--mode` flag > `$HIVEMIND_MODE` > `[agent] mode` > Standard.
+    pub mode: Mode,
     /// Whether `endpoint`/`default_model` came from stored hosted
     /// credentials (`hivemind auth login`) rather than an explicit BYOK
     /// key. Only consulted to decide whether the live cost readout should
@@ -326,8 +329,44 @@ struct ModelSection {
     reasoning_effort: Option<String>,
 }
 
+/// Product tier for a session. Deliberately a mode rather than a pile of
+/// individual toggles: a user should pick "how good do I want this to be",
+/// not learn which capabilities happen to be network-backed. Today it only
+/// selects the embedder; it is the place any later paid capability lands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Mode {
+    /// Everything local and free. Works offline, costs nothing.
+    #[default]
+    Standard,
+    /// Hosted code-aware embeddings, billed against the account balance.
+    Pro,
+}
+
+impl Mode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Mode::Standard => "standard",
+            Mode::Pro => "pro",
+        }
+    }
+
+    /// Accepts the spellings a user might reasonably type or a client might
+    /// send. Anything unrecognized is `None` so the caller can fall through
+    /// to the next precedence tier rather than silently guessing a tier the
+    /// user did not ask (and may be billed) for.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "standard" | "default" | "free" | "local" => Some(Mode::Standard),
+            "pro" | "remote" | "cloud" => Some(Mode::Pro),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct AgentSection {
+    mode: Option<String>,
     max_turns: Option<u32>,
     compaction_threshold_percent: Option<u8>,
     auto_escalate: Option<bool>,
@@ -377,6 +416,7 @@ pub struct CliOverrides {
     pub model: Option<String>,
     pub reasoning_effort: Option<String>,
     pub budget_usd: Option<f64>,
+    pub mode: Option<Mode>,
 }
 
 /// A token minted by the hosted backend (`hivemind auth login`), paired
@@ -459,6 +499,20 @@ pub fn resolve(
         .or_else(|| file.model.reasoning_effort.clone());
     let budget_usd = cli.budget_usd.or(file.agent.budget_usd);
 
+    // Highest wins: --mode > $HIVEMIND_MODE > [agent] mode > Standard.
+    // An unparseable value at any tier falls through to the next rather
+    // than defaulting to Pro -- nobody gets billed because of a typo.
+    let mode = cli
+        .mode
+        .or_else(|| {
+            std::env::var("HIVEMIND_MODE")
+                .ok()
+                .as_deref()
+                .and_then(Mode::parse)
+        })
+        .or_else(|| file.agent.mode.as_deref().and_then(Mode::parse))
+        .unwrap_or_default();
+
     let mut policy = AgentPolicy::default();
     if let Some(v) = file.agent.max_turns {
         policy.max_turns = v;
@@ -479,6 +533,7 @@ pub fn resolve(
     Ok(Resolved {
         endpoint: Endpoint { base_url, api_key },
         default_model,
+        mode,
         hosted,
         reasoning_effort,
         budget_usd,

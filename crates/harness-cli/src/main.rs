@@ -108,6 +108,8 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+// Parsed once at startup; the variant size gap costs nothing here.
+#[allow(clippy::large_enum_variant)]
 enum Command {
     /// Start the agent — interactive REPL, or headless with --prompt.
     Activate(ActivateArgs),
@@ -218,6 +220,13 @@ struct ActivateArgs {
     /// an in-flight turn always finishes first. Unbounded by default.
     #[arg(long)]
     budget: Option<f64>,
+
+    /// "standard" (default) runs everything locally and free. "pro" adds
+    /// hosted code-aware embeddings for sharper semantic_search, billed
+    /// against your balance. Also settable via `[agent] mode` in
+    /// config.toml or $HIVEMIND_MODE.
+    #[arg(long)]
+    mode: Option<String>,
 
     /// Resume the most recent session for this workspace. Restores the
     /// conversation, model, and accumulated spend -- but not `/undo`
@@ -334,6 +343,7 @@ async fn run(args: ActivateArgs) -> anyhow::Result<()> {
         model: args.model.clone(),
         reasoning_effort: args.reasoning_effort.clone(),
         budget_usd: args.budget,
+        mode: args.mode.as_deref().and_then(harness_config::Mode::parse),
     };
     let resolved = harness_config::resolve(
         &config_path,
@@ -355,7 +365,28 @@ async fn run(args: ActivateArgs) -> anyhow::Result<()> {
     registry.register(Arc::new(ListDir(ws.clone())));
     registry.register(Arc::new(ProjectMap(ws.clone())));
     registry.register(Arc::new(Search(ws.clone())));
-    registry.register(Arc::new(SemanticSearch::new(ws.clone())));
+    // Pro mode swaps semantic_search onto hosted embeddings. Standard mode
+    // -- and any Pro session that can't reach them -- keeps the local
+    // embedder, which is also retained inside SemanticSearch as the runtime
+    // fallback, so a network failure degrades quality instead of failing
+    // the task.
+    let hosted_token = resolved
+        .hosted
+        .then_some(resolved.endpoint.api_key.as_str());
+    let pro = resolved.mode == harness_config::Mode::Pro;
+    registry.register(Arc::new(
+        match harness_tools::RemoteEmbedder::for_pro_mode(pro, hosted_token) {
+            Some(remote) => SemanticSearch::with_embedder(ws.clone(), Arc::new(remote)),
+            None => {
+                if pro {
+                    eprintln!(
+                        "pro mode: hosted embeddings need a signed-in account (`hivemind auth login`); using local search"
+                    );
+                }
+                SemanticSearch::new(ws.clone())
+            }
+        },
+    ));
     registry.register(Arc::new(TodoWrite));
     registry.register(Arc::new(CreatePdf(ws.clone())));
     registry.register(Arc::new(CreateSpreadsheet(ws.clone())));

@@ -13,6 +13,9 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }
 walkdir = { workspace = true }
+# blocking client only: every call site is already inside spawn_blocking
+# (see semantic.rs), so an async client would need a nested runtime.
+reqwest = { workspace = true, features = ["blocking"] }
 rust_xlsxwriter = "0.96.0"
 # default-features off: printpdf's defaults pull in "html" -> a full HTML/CSS
 # layout engine (azul-layout) + fontconfig, meant for HTML-to-PDF rendering.
