@@ -519,6 +519,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "262590f4fe6afeb0bc83be1daa64e52657fe185690a958af7f3ad0e92085c5ae"
 dependencies = [
  "futures-core",
+ "futures-sink",
 ]
 
 [[package]]
@@ -619,7 +620,7 @@ checksum = "c3531d702d6c1a3ba92a5fb55a404c7b8c476c8e7ca249951077afcbe4bc807f"
 
 [[package]]
 name = "harness-agent"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "harness-config",
@@ -634,7 +635,7 @@ dependencies = [
 
 [[package]]
 name = "harness-cli"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -654,7 +655,7 @@ dependencies = [
 
 [[package]]
 name = "harness-config"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "serde",
  "thiserror 2.0.19",
@@ -663,7 +664,7 @@ dependencies = [
 
 [[package]]
 name = "harness-provider"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -679,11 +680,12 @@ dependencies = [
 
 [[package]]
 name = "harness-tools"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "async-trait",
  "harness-types",
  "printpdf",
+ "reqwest",
  "rust_xlsxwriter",
  "serde",
  "serde_json",
@@ -694,7 +696,7 @@ dependencies = [
 
 [[package]]
 name = "harness-types"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -1513,6 +1515,7 @@ checksum = "eddd3ca559203180a307f12d114c268abf583f59b03cb906fd0b3ff8646c1147"
 dependencies = [
  "base64",
  "bytes",
+ "futures-channel",
  "futures-core",
  "futures-util",
  "http",

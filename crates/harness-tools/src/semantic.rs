@@ -66,6 +66,23 @@ pub trait Embedder: Send + Sync {
     /// Must return an L2-normalized vector of length [`Embedder::dim`] (a
     /// zero vector is allowed for empty/degenerate input).
     fn embed(&self, text: &str) -> Vec<f32>;
+
+    /// Stable identity for the vector space this embedder produces. Vectors
+    /// from two different ids are not comparable, so this is written into
+    /// the index and checked before a cached index is reused — without it,
+    /// switching embedders would score a new query against stale vectors of
+    /// a different width and silently return nonsense.
+    fn id(&self) -> &str;
+
+    /// Embed many texts at once. The default loops over [`Embedder::embed`],
+    /// so a purely local implementation needs nothing extra; a network-backed
+    /// one overrides this to spend one round trip per batch instead of one
+    /// per chunk. Returning `Err` means "this embedder is unavailable" — the
+    /// caller falls back to a local one and rebuilds the whole index rather
+    /// than mixing two vector spaces.
+    fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
+        Ok(texts.iter().map(|t| self.embed(t)).collect())
+    }
 }
 
 /// Local, dependency-free feature-hashing embedder. Hashes each token and each
@@ -86,6 +103,9 @@ impl HashingEmbedder {
 impl Embedder for HashingEmbedder {
     fn dim(&self) -> usize {
         self.dim
+    }
+    fn id(&self) -> &str {
+        "hash-v1"
     }
     fn embed(&self, text: &str) -> Vec<f32> {
         let mut v = vec![0f32; self.dim];
@@ -197,6 +217,9 @@ struct Chunk {
 
 struct Index {
     fingerprint: u64,
+    /// Which embedder produced `chunks[*].vec`. A cached index is only
+    /// reusable by the embedder that built it.
+    embedder_id: String,
     chunks: Vec<Chunk>,
     truncated: bool,
 }
@@ -259,8 +282,30 @@ fn mix(mut h: u64, bytes: &[u8]) -> u64 {
     h
 }
 
-fn build_index(stats: &[FileStat], embedder: &dyn Embedder, fingerprint: u64) -> Index {
-    let mut chunks = Vec::new();
+/// Number of chunk texts handed to [`Embedder::embed_batch`] at a time.
+/// Matters only for network-backed embedders, where it is the difference
+/// between one request per chunk and one per 128 -- and therefore between
+/// paying a connection round trip 400 times or 4. Kept at or below the
+/// server's own per-request input cap.
+const EMBED_BATCH: usize = 128;
+
+/// Collect every chunk's text first, embed in batches, then zip the vectors
+/// back on. The two-pass shape exists for `embed_batch`: a per-chunk
+/// `embed()` call is fine locally but pathological over a network.
+fn build_index(
+    stats: &[FileStat],
+    embedder: &dyn Embedder,
+    fingerprint: u64,
+) -> Result<Index, String> {
+    struct Pending {
+        path: String,
+        start_line: usize,
+        end_line: usize,
+        preview: String,
+        text: String,
+    }
+
+    let mut pending: Vec<Pending> = Vec::new();
     let mut truncated = false;
     'files: for s in stats {
         let Ok(contents) = std::fs::read_to_string(&s.path) else {
@@ -272,14 +317,14 @@ fn build_index(stats: &[FileStat], embedder: &dyn Embedder, fingerprint: u64) ->
             let end = (start + CHUNK_LINES).min(lines.len());
             let window = &lines[start..end];
             if let Some(preview) = first_non_blank(window) {
-                chunks.push(Chunk {
+                pending.push(Pending {
                     path: s.rel.clone(),
                     start_line: start + 1,
                     end_line: end,
                     preview,
-                    vec: embedder.embed(&window.join("\n")),
+                    text: window.join("\n"),
                 });
-                if chunks.len() >= MAX_CHUNKS {
+                if pending.len() >= MAX_CHUNKS {
                     truncated = true;
                     break 'files;
                 }
@@ -290,11 +335,41 @@ fn build_index(stats: &[FileStat], embedder: &dyn Embedder, fingerprint: u64) ->
             start += CHUNK_STEP;
         }
     }
-    Index {
+
+    let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(pending.len());
+    for group in pending.chunks(EMBED_BATCH) {
+        let texts: Vec<String> = group.iter().map(|p| p.text.clone()).collect();
+        let got = embedder.embed_batch(&texts)?;
+        // A short or over-long reply would silently misalign every vector
+        // after it with the wrong chunk, which is far worse than failing.
+        if got.len() != texts.len() {
+            return Err(format!(
+                "embedder returned {} vectors for {} inputs",
+                got.len(),
+                texts.len()
+            ));
+        }
+        vectors.extend(got);
+    }
+
+    let chunks = pending
+        .into_iter()
+        .zip(vectors)
+        .map(|(p, vec)| Chunk {
+            path: p.path,
+            start_line: p.start_line,
+            end_line: p.end_line,
+            preview: p.preview,
+            vec,
+        })
+        .collect();
+
+    Ok(Index {
         fingerprint,
+        embedder_id: embedder.id().to_string(),
         chunks,
         truncated,
-    }
+    })
 }
 
 fn first_non_blank(lines: &[&str]) -> Option<String> {
@@ -331,6 +406,10 @@ struct SemanticArgs {
 pub struct SemanticSearch {
     workspace: Workspace,
     embedder: Arc<dyn Embedder>,
+    /// Always local and always infallible. Used when `embedder` is a remote
+    /// one that fails, so a network problem degrades search quality instead
+    /// of failing the user's task outright.
+    fallback: Arc<dyn Embedder>,
     index: Arc<Mutex<Option<Index>>>,
 }
 
@@ -345,6 +424,7 @@ impl SemanticSearch {
         Self {
             workspace,
             embedder,
+            fallback: Arc::new(HashingEmbedder::new(EMBED_DIM)),
             index: Arc::new(Mutex::new(None)),
         }
     }
@@ -406,6 +486,7 @@ impl Tool for SemanticSearch {
         };
 
         let embedder = self.embedder.clone();
+        let fallback = self.fallback.clone();
         let cache = self.index.clone();
         let query = a.query.clone();
 
@@ -417,12 +498,47 @@ impl Tool for SemanticSearch {
             let fp = fingerprint(&stats);
 
             let mut guard = cache.lock().expect("semantic index mutex poisoned");
-            if guard.as_ref().map(|i| i.fingerprint) != Some(fp) {
-                *guard = Some(build_index(&stats, embedder.as_ref(), fp));
+            // Reuse the cached index only if BOTH the files and the vector
+            // space are unchanged. Ignoring the embedder id here would score
+            // a fresh query against vectors of a different width/meaning.
+            let stale = match guard.as_ref() {
+                Some(i) => i.fingerprint != fp || i.embedder_id != embedder.id(),
+                None => true,
+            };
+            if stale {
+                let built = match build_index(&stats, embedder.as_ref(), fp) {
+                    Ok(idx) => idx,
+                    Err(e) => {
+                        // Rebuild wholesale with the local embedder rather
+                        // than salvaging a partial remote index -- half the
+                        // chunks in one vector space and half in another is
+                        // not a degraded index, it is a wrong one.
+                        eprintln!(
+                            "semantic_search: {} embedder unavailable ({e}); falling back to local index",
+                            embedder.id()
+                        );
+                        build_index(&stats, fallback.as_ref(), fp)
+                            .expect("local embedder is infallible")
+                    }
+                };
+                *guard = Some(built);
             }
             let index = guard.as_ref().expect("index just populated");
 
-            let qv = embedder.embed(&query);
+            // The query must be embedded by whichever embedder actually
+            // produced this index, not whichever one was requested.
+            let active: &dyn Embedder = if index.embedder_id == embedder.id() {
+                embedder.as_ref()
+            } else {
+                fallback.as_ref()
+            };
+            let qv = match active.embed_batch(std::slice::from_ref(&query)) {
+                Ok(mut v) if v.len() == 1 => v.remove(0),
+                // A query-time failure against an index that is already
+                // built is not worth discarding the index over; the local
+                // embedder cannot match those vectors, so report cleanly.
+                _ => return "semantic_search: embedding the query failed; try again".to_string(),
+            };
             let mut scored: Vec<(f32, &Chunk)> = index
                 .chunks
                 .iter()
@@ -588,5 +704,108 @@ mod tests {
             .await
             .unwrap();
         assert!(out.contains("no relevant code"), "got:\n{out}");
+    }
+}
+
+#[cfg(test)]
+mod embedder_switch_tests {
+    use super::*;
+
+    /// A second embedder with a different id and width, standing in for the
+    /// hosted one.
+    struct WideEmbedder;
+    impl Embedder for WideEmbedder {
+        fn dim(&self) -> usize {
+            8
+        }
+        fn id(&self) -> &str {
+            "wide-test"
+        }
+        fn embed(&self, _text: &str) -> Vec<f32> {
+            let mut v = vec![0.0; 8];
+            v[0] = 1.0;
+            v
+        }
+    }
+
+    struct FailingEmbedder;
+    impl Embedder for FailingEmbedder {
+        fn dim(&self) -> usize {
+            8
+        }
+        fn id(&self) -> &str {
+            "failing-test"
+        }
+        fn embed(&self, _text: &str) -> Vec<f32> {
+            vec![0.0; 8]
+        }
+        fn embed_batch(&self, _texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
+            Err("upstream down".to_string())
+        }
+    }
+
+    fn stats_for(dir: &std::path::Path) -> Vec<FileStat> {
+        collect_stats(dir, dir)
+    }
+
+    fn tmp_repo(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("hivemind_semantic_switch_{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.rs"), "fn alpha() {}\nfn beta() {}\n").unwrap();
+        dir
+    }
+
+    #[test]
+    fn index_records_which_embedder_built_it() {
+        let dir = tmp_repo("records");
+        let stats = stats_for(&dir);
+        let local = HashingEmbedder::new(EMBED_DIM);
+        let idx = build_index(&stats, &local, 1).unwrap();
+        assert_eq!(idx.embedder_id, "hash-v1");
+        assert_eq!(idx.chunks[0].vec.len(), EMBED_DIM);
+
+        let wide = WideEmbedder;
+        let idx2 = build_index(&stats, &wide, 1).unwrap();
+        assert_eq!(idx2.embedder_id, "wide-test");
+        // Different width: reusing idx across these two would be a bug.
+        assert_eq!(idx2.chunks[0].vec.len(), 8);
+    }
+
+    #[test]
+    fn a_failing_embedder_reports_error_rather_than_a_partial_index() {
+        let dir = tmp_repo("failing");
+        let stats = stats_for(&dir);
+        match build_index(&stats, &FailingEmbedder, 1) {
+            Err(e) => assert!(e.contains("upstream down"), "got: {e}"),
+            Ok(_) => panic!("a failing embedder must not yield an index"),
+        }
+    }
+
+    #[test]
+    fn batching_preserves_chunk_to_vector_alignment() {
+        // Enough chunks to span multiple EMBED_BATCH groups, so a
+        // mis-zipped batch boundary would show up as a wrong preview.
+        let dir = std::env::temp_dir().join("hivemind_semantic_switch_align");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let body: String = (0..(EMBED_BATCH * 3 * CHUNK_STEP))
+            .map(|i| format!("fn f{i}() {{}}\n"))
+            .collect();
+        std::fs::write(dir.join("big.rs"), body).unwrap();
+
+        let stats = stats_for(&dir);
+        let local = HashingEmbedder::new(EMBED_DIM);
+        let idx = build_index(&stats, &local, 7).unwrap();
+        assert!(idx.chunks.len() > EMBED_BATCH * 2, "need multiple batches");
+        for c in &idx.chunks {
+            // Every chunk must carry a real vector from its own text.
+            assert_eq!(c.vec.len(), EMBED_DIM);
+            assert!(
+                c.vec.iter().any(|v| *v != 0.0),
+                "zero vector at {}",
+                c.start_line
+            );
+        }
     }
 }
