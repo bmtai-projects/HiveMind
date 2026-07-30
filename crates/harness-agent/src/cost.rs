@@ -5,14 +5,6 @@
 use harness_config::lookup_model;
 use harness_types::Usage;
 
-/// A model's provider bills cache-miss and cache-hit prompt tokens at
-/// different rates; when a response doesn't report the split, treat the
-/// whole prompt as a cache miss (the conservative, never-underestimate
-/// default). `hosted` applies HiveMind's margin on top of the wholesale
-/// price, since that's what a hosted user is actually billed; a BYOK key
-/// pays the upstream provider's wholesale price directly. `None` for a
-/// `model_id` not in `KNOWN_MODELS` (a BYOK user's own custom string) --
-/// there's no pricing data to estimate from, not a zero cost.
 pub fn estimate_cost_usd(usage: &Usage, model_id: &str, hosted: bool) -> Option<f64> {
     let pricing = lookup_model(model_id)?.wholesale_pricing;
     let miss = usage.cache_miss_tokens.unwrap_or(usage.prompt_tokens) as f64;

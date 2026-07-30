@@ -585,10 +585,35 @@ pub fn delete_hosted_credentials(path: &Path) -> std::io::Result<bool> {
     }
 }
 
-/// Minimal `$HOME` lookup so this crate doesn't need the `dirs` dependency
-/// for one call site.
+/// Minimal home-directory lookup so this crate doesn't need the `dirs`
+/// dependency for one call site.
+///
+/// Windows does not set `HOME`. Without the `USERPROFILE` fallback every
+/// path above silently degraded to a *relative* one, resolved against the
+/// process's cwd — so credentials written by `hivemind auth login` in one
+/// directory were invisible to a `hivemind activate` launched from another
+/// (which is exactly what the VS Code extension does: it spawns with the
+/// workspace root as cwd).
 fn dirs_home() -> Option<std::path::PathBuf> {
-    std::env::var_os("HOME").map(std::path::PathBuf::from)
+    fn var(key: &str) -> Option<std::path::PathBuf> {
+        std::env::var_os(key)
+            .filter(|v| !v.is_empty())
+            .map(std::path::PathBuf::from)
+    }
+
+    #[cfg(windows)]
+    {
+        // `HOME` last: only MSYS/Git-Bash sets it, and when it does it can
+        // hold a POSIX-style path the Windows APIs can't open.
+        var("USERPROFILE")
+            .or_else(|| Some(var("HOMEDRIVE")?.join(var("HOMEPATH")?)))
+            .or_else(|| var("HOME"))
+    }
+
+    #[cfg(not(windows))]
+    {
+        var("HOME")
+    }
 }
 
 #[cfg(test)]
@@ -609,6 +634,42 @@ mod tests {
     fn known_models_lookup_finds_hivemind_and_rejects_unknown() {
         assert_eq!(lookup_model("hivemind").unwrap().display_name, "HiveMind");
         assert!(lookup_model("not-a-real-model").is_none());
+    }
+
+    /// A relative path here means the file is looked up against whatever cwd
+    /// the process happened to launch with -- the Windows bug where the VS
+    /// Code extension (cwd = workspace root) could not see credentials that
+    /// `auth login` had written elsewhere.
+    #[test]
+    fn default_paths_are_absolute_not_cwd_relative() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        for path in [
+            default_config_path(),
+            default_credentials_path(),
+            default_sessions_dir(),
+        ] {
+            assert!(
+                path.is_absolute(),
+                "{path:?} is relative, so it resolves against the process cwd"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_home_is_treated_as_unset() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let key = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+        let saved = std::env::var_os(key);
+        // SAFETY: test-only env mutation, serialized via ENV_LOCK above.
+        unsafe { std::env::set_var(key, "") };
+        let got = dirs_home();
+        unsafe {
+            match saved {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
+        };
+        assert_ne!(got, Some(std::path::PathBuf::from("")));
     }
 
     #[test]

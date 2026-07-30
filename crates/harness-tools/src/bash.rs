@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -98,10 +98,8 @@ impl Tool for Bash {
             return Ok("command denied by user".to_string());
         }
 
-        let mut cmd = Command::new("bash");
-        cmd.arg("-lc")
-            .arg(&a.command)
-            .current_dir(&self.workspace_root)
+        let mut cmd = shell_command(&a.command);
+        cmd.current_dir(strip_verbatim(&self.workspace_root))
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .stdin(Stdio::null())
@@ -117,6 +115,52 @@ impl Tool for Bash {
             Ok(Err(e)) => Err(ToolError::Io(e)),
             Err(_) => Ok(format!("[timed out after {}s]", self.timeout.as_secs())),
         }
+    }
+}
+
+/// Windows has no `bash`; `cmd.exe /C` is the only shell guaranteed to be
+/// present. Elsewhere `bash -lc` is kept as-is so login-shell PATH setup
+/// (nvm, pyenv, ...) still applies.
+fn shell_command(command: &str) -> Command {
+    #[cfg(windows)]
+    {
+        let mut cmd = Command::new("cmd");
+        cmd.arg("/C").arg(command);
+        cmd
+    }
+
+    #[cfg(not(windows))]
+    {
+        let mut cmd = Command::new("bash");
+        cmd.arg("-lc").arg(command);
+        cmd
+    }
+}
+
+/// `Path::canonicalize` on Windows returns a `\\?\C:\...` verbatim path, and
+/// `cmd.exe` refuses to start in one ("UNC paths are not supported"). Strip
+/// the prefix back to a plain `C:\...` for use as a working directory.
+fn strip_verbatim(path: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        use std::path::{Component, Prefix};
+        if let Some(Component::Prefix(p)) = path.components().next() {
+            match p.kind() {
+                Prefix::VerbatimDisk(drive) => {
+                    let rest: PathBuf = path.components().skip(1).collect();
+                    return PathBuf::from(format!("{}:\\", drive as char)).join(rest);
+                }
+                // A verbatim UNC share (`\\?\UNC\server\share`) has no plain
+                // equivalent that gains anything, so it's left alone.
+                _ => {}
+            }
+        }
+        path.to_path_buf()
+    }
+
+    #[cfg(not(windows))]
+    {
+        path.to_path_buf()
     }
 }
 

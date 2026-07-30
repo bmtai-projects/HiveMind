@@ -1,26 +1,3 @@
-//! Tool hooks: `PreToolUse` can veto a call before it runs; `PostToolUse`
-//! only observes what already happened. Ported from grok-build's
-//! `xai-grok-hooks`, scoped down to a command-only handler — no HTTP
-//! handler type (cuts its SSRF-allowlist concern entirely), no
-//! multi-location discovery (hooks are declared directly in
-//! `config.toml`'s `[[hooks]]`), and exact/wildcard tool-name matching
-//! only. See `plan.md` at the repo root for the full comparison.
-//!
-//! The execution contract matches grok-build's real one (confirmed by
-//! reading `runner/command.rs`, not guessed): the event envelope is JSON on
-//! the child's stdin, and the outcome is read from either structured JSON
-//! on stdout (`{"decision": "...", "reason": "..."}`) or, as a fallback,
-//! the exit code — `0` allows, `2` denies (matching Claude Code's own hook
-//! convention), anything else means the hook itself failed. A hook that
-//! times out, fails to spawn, or produces unparsable output **fails
-//! open** (`Allow`) — a broken hook script must never be able to wedge the
-//! agent. This is ported as-is from grok-build's `result.rs`, not
-//! reconsidered.
-//!
-//! `PostToolUse` never produces a decision to act on — grok-build's own
-//! `HookDecision` is explicitly scoped to blocking (`pre_tool_use`)
-//! dispatch, so a post-hook's outcome is purely observational here too.
-
 use std::process::Stdio;
 use std::time::Duration;
 

@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use reedline::{Completer, Span, Suggestion};
 
 use crate::commands::COMMAND_NAMES;
+use crate::mentions::is_ignored;
 
 pub struct HiveCompleter {
     workdir: PathBuf,
@@ -23,15 +24,25 @@ impl HiveCompleter {
             .filter_entry(|e| !is_ignored(e))
             .filter_map(Result::ok)
         {
-            if !entry.file_type().is_file() {
+            let is_dir = entry.file_type().is_dir();
+            if !entry.file_type().is_file() && !is_dir {
                 continue;
             }
             let Ok(rel) = entry.path().strip_prefix(&self.workdir) else {
                 continue;
             };
+            if rel.as_os_str().is_empty() {
+                continue; // the workdir itself
+            }
             let rel_str = rel.to_string_lossy();
             if partial.is_empty() || rel_str.contains(partial) {
-                matches.push(rel_str.into_owned());
+                // Trailing slash marks a folder mention, which expands to a
+                // listing rather than file content.
+                matches.push(if is_dir {
+                    format!("{rel_str}/")
+                } else {
+                    rel_str.into_owned()
+                });
             }
             if matches.len() >= 50 {
                 break;
@@ -82,13 +93,6 @@ impl Completer for HiveCompleter {
 
         Vec::new()
     }
-}
-
-fn is_ignored(entry: &walkdir::DirEntry) -> bool {
-    matches!(
-        entry.file_name().to_str(),
-        Some(".git" | "target" | "node_modules" | ".DS_Store")
-    )
 }
 
 /// Byte index of the `@` that starts the mention currently being typed just
