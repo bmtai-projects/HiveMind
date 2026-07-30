@@ -24,7 +24,7 @@ use clap::{Args, Parser, Subcommand};
 use reedline::Signal;
 
 use commands::{BudgetArg, ModelArg, ReasoningArg, SlashCommand, UndoArg};
-use harness_agent::Agent;
+use harness_agent::{Agent, Ui};
 use harness_config::CliOverrides;
 use harness_tools::{
     Bash, CreatePdf, CreateSpreadsheet, EditFile, ListDir, ProjectMap, ReadFile, Registry, Search,
@@ -356,6 +356,17 @@ async fn run(args: ActivateArgs) -> anyhow::Result<()> {
         .canonicalize()
         .map_err(|e| anyhow::anyhow!("workdir {:?}: {e}", args.workdir))?;
     let headless = args.prompt.is_some();
+    let protocol_json = matches!(args.protocol, Some(Protocol::Json));
+
+    // Constructed up front, before any tool is registered, so a tool that
+    // needs to report progress (below) can route through whichever Ui this
+    // session actually uses -- rather than writing to a terminal directly,
+    // bypassing the one interface a host (a TUI, or the VS Code extension
+    // via --protocol json) is meant to go through. Exactly one of these is
+    // ever `Some`; `TermUi::new`'s inputs are both already available here.
+    let json_ui: Option<Arc<JsonUi>> = protocol_json.then(|| Arc::new(JsonUi::new()));
+    let term_ui: Option<Arc<TermUi>> =
+        (!protocol_json).then(|| Arc::new(TermUi::new(args.show_reasoning, resolved.budget_usd)));
 
     let mut registry = Registry::new();
     let ws = Workspace::new(workdir.clone());
@@ -374,24 +385,35 @@ async fn run(args: ActivateArgs) -> anyhow::Result<()> {
         .hosted
         .then_some(resolved.endpoint.api_key.as_str());
     let pro = resolved.mode == harness_config::Mode::Pro;
+    let progress_ui: harness_tools::ProgressSink = {
+        let json_ui = json_ui.clone();
+        let term_ui = term_ui.clone();
+        Arc::new(move |msg: &str| {
+            if let Some(j) = &json_ui {
+                j.tool_progress("semantic_search", msg);
+            } else if let Some(t) = &term_ui {
+                t.tool_progress("semantic_search", msg);
+            }
+        })
+    };
     registry.register(Arc::new(
         match harness_tools::RemoteEmbedder::for_pro_mode(pro, hosted_token) {
-            Some(remote) => SemanticSearch::with_embedder(ws.clone(), Arc::new(remote)),
+            Some(remote) => {
+                SemanticSearch::with_embedder(ws.clone(), Arc::new(remote)).with_progress(progress_ui)
+            }
             None => {
                 if pro {
                     eprintln!(
                         "pro mode: hosted embeddings need a signed-in account (`hivemind auth login`); using local search"
                     );
                 }
-                SemanticSearch::new(ws.clone())
+                SemanticSearch::new(ws.clone()).with_progress(progress_ui)
             }
         },
     ));
     registry.register(Arc::new(TodoWrite));
     registry.register(Arc::new(CreatePdf(ws.clone())));
     registry.register(Arc::new(CreateSpreadsheet(ws.clone())));
-
-    let protocol_json = matches!(args.protocol, Some(Protocol::Json));
 
     // Shell approval has three shapes:
     // - `--yolo` (either mode): auto-approved, no round-trip at all.
@@ -401,7 +423,6 @@ async fn run(args: ActivateArgs) -> anyhow::Result<()> {
     //   y/N prompt. Headless `-p` (no `--protocol`) keeps its pre-existing
     //   behavior of auto-approving, unchanged.
     let mut bash = Bash::new(workdir.clone());
-    let json_ui: Option<Arc<JsonUi>> = protocol_json.then(|| Arc::new(JsonUi::new()));
     if let Some(json_ui) = &json_ui {
         if !args.yolo {
             let json_ui = json_ui.clone();
@@ -431,7 +452,7 @@ async fn run(args: ActivateArgs) -> anyhow::Result<()> {
         return run_json_protocol(&mut agent, ws, json_ui).await;
     }
 
-    let ui: Arc<TermUi> = Arc::new(TermUi::new(args.show_reasoning, resolved.budget_usd));
+    let ui = term_ui.expect("interactive mode always constructs a TermUi above");
     let mut agent = Agent::new(
         resolved.clone(),
         registry,
