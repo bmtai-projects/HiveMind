@@ -54,6 +54,12 @@ const MAX_TOP_K: usize = 25;
 const MIN_SCORE: f32 = 0.05;
 const PREVIEW_CHARS: usize = 120;
 
+/// Sink for progress reported during index building. A type alias mainly
+/// to keep call sites and struct fields readable -- `Arc<dyn Fn(&str) +
+/// Send + Sync>` repeated at every use site is exactly the kind of
+/// signature clippy's `type_complexity` lint exists to flag.
+pub type ProgressSink = Arc<dyn Fn(&str) + Send + Sync>;
+
 // ---------------------------------------------------------------------------
 // Embedder: the one swappable piece (see module docs).
 // ---------------------------------------------------------------------------
@@ -292,11 +298,24 @@ const EMBED_BATCH: usize = 128;
 /// Collect every chunk's text first, embed in batches, then zip the vectors
 /// back on. The two-pass shape exists for `embed_batch`: a per-chunk
 /// `embed()` call is fine locally but pathological over a network.
+/// Route through the host UI when one is wired (a real ndjson event a
+/// client can render), else fall back to stderr -- still visible in a plain
+/// terminal, and a safe no-op default for any call site (including tests)
+/// that hasn't wired progress reporting.
+fn report_progress(progress: Option<&(dyn Fn(&str) + Send + Sync)>, msg: &str) {
+    match progress {
+        Some(f) => f(msg),
+        None => eprintln!("semantic_search: {msg}"),
+    }
+}
+
 fn build_index(
     stats: &[FileStat],
     embedder: &dyn Embedder,
     fingerprint: u64,
+    progress: Option<&(dyn Fn(&str) + Send + Sync)>,
 ) -> Result<Index, String> {
+    let report = |msg: &str| report_progress(progress, msg);
     struct Pending {
         path: String,
         start_line: usize,
@@ -336,8 +355,28 @@ fn build_index(
         }
     }
 
+    // A remote embedder can take tens of seconds per batch (network + cold
+    // start), and this whole function runs before semantic_search returns
+    // anything -- with no signal at all, a slow-but-working index build is
+    // indistinguishable from a hung one.
+    let total_batches = pending.len().div_ceil(EMBED_BATCH).max(1);
+    if !pending.is_empty() {
+        report(&format!(
+            "indexing {} chunk(s){}",
+            pending.len(),
+            if total_batches > 1 {
+                format!(" in {total_batches} batches")
+            } else {
+                String::new()
+            }
+        ));
+    }
+
     let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(pending.len());
-    for group in pending.chunks(EMBED_BATCH) {
+    for (i, group) in pending.chunks(EMBED_BATCH).enumerate() {
+        if total_batches > 1 {
+            report(&format!("batch {}/{total_batches}...", i + 1));
+        }
         let texts: Vec<String> = group.iter().map(|p| p.text.clone()).collect();
         let got = embedder.embed_batch(&texts)?;
         // A short or over-long reply would silently misalign every vector
@@ -411,6 +450,12 @@ pub struct SemanticSearch {
     /// of failing the user's task outright.
     fallback: Arc<dyn Embedder>,
     index: Arc<Mutex<Option<Index>>>,
+    /// Optional sink for indexing progress -- wired to the host `Ui` (see
+    /// `harness_agent::Ui::tool_progress`) so a slow, network-backed index
+    /// build reports through the same interface every other event does,
+    /// instead of a tool writing to a terminal directly. `None` (the
+    /// default) falls back to stderr inside `build_index`.
+    progress: Option<ProgressSink>,
 }
 
 impl SemanticSearch {
@@ -426,7 +471,14 @@ impl SemanticSearch {
             embedder,
             fallback: Arc::new(HashingEmbedder::new(EMBED_DIM)),
             index: Arc::new(Mutex::new(None)),
+            progress: None,
         }
+    }
+
+    /// Report indexing progress through `cb` instead of stderr.
+    pub fn with_progress(mut self, cb: ProgressSink) -> Self {
+        self.progress = Some(cb);
+        self
     }
 }
 
@@ -489,6 +541,7 @@ impl Tool for SemanticSearch {
         let fallback = self.fallback.clone();
         let cache = self.index.clone();
         let query = a.query.clone();
+        let progress = self.progress.clone();
 
         // Index build (walk + read + embed) and search are blocking/CPU work;
         // run off the reactor. The std `Mutex` is only ever locked inside this
@@ -506,18 +559,21 @@ impl Tool for SemanticSearch {
                 None => true,
             };
             if stale {
-                let built = match build_index(&stats, embedder.as_ref(), fp) {
+                let built = match build_index(&stats, embedder.as_ref(), fp, progress.as_deref()) {
                     Ok(idx) => idx,
                     Err(e) => {
                         // Rebuild wholesale with the local embedder rather
                         // than salvaging a partial remote index -- half the
                         // chunks in one vector space and half in another is
                         // not a degraded index, it is a wrong one.
-                        eprintln!(
-                            "semantic_search: {} embedder unavailable ({e}); falling back to local index",
-                            embedder.id()
+                        report_progress(
+                            progress.as_deref(),
+                            &format!(
+                                "{} embedder unavailable ({e}); falling back to local index",
+                                embedder.id()
+                            ),
                         );
-                        build_index(&stats, fallback.as_ref(), fp)
+                        build_index(&stats, fallback.as_ref(), fp, progress.as_deref())
                             .expect("local embedder is infallible")
                     }
                 };
@@ -761,12 +817,12 @@ mod embedder_switch_tests {
         let dir = tmp_repo("records");
         let stats = stats_for(&dir);
         let local = HashingEmbedder::new(EMBED_DIM);
-        let idx = build_index(&stats, &local, 1).unwrap();
+        let idx = build_index(&stats, &local, 1, None).unwrap();
         assert_eq!(idx.embedder_id, "hash-v1");
         assert_eq!(idx.chunks[0].vec.len(), EMBED_DIM);
 
         let wide = WideEmbedder;
-        let idx2 = build_index(&stats, &wide, 1).unwrap();
+        let idx2 = build_index(&stats, &wide, 1, None).unwrap();
         assert_eq!(idx2.embedder_id, "wide-test");
         // Different width: reusing idx across these two would be a bug.
         assert_eq!(idx2.chunks[0].vec.len(), 8);
@@ -776,7 +832,7 @@ mod embedder_switch_tests {
     fn a_failing_embedder_reports_error_rather_than_a_partial_index() {
         let dir = tmp_repo("failing");
         let stats = stats_for(&dir);
-        match build_index(&stats, &FailingEmbedder, 1) {
+        match build_index(&stats, &FailingEmbedder, 1, None) {
             Err(e) => assert!(e.contains("upstream down"), "got: {e}"),
             Ok(_) => panic!("a failing embedder must not yield an index"),
         }
@@ -796,7 +852,7 @@ mod embedder_switch_tests {
 
         let stats = stats_for(&dir);
         let local = HashingEmbedder::new(EMBED_DIM);
-        let idx = build_index(&stats, &local, 7).unwrap();
+        let idx = build_index(&stats, &local, 7, None).unwrap();
         assert!(idx.chunks.len() > EMBED_BATCH * 2, "need multiple batches");
         for c in &idx.chunks {
             // Every chunk must carry a real vector from its own text.

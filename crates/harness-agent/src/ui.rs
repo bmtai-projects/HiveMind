@@ -79,4 +79,12 @@ pub trait Ui: Send + Sync {
     /// not the one just sent. A clean stop instead of letting the request
     /// go out and get rejected by the provider with a confusing wire error.
     fn stopped_for_context_limit(&self, estimated_tokens: u64, context_window: u64);
+
+    /// Fired zero or more times *during* a single tool call, between its
+    /// `tool_start` and `tool_end`, for a call whose duration can otherwise
+    /// leave a host UI with no signal to distinguish "still working" from
+    /// "hung" -- e.g. `semantic_search` building an index across several
+    /// slow network-backed embedding batches. Purely informational: no tool
+    /// is required to call this, and none did before hosted embeddings.
+    fn tool_progress(&self, tool: &str, message: &str);
 }

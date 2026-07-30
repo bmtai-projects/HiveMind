@@ -23,7 +23,7 @@ pub use pdf::CreatePdf;
 pub use project_map::ProjectMap;
 pub use remote_embed::RemoteEmbedder;
 pub use search::Search;
-pub use semantic::{Embedder, HashingEmbedder, SemanticSearch};
+pub use semantic::{Embedder, HashingEmbedder, ProgressSink, SemanticSearch};
 pub use todo::TodoWrite;
 pub use tool::{Registry, Tool, obj_schema};
 pub use xlsx::CreateSpreadsheet;

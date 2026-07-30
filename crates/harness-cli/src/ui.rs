@@ -162,6 +162,10 @@ impl Ui for TermUi {
         println!("\x1b[36m  ↩ delivered your {noun} to the model\x1b[0m");
     }
 
+    fn tool_progress(&self, tool: &str, message: &str) {
+        eprintln!("\x1b[90m  {tool}: {message}\x1b[0m");
+    }
+
     fn compacted(
         &self,
         messages_before: usize,

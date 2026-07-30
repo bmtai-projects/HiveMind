@@ -296,4 +296,12 @@ impl Ui for JsonUi {
             "context_window": context_window,
         }));
     }
+
+    fn tool_progress(&self, tool: &str, message: &str) {
+        self.emit(json!({
+            "type": "tool_progress",
+            "tool": tool,
+            "message": message,
+        }));
+    }
 }
