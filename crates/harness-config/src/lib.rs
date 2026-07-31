@@ -575,6 +575,16 @@ pub fn default_credentials_path() -> PathBuf {
     PathBuf::from("hivemind-credentials.toml")
 }
 
+/// Default embedding-cache location: `~/.config/hivemind/embeddings/`.
+/// Vectors keyed by chunk content, so an unchanged chunk is embedded once
+/// ever rather than once per session — see `harness_tools::EmbedCache`.
+pub fn default_embeddings_cache_dir() -> PathBuf {
+    if let Some(home) = dirs_home() {
+        return home.join(".config").join("hivemind").join("embeddings");
+    }
+    PathBuf::from("hivemind-embeddings")
+}
+
 /// Default session-store location: `~/.config/hivemind/sessions/`. One JSON
 /// file per saved conversation — see `harness_agent::SessionStore`.
 pub fn default_sessions_dir() -> PathBuf {
