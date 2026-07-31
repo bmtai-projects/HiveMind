@@ -20,13 +20,6 @@ use crate::ui::Ui;
 /// Most-recent messages (after the system prompt) a compaction pass keeps
 /// verbatim. Not user-configurable yet — a reasonable fixed default.
 const COMPACTION_KEEP_RECENT: usize = 8;
-
-/// Last-resort ceiling, as a percent of the active model's context window,
-/// past which a request is refused rather than sent. Deliberately higher
-/// than `compaction_threshold_percent` (75% default) -- compaction is the
-/// first line of defense and should already have acted well before this;
-/// this exists only for what compaction *can't* fix (no older turns left
-/// to fold) or when the estimate itself runs a little hot.
 const SEND_GUARD_PERCENT: u64 = 95;
 
 pub struct Agent {
@@ -36,60 +29,20 @@ pub struct Agent {
     ui: Arc<dyn Ui>,
 
     messages: Vec<Message>,
-    /// Sticky across `run()` calls; changed only by an explicit `/model`
-    /// command. `current_model` resets to this at the start of every input.
     default_model: String,
     current_model: String,
-    /// Whether `default_model` is billed through HiveMind's hosted margin
-    /// (true) or paid directly to the upstream provider via a BYOK key
-    /// (false) -- only affects the live cost readout, see `crate::ui::Ui::usage`.
     hosted: bool,
-    /// User intent, not necessarily what gets sent -- gated per-model
-    /// against `harness_config::lookup_model(...).reasoning_efforts` fresh
-    /// every turn in `run()`, since `/model` can switch to a model that
-    /// doesn't support whatever was requested (or doesn't support the
-    /// parameter at all). Sticky like `default_model`.
     reasoning_effort: Option<String>,
-    /// Hard cap on cumulative estimated USD spend across the *whole*
-    /// session (every `run()` call, not just the current one) -- matches
-    /// what `/cost` already reports as "session cost so far". Checked at
-    /// the start of every turn, not mid-stream: the in-flight turn is
-    /// always allowed to finish (mirrors the server's own reserve-then-
-    /// settle philosophy -- never interrupt something already committed
-    /// to, just don't start another). `None` means unbounded, the default.
     budget_usd: Option<f64>,
-    /// Running total this estimate is checked against. Computed from the
-    /// exact same formula the UI's own readout uses (`crate::cost`), so
-    /// the two can never quietly disagree -- but this is HiveMind's own
-    /// best-effort client-side estimate, not what the server actually
-    /// bills; see `crate::cost::estimate_cost_usd`'s doc comment.
     session_cost_usd: f64,
     last_total_tokens: u64,
     context_window: u64,
-
-    /// Doom-loop guard: consecutive turns whose tool calls were identical
-    /// to the previous turn's, or produced a tool error.
     repeat_count: u32,
     last_call_signature: Option<String>,
-
-    /// Used only to snapshot/restore files for `/undo` -- reuses the exact
-    /// same path-escape check the file tools themselves enforce.
     workspace: Workspace,
-    /// One entry per completed `run()` call, oldest first. See
-    /// `crate::checkpoint` for why `run_shell` doesn't participate.
     checkpoints: Vec<Checkpoint>,
-    /// From `config.toml`'s `[[hooks]]`. Empty unless the user configured
-    /// any -- see `crate::hooks`.
     hooks: Vec<HookSpec>,
-
-    /// Messages the user sent *while* a turn was already running, delivered
-    /// at the next turn boundary. Cloneable handle: hosts hand a clone to
-    /// whatever reads input concurrently (see `crate::interjection`).
     interjections: InterjectionQueue,
-
-    /// Where this conversation is persisted, if anywhere. `None` disables
-    /// persistence entirely (used by tests and one-shot `-p` runs, which
-    /// have nothing worth resuming).
     persistence: Option<Persistence>,
 }
 
@@ -155,6 +108,12 @@ impl Agent {
         self.interjections.clone()
     }
 
+    /// Open the provider connection in the background, so the first turn
+    /// doesn't pay for the TLS handshake. Call once at startup.
+    pub fn warm_connection(&self) {
+        self.client.warm();
+    }
+
     /// Start persisting this conversation to `store` under a fresh id.
     /// Returns the id, so a host can print it for `--resume`.
     pub fn enable_persistence(&mut self, store: SessionStore, workspace: String) -> String {
@@ -171,12 +130,6 @@ impl Agent {
     /// Adopt a previously saved conversation, continuing to persist under
     /// its original id so `--continue` keeps following the same session
     /// rather than forking a new one on every resume.
-    ///
-    /// The **system prompt is deliberately not restored**: `messages[0]` is
-    /// replaced with the current one. A resumed session runs on today's
-    /// binary, whose tools and guidance may differ from whenever the
-    /// session started -- replaying a stale prompt would describe tools
-    /// that no longer exist (or omit ones that now do).
     pub fn restore(&mut self, record: SessionRecord, store: SessionStore, system_prompt: String) {
         let mut messages = record.messages;
         match messages.first_mut() {
@@ -243,11 +196,7 @@ impl Agent {
         &self.current_model
     }
 
-    /// Set the model this session runs on, effective immediately and sticky
-    /// across future inputs (unlike auto-escalation, which resets to the
-    /// configured default at the start of every new `run()` call). Used by
-    /// an explicit user command (e.g. a REPL `/model` command), not by the
-    /// doom-loop guard.
+   
     pub fn set_model(&mut self, model: String) {
         self.default_model = model.clone();
         self.current_model = model;
@@ -257,13 +206,7 @@ impl Agent {
         self.reasoning_effort.as_deref()
     }
 
-    /// Which `reasoning_effort` values the *current* model actually
-    /// accepts -- empty means it either doesn't support the parameter, or
-    /// (for a couple of models that reason unconditionally but only expose
-    /// OpenRouter's richer `reasoning: {...}` object) isn't wired up here.
-    /// Callers (the REPL's `/reasoning` command) should validate against
-    /// this before calling `set_reasoning_effort`, since this type doesn't
-    /// -- same trust boundary as `set_model` not validating BYOK ids.
+ 
     pub fn reasoning_efforts_for_current_model(&self) -> &'static [&'static str] {
         harness_config::lookup_model(&self.current_model)
             .map(|m| m.reasoning_efforts)
@@ -393,7 +336,7 @@ impl Agent {
             self.ui.turn_started();
             let mut rx = self.client.stream(&req);
             self.messages = std::mem::take(&mut req.messages);
-
+            
             let resp = self.drain_stream(&mut rx).await?;
 
             self.last_total_tokens = resp.usage.total_tokens;
@@ -483,6 +426,9 @@ impl Agent {
                 }
                 StreamEvent::ReasoningDelta(r) => {
                     self.ui.reasoning_delta(&r);
+                }
+                StreamEvent::ToolCallStarted(name) => {
+                    self.ui.tool_call_pending(&name);
                 }
                 StreamEvent::Done(resp) => {
                     final_response = Some(*resp);
@@ -593,14 +539,8 @@ impl Agent {
             threshold_percent: self.policy.compaction_threshold_percent,
             keep_recent: COMPACTION_KEEP_RECENT,
         };
-        // `last_total_tokens` is the previous *response's* real usage --
-        // accurate, but stale by exactly one user message, since it can't
-        // know about whatever was just appended for the turn about to be
-        // sent. `estimate_tokens` is approximate but always current. Taking
-        // the larger of the two never under-triggers relative to either
-        // signal, which matters more here than being precise: this is what
-        // catches a huge single paste on what would otherwise look like an
-        // early, low-usage turn.
+        
+
         let effective_tokens = self
             .last_total_tokens
             .max(crate::tokens::estimate_tokens(&self.messages));
@@ -627,11 +567,7 @@ impl Agent {
         }
     }
 
-    /// Fold a compaction pass's own summarization-call cost into
-    /// `session_cost_usd` -- without this, every compaction is a real,
-    /// billed model call that's invisible to both `/cost` and `--budget`
-    /// enforcement, a leak in the exact accounting `budget_usd` exists to
-    /// guarantee. Returns the cost added, for the UI to surface immediately.
+    
     fn account_for_compaction_cost(
         &mut self,
         report: &crate::compaction::CompactionReport,
@@ -643,13 +579,7 @@ impl Agent {
     }
 }
 
-/// Index to truncate a transcript to so it no longer ends with an assistant
-/// message whose `tool_calls` never received all their results. `None` when
-/// the transcript is already well-formed.
-///
-/// Pure and free-standing so the rule can be tested directly -- building a
-/// whole `Agent` (client, registry, workspace, UI) to exercise a list
-/// operation would test the scaffolding, not the rule.
+
 fn incomplete_tool_group_start(messages: &[Message]) -> Option<usize> {
     let idx = messages
         .iter()

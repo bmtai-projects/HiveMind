@@ -340,6 +340,11 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn run(args: ActivateArgs) -> anyhow::Result<()> {
+    // Fired before any of the startup I/O below so its round trip overlaps
+    // config resolution, workspace canonicalization, and session loading
+    // rather than being serialized in front of the first prompt.
+    let update_check = banner::start_update_check();
+
     let config_path = args
         .config
         .clone()
@@ -454,6 +459,7 @@ async fn run(args: ActivateArgs) -> anyhow::Result<()> {
             json_ui.clone(),
             SYSTEM_PROMPT.to_string(),
         );
+        agent.warm_connection();
         // Protocol mode persists too: an editor window reloading is exactly
         // the kind of ordinary interruption a session must survive.
         attach_or_restore_session(&mut agent, &args, store, workspace, false)?;
@@ -468,6 +474,7 @@ async fn run(args: ActivateArgs) -> anyhow::Result<()> {
         ui.clone(),
         SYSTEM_PROMPT.to_string(),
     );
+    agent.warm_connection();
 
     if let Some(prompt) = &args.prompt {
         // A one-shot `-p` run has nothing worth resuming later, so it stays
@@ -479,7 +486,7 @@ async fn run(args: ActivateArgs) -> anyhow::Result<()> {
 
     attach_or_restore_session(&mut agent, &args, store, workspace, true)?;
 
-    repl(&mut agent, ws, ui, args.yolo).await
+    repl(&mut agent, ws, ui, args.yolo, update_check).await
 }
 
 /// Resolve `--continue` / `--resume` into either a restored session or a
@@ -663,8 +670,14 @@ async fn run_json_protocol(
     Ok(())
 }
 
-async fn repl(agent: &mut Agent, ws: Workspace, ui: Arc<TermUi>, yolo: bool) -> anyhow::Result<()> {
-    banner::print().await;
+async fn repl(
+    agent: &mut Agent,
+    ws: Workspace,
+    ui: Arc<TermUi>,
+    yolo: bool,
+    update_check: tokio::task::JoinHandle<Option<String>>,
+) -> anyhow::Result<()> {
+    banner::print(update_check).await;
     println!("\x1b[90m@ to reference a file\x1b[0m");
 
     let history_path = harness_config::default_config_path()

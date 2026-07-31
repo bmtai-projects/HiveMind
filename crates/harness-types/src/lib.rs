@@ -168,5 +168,9 @@ pub struct ChatResponse {
 pub enum StreamEvent {
     TextDelta(String),
     ReasoningDelta(String),
+    /// A tool call's name, the moment it hits the wire — well before its
+    /// arguments finish. Once per call; a tool-only turn emits no
+    /// `TextDelta`, so this is the only thing a UI can show while it waits.
+    ToolCallStarted(String),
     Done(Box<ChatResponse>),
 }

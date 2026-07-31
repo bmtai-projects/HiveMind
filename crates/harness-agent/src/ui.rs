@@ -25,6 +25,11 @@ pub trait Ui: Send + Sync {
     /// text was actually streamed — a tool-only turn skips this).
     fn assistant_done(&self);
 
+    /// A tool call's name arrived, but its arguments are still streaming and
+    /// nothing has run yet. Fires between `turn_started` and `tool_start`.
+    /// Optional: `tool_start` stays the authoritative "now running" event.
+    fn tool_call_pending(&self, _name: &str) {}
+
     fn tool_start(&self, name: &str, args: &str);
     fn tool_end(&self, name: &str, result: &str, is_error: bool);
 
