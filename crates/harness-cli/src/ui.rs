@@ -3,7 +3,7 @@
 //! the active model's pricing — the whole point of the caching/model-tiering
 //! work is to make that number small, so it's surfaced every turn, not hidden.
 
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -30,6 +30,13 @@ pub struct TermUi {
     /// even if they never want the full raw chain-of-thought dumped to
     /// the terminal.
     thinking_shown: AtomicBool,
+    /// Tool names streamed so far this turn, rendered as one rewritable
+    /// preview line. Erased by whatever prints next -- it's a latency hint,
+    /// not transcript. Empty means no preview is on screen.
+    pending_calls: Mutex<Vec<String>>,
+    /// Cursor rewriting only works on a real terminal; piped output (tests,
+    /// `| tee`) gets the normal lines and no preview.
+    interactive: bool,
 }
 
 impl TermUi {
@@ -38,7 +45,21 @@ impl TermUi {
             show_reasoning,
             budget_usd: Mutex::new(budget_usd),
             thinking_shown: AtomicBool::new(false),
+            pending_calls: Mutex::new(Vec::new()),
+            interactive: io::stdout().is_terminal(),
         }
+    }
+
+    /// Wipe the preview line if one is showing, so the caller can print
+    /// normally. Idempotent.
+    fn clear_preview(&self) {
+        let mut pending = self.pending_calls.lock().expect("preview mutex poisoned");
+        if pending.is_empty() {
+            return;
+        }
+        pending.clear();
+        print!("\r\x1b[2K");
+        flush_stdout();
     }
 
     /// Keep the displayed budget in sync with `Agent::set_budget_usd` --
@@ -61,7 +82,18 @@ impl Ui for TermUi {
     }
 
     fn assistant_delta(&self, text: &str) {
+        self.clear_preview();
         print!("{text}");
+        flush_stdout();
+    }
+
+    fn tool_call_pending(&self, name: &str) {
+        if !self.interactive {
+            return;
+        }
+        let mut pending = self.pending_calls.lock().expect("preview mutex poisoned");
+        pending.push(name.to_string());
+        print!("\r\x1b[2K\x1b[36m⚙ {}\x1b[0m \x1b[90m…\x1b[0m", pending.join(", "));
         flush_stdout();
     }
 
@@ -75,16 +107,19 @@ impl Ui for TermUi {
             println!("\x1b[2;3m⟡ thinking...\x1b[0m");
         }
         if self.show_reasoning {
+            self.clear_preview();
             print!("\x1b[90m{text}\x1b[0m");
             flush_stdout();
         }
     }
 
     fn assistant_done(&self) {
+        self.clear_preview();
         println!();
     }
 
     fn tool_start(&self, name: &str, args: &str) {
+        self.clear_preview();
         println!("\x1b[36m⚙ {name}\x1b[0m {}", one_line(args, 140));
     }
 
@@ -111,6 +146,7 @@ impl Ui for TermUi {
         // Fires unconditionally, ahead of the early return below -- this is
         // the one guaranteed once-per-turn boundary, so it's the correct
         // place to re-arm the thinking indicator for the next turn.
+        self.clear_preview();
         self.thinking_shown.store(false, Ordering::Relaxed);
         if usage.total_tokens == 0 {
             return;

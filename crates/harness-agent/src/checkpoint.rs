@@ -6,8 +6,7 @@
 //! in-memory only (no disk persistence), no redo, and no coverage of
 //! `run_shell` — a shell command's effects are unbounded and can't be
 //! captured this way without a much heavier mechanism (e.g. a shadow git
-//! commit of the whole tree). See `plan.md` at the repo root for the full
-//! comparison this was scoped against.
+//! commit of the whole tree).
 
 use std::path::PathBuf;
 

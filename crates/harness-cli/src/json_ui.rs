@@ -211,6 +211,10 @@ impl Ui for JsonUi {
         self.emit(json!({"type": "assistant_done"}));
     }
 
+    fn tool_call_pending(&self, name: &str) {
+        self.emit(json!({"type": "tool_call_pending", "name": name}));
+    }
+
     fn tool_start(&self, name: &str, args: &str) {
         self.emit(json!({"type": "tool_start", "name": name, "args": args}));
     }

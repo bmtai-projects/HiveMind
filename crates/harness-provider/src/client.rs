@@ -38,6 +38,11 @@ impl DeepSeekClient {
     pub fn new(base_url: impl Into<String>, api_key: impl Into<String>) -> Self {
         let http = Client::builder()
             .timeout(Duration::from_secs(300))
+            // Default is 90s, which drops the pooled connection whenever a
+            // user pauses to think between turns and makes the next one pay
+            // a fresh TLS handshake (~150-360ms measured).
+            .pool_idle_timeout(Duration::from_secs(600))
+            .tcp_keepalive(Duration::from_secs(60))
             .build()
             .expect("reqwest client with default TLS backend should always build");
         Self {
@@ -57,6 +62,23 @@ impl DeepSeekClient {
     pub fn with_retry_hook(mut self, hook: RetryHook) -> Self {
         self.on_retry = Some(hook);
         self
+    }
+
+    /// Open the TLS connection now so the first real request doesn't pay for
+    /// it. Spawn this while the user is still typing; the response is
+    /// discarded and any failure is ignored (the real request will surface
+    /// it properly). Whatever this hits -- 404, 405 -- the pooled connection
+    /// is what we came for.
+    pub fn warm(&self) {
+        let http = self.http.clone();
+        let url = self.base_url.to_string();
+        tokio::spawn(async move {
+            let _ = tokio::time::timeout(
+                Duration::from_secs(10),
+                http.get(&url).header("Accept", "*/*").send(),
+            )
+            .await;
+        });
     }
 
     /// Start one streaming sampling request. Borrows `req` only long enough
@@ -240,6 +262,14 @@ impl DeepSeekClient {
                         }
                         if let Some(f) = tc.function {
                             if let Some(name) = f.name {
+                                // Only on the transition out of empty: the
+                                // dialect repeats `name` on later fragments
+                                // of the same call, and a host UI must not
+                                // announce one call several times.
+                                if entry.name.is_empty() && !name.is_empty() {
+                                    let _ =
+                                        tx.send(Ok(StreamEvent::ToolCallStarted(name.clone())));
+                                }
                                 entry.name = name;
                             }
                             if let Some(args) = f.arguments {
@@ -273,5 +303,146 @@ impl DeepSeekClient {
         };
         let _ = tx.send(Ok(StreamEvent::Done(Box::new(response))));
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use harness_types::{ChatRequest, Message};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Serves one canned SSE response over a real socket, so the test drives
+    /// the whole `stream()` -> `try_once` -> `decode_stream` path rather
+    /// than a hand-built `Response`.
+    async fn serve_once(frames: Vec<String>) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut scratch = [0u8; 4096];
+            let _ = sock.read(&mut scratch).await;
+            let mut out = String::from(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+            );
+            for f in frames {
+                out.push_str(&format!("data: {f}\n\n"));
+            }
+            out.push_str("data: [DONE]\n\n");
+            let _ = sock.write_all(out.as_bytes()).await;
+            let _ = sock.shutdown().await;
+        });
+        format!("http://{addr}")
+    }
+
+    fn req() -> ChatRequest {
+        ChatRequest {
+            model: "test".into(),
+            messages: vec![Message::user("go")],
+            tools: Vec::new(),
+            temperature: None,
+            max_tokens: None,
+            reasoning_effort: None,
+            cache_prompt_prefix: false,
+        }
+    }
+
+    async fn collect(url: String) -> Vec<StreamEvent> {
+        let client = DeepSeekClient::new(url, "k");
+        let mut rx = client.stream(&req());
+        let mut events = Vec::new();
+        while let Some(e) = rx.recv().await {
+            events.push(e.unwrap());
+        }
+        events
+    }
+
+    /// The name must reach the caller on the fragment that carries it, not
+    /// be held back until the arguments finish -- that gap is the dead air
+    /// this event exists to fill.
+    #[tokio::test]
+    async fn a_tool_call_announces_its_name_before_its_arguments_finish() {
+        let url = serve_once(vec![
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c0","function":{"name":"project_map","arguments":""}}]}}]}"#.into(),
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"pa"}}]}}]}"#.into(),
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"th\":\".\"}"}}]}}]}"#.into(),
+        ])
+        .await;
+
+        let events = collect(url).await;
+        let announced: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::ToolCallStarted(n) => Some(n.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(announced, ["project_map"], "exactly one announcement");
+
+        // It must land before the terminal event, or it bought nothing.
+        let announce_at = events
+            .iter()
+            .position(|e| matches!(e, StreamEvent::ToolCallStarted(_)))
+            .unwrap();
+        let done_at = events
+            .iter()
+            .position(|e| matches!(e, StreamEvent::Done(_)))
+            .unwrap();
+        assert!(announce_at < done_at);
+
+        // And the assembled call is still correct.
+        let StreamEvent::Done(resp) = &events[done_at] else {
+            unreachable!()
+        };
+        assert_eq!(resp.tool_calls.len(), 1);
+        assert_eq!(resp.tool_calls[0].name, "project_map");
+        assert_eq!(resp.tool_calls[0].args.get(), r#"{"path":"."}"#);
+    }
+
+    /// Parallel calls each announce once, in wire order -- a repeated `name`
+    /// on a later fragment of the same call must not re-announce it.
+    #[tokio::test]
+    async fn each_parallel_call_announces_exactly_once_in_order() {
+        let url = serve_once(vec![
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c0","function":{"name":"read_file","arguments":"{}"}}]}}]}"#.into(),
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"read_file","arguments":""}}]}}]}"#.into(),
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":1,"id":"c1","function":{"name":"search","arguments":"{}"}}]}}]}"#.into(),
+        ])
+        .await;
+
+        let announced: Vec<String> = collect(url)
+            .await
+            .into_iter()
+            .filter_map(|e| match e {
+                StreamEvent::ToolCallStarted(n) => Some(n),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(announced, ["read_file", "search"]);
+    }
+
+    /// A text-only turn is unchanged: no announcements, deltas still stream.
+    #[tokio::test]
+    async fn a_text_only_turn_announces_nothing() {
+        let url = serve_once(vec![
+            r#"{"choices":[{"delta":{"content":"hello"}}]}"#.into(),
+            r#"{"choices":[{"delta":{"content":" there"}}]}"#.into(),
+        ])
+        .await;
+
+        let events = collect(url).await;
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::ToolCallStarted(_)))
+        );
+        let text: String = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::TextDelta(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "hello there");
     }
 }

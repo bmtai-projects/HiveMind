@@ -39,10 +39,16 @@ fn boxed_blank() -> String {
     boxed("")
 }
 
-/// Async because the update check is a real (short-timeout) network call --
-/// called once from the REPL's async startup path, never from a sync
-/// context.
-pub async fn print() {
+/// Kick the update check off early, so its network round trip overlaps the
+/// rest of startup instead of being serialized in front of the prompt.
+/// Hand the result to [`print`].
+pub fn start_update_check() -> tokio::task::JoinHandle<Option<String>> {
+    tokio::spawn(update_check::newer_version_available())
+}
+
+/// `update` is the handle from [`start_update_check`]; by the time the box
+/// is drawn it has usually already resolved.
+pub async fn print(update: tokio::task::JoinHandle<Option<String>>) {
     let top = format!("{CYAN}╭{}╮{RESET}", "─".repeat(INNER_WIDTH + 2));
     let bottom = format!("{CYAN}╰{}╯{RESET}", "─".repeat(INNER_WIDTH + 2));
 
@@ -79,7 +85,7 @@ pub async fn print() {
     );
     println!("{bottom}");
 
-    if let Some(latest) = update_check::newer_version_available().await {
+    if let Ok(Some(latest)) = update.await {
         println!("{YELLOW}Update: v{latest} available -- run `hivemind update` to upgrade{RESET}");
     }
     println!();
