@@ -80,7 +80,7 @@ pub async fn print() {
     println!("{bottom}");
 
     if let Some(latest) = update_check::newer_version_available().await {
-        println!("{YELLOW}Update: v{latest} available -- re-run the installer to upgrade{RESET}");
+        println!("{YELLOW}Update: v{latest} available -- run `hivemind update` to upgrade{RESET}");
     }
     println!();
 }

@@ -476,6 +476,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "fastrand"
+version = "2.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
+
+[[package]]
 name = "fd-lock"
 version = "4.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -620,7 +626,7 @@ checksum = "c3531d702d6c1a3ba92a5fb55a404c7b8c476c8e7ca249951077afcbe4bc807f"
 
 [[package]]
 name = "harness-agent"
-version = "1.3.0"
+version = "1.4.0"
 dependencies = [
  "anyhow",
  "harness-config",
@@ -635,7 +641,7 @@ dependencies = [
 
 [[package]]
 name = "harness-cli"
-version = "1.3.0"
+version = "1.4.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -647,15 +653,17 @@ dependencies = [
  "open",
  "reedline",
  "reqwest",
+ "self-replace",
  "serde",
  "serde_json",
  "tokio",
  "walkdir",
+ "zip",
 ]
 
 [[package]]
 name = "harness-config"
-version = "1.3.0"
+version = "1.4.0"
 dependencies = [
  "serde",
  "thiserror 2.0.19",
@@ -664,7 +672,7 @@ dependencies = [
 
 [[package]]
 name = "harness-provider"
-version = "1.3.0"
+version = "1.4.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -680,7 +688,7 @@ dependencies = [
 
 [[package]]
 name = "harness-tools"
-version = "1.3.0"
+version = "1.4.0"
 dependencies = [
  "async-trait",
  "harness-types",
@@ -696,7 +704,7 @@ dependencies = [
 
 [[package]]
 name = "harness-types"
-version = "1.3.0"
+version = "1.4.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -1676,6 +1684,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
+name = "self-replace"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "03ec815b5eab420ab893f63393878d89c90fdd94c0bcc44c07abb8ad95552fb7"
+dependencies = [
+ "fastrand",
+ "tempfile",
+ "windows-sys 0.52.0",
+]
+
+[[package]]
 name = "semver"
 version = "1.0.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1927,6 +1946,19 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "tempfile"
+version = "3.27.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
+dependencies = [
+ "fastrand",
+ "getrandom 0.4.3",
+ "once_cell",
+ "rustix 1.1.4",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

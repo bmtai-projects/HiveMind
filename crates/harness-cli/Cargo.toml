@@ -24,3 +24,13 @@ reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 open = { workspace = true }
+# `hivemind update`: replaces the currently-running executable in place.
+# Hand-rolling this is a trap on Windows specifically -- it locks a running
+# .exe against in-place overwrite, and this crate already implements the
+# correct rename-then-place workaround rather than reinventing it.
+self-replace = "1"
+# Extracts the Windows release asset (.zip). Unix's .tar.gz is extracted by
+# shelling out to the system `tar`, which every target here ships with, so
+# this is Windows-only in practice but built for both to avoid a #[cfg] split
+# in the dependency graph itself.
+zip = { version = "7", default-features = false, features = ["deflate"] }
