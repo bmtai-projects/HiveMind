@@ -13,6 +13,7 @@ mod completion;
 mod input;
 mod json_ui;
 mod mentions;
+mod self_update;
 mod ui;
 mod update_check;
 
@@ -121,6 +122,11 @@ enum Command {
     Models,
     /// List saved sessions for a workspace, newest first, for `--resume`.
     Sessions(SessionsArgs),
+    /// Download the latest release for this platform and replace the
+    /// running binary with it. Never runs on its own -- see
+    /// `crate::self_update` for the full explanation of why this is
+    /// explicit-only, not automatic.
+    Update,
 }
 
 #[derive(Args)]
@@ -324,6 +330,7 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Command::Sessions(args) => list_sessions(args),
+        Command::Update => self_update::run().await,
     };
     if let Err(e) = result {
         eprintln!("\nerror: {e:#}");
