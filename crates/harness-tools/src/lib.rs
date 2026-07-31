@@ -3,6 +3,7 @@
 
 mod bash;
 mod edit;
+mod embed_cache;
 mod error;
 mod fs;
 mod pdf;
@@ -17,6 +18,7 @@ mod xlsx;
 
 pub use bash::{ApproveFn, Bash};
 pub use edit::EditFile;
+pub use embed_cache::EmbedCache;
 pub use error::ToolError;
 pub use fs::{ListDir, ReadFile, Workspace, WriteFile};
 pub use pdf::CreatePdf;

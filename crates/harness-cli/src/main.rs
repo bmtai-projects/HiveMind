@@ -398,9 +398,10 @@ async fn run(args: ActivateArgs) -> anyhow::Result<()> {
     };
     registry.register(Arc::new(
         match harness_tools::RemoteEmbedder::for_pro_mode(pro, hosted_token) {
-            Some(remote) => {
-                SemanticSearch::with_embedder(ws.clone(), Arc::new(remote)).with_progress(progress_ui)
-            }
+            Some(remote) => SemanticSearch::new(ws.clone())
+                .with_reranker(Arc::new(remote))
+                .with_cache_dir(harness_config::default_embeddings_cache_dir())
+                .with_progress(progress_ui),
             None => {
                 if pro {
                     eprintln!(

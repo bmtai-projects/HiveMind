@@ -34,6 +34,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::value::RawValue;
 
+use crate::embed_cache::EmbedCache;
 use crate::error::ToolError;
 use crate::fs::Workspace;
 use crate::tool::{Tool, obj_schema};
@@ -53,6 +54,11 @@ const MAX_TOP_K: usize = 25;
 /// Cosine floor below which a "match" is just hash noise / incidental overlap.
 const MIN_SCORE: f32 = 0.05;
 const PREVIEW_CHARS: usize = 120;
+/// How many lexically-shortlisted chunks the reranker embeds per query.
+/// This, not repo size, is what a Pro-mode search costs: ~100 chunks is a
+/// single batch regardless of whether the workspace holds 500 chunks or
+/// 500,000.
+const RERANK_CANDIDATES: usize = 100;
 
 /// Sink for progress reported during index building. A type alias mainly
 /// to keep call sites and struct fields readable -- `Arc<dyn Fn(&str) +
@@ -218,6 +224,10 @@ struct Chunk {
     start_line: usize,
     end_line: usize,
     preview: String,
+    /// Full chunk source, kept so a reranker can embed the shortlist
+    /// without re-reading (and possibly re-chunking) files that may have
+    /// changed since indexing. ~2 KB per chunk, bounded by `MAX_CHUNKS`.
+    text: String,
     vec: Vec<f32>,
 }
 
@@ -355,28 +365,16 @@ fn build_index(
         }
     }
 
-    // A remote embedder can take tens of seconds per batch (network + cold
-    // start), and this whole function runs before semantic_search returns
-    // anything -- with no signal at all, a slow-but-working index build is
-    // indistinguishable from a hung one.
-    let total_batches = pending.len().div_ceil(EMBED_BATCH).max(1);
+    // The index embedder is local and effectively instant, so this reports
+    // once rather than per batch: a per-batch counter here would imply
+    // network work that isn't happening, and drown out the rerank progress
+    // that actually takes time.
     if !pending.is_empty() {
-        report(&format!(
-            "indexing {} chunk(s){}",
-            pending.len(),
-            if total_batches > 1 {
-                format!(" in {total_batches} batches")
-            } else {
-                String::new()
-            }
-        ));
+        report(&format!("indexing {} chunk(s)", pending.len()));
     }
 
     let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(pending.len());
-    for (i, group) in pending.chunks(EMBED_BATCH).enumerate() {
-        if total_batches > 1 {
-            report(&format!("batch {}/{total_batches}...", i + 1));
-        }
+    for group in pending.chunks(EMBED_BATCH) {
         let texts: Vec<String> = group.iter().map(|p| p.text.clone()).collect();
         let got = embedder.embed_batch(&texts)?;
         // A short or over-long reply would silently misalign every vector
@@ -399,6 +397,7 @@ fn build_index(
             start_line: p.start_line,
             end_line: p.end_line,
             preview: p.preview,
+            text: p.text,
             vec,
         })
         .collect();
@@ -444,11 +443,17 @@ struct SemanticArgs {
 /// a session don't re-embed an unchanged repo.
 pub struct SemanticSearch {
     workspace: Workspace,
+    /// Builds the index. Always the local, infallible, free embedder --
+    /// nothing network-backed ever indexes the whole repo (see
+    /// [`SemanticSearch::with_reranker`]).
     embedder: Arc<dyn Embedder>,
-    /// Always local and always infallible. Used when `embedder` is a remote
-    /// one that fails, so a network problem degrades search quality instead
-    /// of failing the user's task outright.
-    fallback: Arc<dyn Embedder>,
+    /// Optional second stage. Only ever embeds a shortlist plus the query,
+    /// never the corpus, so its cost is bounded by `RERANK_CANDIDATES`
+    /// rather than by repo size.
+    reranker: Option<Arc<dyn Embedder>>,
+    /// Where the reranker's vectors are cached between runs. `None`
+    /// disables persistence (embeddings are then recomputed each session).
+    cache_dir: Option<std::path::PathBuf>,
     index: Arc<Mutex<Option<Index>>>,
     /// Optional sink for indexing progress -- wired to the host `Ui` (see
     /// `harness_agent::Ui::tool_progress`) so a slow, network-backed index
@@ -460,19 +465,33 @@ pub struct SemanticSearch {
 
 impl SemanticSearch {
     pub fn new(workspace: Workspace) -> Self {
-        Self::with_embedder(workspace, Arc::new(HashingEmbedder::new(EMBED_DIM)))
-    }
-
-    /// Build with a custom [`Embedder`] — the seam for dropping in a real
-    /// neural embedding model without touching the index or tool logic.
-    pub fn with_embedder(workspace: Workspace, embedder: Arc<dyn Embedder>) -> Self {
         Self {
             workspace,
-            embedder,
-            fallback: Arc::new(HashingEmbedder::new(EMBED_DIM)),
+            embedder: Arc::new(HashingEmbedder::new(EMBED_DIM)),
+            reranker: None,
+            cache_dir: None,
             index: Arc::new(Mutex::new(None)),
             progress: None,
         }
+    }
+
+    /// Add a second-stage reranker (a real neural embedder).
+    ///
+    /// Deliberately a *reranker* rather than the index embedder. Embedding
+    /// a whole repo through a network model costs minutes and re-runs on
+    /// every file change and every new session; embedding only the
+    /// shortlist the local index already produced costs one small batch and
+    /// is bounded no matter how large the repo is.
+    pub fn with_reranker(mut self, reranker: Arc<dyn Embedder>) -> Self {
+        self.reranker = Some(reranker);
+        self
+    }
+
+    /// Persist reranker vectors under `dir`, keyed by chunk content, so an
+    /// unchanged chunk is embedded once ever rather than once per session.
+    pub fn with_cache_dir(mut self, dir: std::path::PathBuf) -> Self {
+        self.cache_dir = Some(dir);
+        self
     }
 
     /// Report indexing progress through `cb` instead of stderr.
@@ -538,7 +557,8 @@ impl Tool for SemanticSearch {
         };
 
         let embedder = self.embedder.clone();
-        let fallback = self.fallback.clone();
+        let reranker = self.reranker.clone();
+        let cache_dir = self.cache_dir.clone();
         let cache = self.index.clone();
         let query = a.query.clone();
         let progress = self.progress.clone();
@@ -551,50 +571,22 @@ impl Tool for SemanticSearch {
             let fp = fingerprint(&stats);
 
             let mut guard = cache.lock().expect("semantic index mutex poisoned");
-            // Reuse the cached index only if BOTH the files and the vector
-            // space are unchanged. Ignoring the embedder id here would score
-            // a fresh query against vectors of a different width/meaning.
+            // The index is always built by the local embedder, so it is only
+            // ever invalidated by file changes. (`embedder_id` is still
+            // compared so a future non-hashing index embedder can't silently
+            // reuse vectors from a different space.)
             let stale = match guard.as_ref() {
                 Some(i) => i.fingerprint != fp || i.embedder_id != embedder.id(),
                 None => true,
             };
             if stale {
-                let built = match build_index(&stats, embedder.as_ref(), fp, progress.as_deref()) {
-                    Ok(idx) => idx,
-                    Err(e) => {
-                        // Rebuild wholesale with the local embedder rather
-                        // than salvaging a partial remote index -- half the
-                        // chunks in one vector space and half in another is
-                        // not a degraded index, it is a wrong one.
-                        report_progress(
-                            progress.as_deref(),
-                            &format!(
-                                "{} embedder unavailable ({e}); falling back to local index",
-                                embedder.id()
-                            ),
-                        );
-                        build_index(&stats, fallback.as_ref(), fp, progress.as_deref())
-                            .expect("local embedder is infallible")
-                    }
-                };
+                let built = build_index(&stats, embedder.as_ref(), fp, progress.as_deref())
+                    .expect("the index embedder is local and infallible");
                 *guard = Some(built);
             }
             let index = guard.as_ref().expect("index just populated");
 
-            // The query must be embedded by whichever embedder actually
-            // produced this index, not whichever one was requested.
-            let active: &dyn Embedder = if index.embedder_id == embedder.id() {
-                embedder.as_ref()
-            } else {
-                fallback.as_ref()
-            };
-            let qv = match active.embed_batch(std::slice::from_ref(&query)) {
-                Ok(mut v) if v.len() == 1 => v.remove(0),
-                // A query-time failure against an index that is already
-                // built is not worth discarding the index over; the local
-                // embedder cannot match those vectors, so report cleanly.
-                _ => return "semantic_search: embedding the query failed; try again".to_string(),
-            };
+            let qv = embedder.embed(&query);
             let mut scored: Vec<(f32, &Chunk)> = index
                 .chunks
                 .iter()
@@ -603,17 +595,142 @@ impl Tool for SemanticSearch {
                     None => true,
                 })
                 .map(|c| (dot(&qv, &c.vec), c))
-                .filter(|(s, _)| *s > MIN_SCORE)
                 .collect();
             scored.sort_by(|a, b| b.0.total_cmp(&a.0));
-            scored.truncate(top_k);
-            format_hits(&scored, index.truncated)
+
+            match &reranker {
+                Some(r) => {
+                    // Shortlist first, *without* applying MIN_SCORE: that
+                    // floor is calibrated for hash noise, and a chunk the
+                    // lexical stage scores at 0.04 is exactly the kind the
+                    // neural stage exists to rescue. The floor is applied
+                    // after reranking instead, against real scores.
+                    scored.truncate(RERANK_CANDIDATES);
+                    match rerank(
+                        &query,
+                        &scored,
+                        r.as_ref(),
+                        cache_dir.as_deref(),
+                        progress.as_deref(),
+                    ) {
+                        Some(mut reranked) => {
+                            reranked.retain(|(s, _)| *s > MIN_SCORE);
+                            reranked.truncate(top_k);
+                            format_hits(&reranked, index.truncated)
+                        }
+                        None => {
+                            // Reranking is an enhancement; if it is
+                            // unavailable the lexical ordering is still a
+                            // real answer, so degrade rather than fail.
+                            scored.retain(|(s, _)| *s > MIN_SCORE);
+                            scored.truncate(top_k);
+                            format_hits(&scored, index.truncated)
+                        }
+                    }
+                }
+                None => {
+                    scored.retain(|(s, _)| *s > MIN_SCORE);
+                    scored.truncate(top_k);
+                    format_hits(&scored, index.truncated)
+                }
+            }
         })
         .await
         .map_err(|e| ToolError::Message(format!("semantic search task failed: {e}")))?;
 
         Ok(output)
     }
+}
+
+/// Second-stage scoring: embed the query and the shortlisted chunks with a
+/// real model and re-order by true similarity.
+///
+/// Returns `None` when the reranker is unusable (network down, no balance,
+/// a malformed reply). That is deliberately not an error — the caller keeps
+/// the lexical ordering, which is what Standard mode ships anyway.
+fn rerank<'a>(
+    query: &str,
+    candidates: &[(f32, &'a Chunk)],
+    reranker: &dyn Embedder,
+    cache_dir: Option<&Path>,
+    progress: Option<&(dyn Fn(&str) + Send + Sync)>,
+) -> Option<Vec<(f32, &'a Chunk)>> {
+    if candidates.is_empty() {
+        return Some(Vec::new());
+    }
+
+    let dim = reranker.dim();
+    let mut cache = cache_dir.map(|d| EmbedCache::load(d, reranker.id(), dim));
+
+    // Only chunks with no cached vector reach the network. On a warm cache
+    // this list is empty and the whole rerank is local arithmetic.
+    let mut misses: Vec<String> = Vec::new();
+    let mut miss_positions: Vec<usize> = Vec::new();
+    let mut vectors: Vec<Option<Vec<f32>>> = Vec::with_capacity(candidates.len());
+    for (i, (_, c)) in candidates.iter().enumerate() {
+        let hit = cache.as_mut().and_then(|k| k.get(&c.text));
+        if hit.is_none() {
+            misses.push(c.text.clone());
+            miss_positions.push(i);
+        }
+        vectors.push(hit);
+    }
+
+    // The query itself is never cached: it is different nearly every time,
+    // and caching it would evict real chunk vectors for no benefit.
+    let mut to_embed = misses;
+    to_embed.push(query.to_string());
+
+    if to_embed.len() > 1 {
+        report_progress(
+            progress,
+            &format!(
+                "reranking {} candidate(s), {} new",
+                candidates.len(),
+                to_embed.len() - 1
+            ),
+        );
+    }
+
+    let mut fresh = match reranker.embed_batch(&to_embed) {
+        Ok(v) if v.len() == to_embed.len() => v,
+        Ok(_) => return None,
+        Err(e) => {
+            report_progress(
+                progress,
+                &format!("rerank unavailable ({e}); using local ranking"),
+            );
+            return None;
+        }
+    };
+
+    let qv = fresh.pop()?;
+    if qv.len() != dim {
+        return None;
+    }
+    for (slot, vec) in miss_positions.into_iter().zip(fresh) {
+        if vec.len() != dim {
+            return None;
+        }
+        if let Some(k) = cache.as_mut() {
+            k.insert(&candidates[slot].1.text, vec.clone());
+        }
+        vectors[slot] = Some(vec);
+    }
+
+    // Written back once per query rather than per insert, so a large batch
+    // of misses costs one file write.
+    if let Some(k) = cache.as_mut() {
+        k.save();
+    }
+
+    let mut out: Vec<(f32, &Chunk)> = candidates
+        .iter()
+        .zip(vectors)
+        .filter_map(|((_, c), v)| v.map(|v| (dot(&qv, &v), *c)))
+        .collect();
+    out.sort_by(|a, b| b.0.total_cmp(&a.0));
+    Some(out)
 }
 
 /// A chunk is in scope if its path equals the scope (a single file) or sits
@@ -863,5 +980,125 @@ mod embedder_switch_tests {
                 c.start_line
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod rerank_tests {
+    use super::*;
+
+    /// Scores by how many times a marker character appears, so a test can
+    /// dictate the "true" ordering independently of lexical similarity.
+    struct MarkerEmbedder {
+        fail: bool,
+        calls: std::sync::Mutex<usize>,
+    }
+    impl MarkerEmbedder {
+        fn new(fail: bool) -> Self {
+            Self {
+                fail,
+                calls: std::sync::Mutex::new(0),
+            }
+        }
+        fn embedded(&self) -> usize {
+            *self.calls.lock().unwrap()
+        }
+    }
+    impl Embedder for MarkerEmbedder {
+        fn dim(&self) -> usize {
+            2
+        }
+        fn id(&self) -> &str {
+            "marker-test"
+        }
+        fn embed(&self, text: &str) -> Vec<f32> {
+            // Unit vector rotated by marker density: texts with the marker
+            // point one way, texts without it the other.
+            let has = text.contains('@');
+            if has { vec![1.0, 0.0] } else { vec![0.0, 1.0] }
+        }
+        fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
+            if self.fail {
+                return Err("simulated outage".to_string());
+            }
+            *self.calls.lock().unwrap() += texts.len();
+            Ok(texts.iter().map(|t| self.embed(t)).collect())
+        }
+    }
+
+    fn chunk(path: &str, text: &str) -> Chunk {
+        Chunk {
+            path: path.to_string(),
+            start_line: 1,
+            end_line: 2,
+            preview: text.chars().take(20).collect(),
+            text: text.to_string(),
+            vec: vec![0.0; EMBED_DIM],
+        }
+    }
+
+    #[test]
+    fn rerank_reorders_by_the_second_stage_not_the_first() {
+        let a = chunk("a.rs", "no marker here");
+        let b = chunk("b.rs", "has the @ marker");
+        // Lexical stage ranks `a` first; the reranker must flip it.
+        let candidates = vec![(0.9f32, &a), (0.1f32, &b)];
+        let e = MarkerEmbedder::new(false);
+
+        let out = rerank("@ query", &candidates, &e, None, None).expect("rerank should succeed");
+        assert_eq!(
+            out[0].1.path, "b.rs",
+            "reranked order must win over lexical order"
+        );
+        // 2 chunks + 1 query.
+        assert_eq!(e.embedded(), 3);
+    }
+
+    #[test]
+    fn a_failing_reranker_falls_back_rather_than_erroring() {
+        let a = chunk("a.rs", "x");
+        let candidates = vec![(0.5f32, &a)];
+        let e = MarkerEmbedder::new(true);
+        assert!(rerank("q", &candidates, &e, None, None).is_none());
+    }
+
+    #[test]
+    fn an_empty_shortlist_is_not_a_network_call() {
+        let e = MarkerEmbedder::new(false);
+        let out = rerank("q", &[], &e, None, None).expect("empty is fine");
+        assert!(out.is_empty());
+        assert_eq!(
+            e.embedded(),
+            0,
+            "nothing to rerank must not hit the network"
+        );
+    }
+
+    #[test]
+    fn a_warm_cache_only_embeds_the_query() {
+        let dir = std::env::temp_dir().join("hivemind_rerank_cache_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let a = chunk("a.rs", "no marker here");
+        let b = chunk("b.rs", "has the @ marker");
+        let candidates = vec![(0.9f32, &a), (0.1f32, &b)];
+
+        let cold = MarkerEmbedder::new(false);
+        let first = rerank("@ q", &candidates, &cold, Some(&dir), None).unwrap();
+        assert_eq!(cold.embedded(), 3, "cold: 2 chunks + query");
+
+        let warm = MarkerEmbedder::new(false);
+        let second = rerank("@ q", &candidates, &warm, Some(&dir), None).unwrap();
+        assert_eq!(
+            warm.embedded(),
+            1,
+            "warm: query only -- chunks came from disk"
+        );
+        assert_eq!(
+            first.iter().map(|(_, c)| &c.path).collect::<Vec<_>>(),
+            second.iter().map(|(_, c)| &c.path).collect::<Vec<_>>(),
+            "cached results must rank identically to freshly embedded ones"
+        );
     }
 }
