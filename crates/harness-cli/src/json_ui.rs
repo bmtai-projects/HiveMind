@@ -269,6 +269,14 @@ impl Ui for JsonUi {
         self.emit(json!({"type": "interjected", "count": count}));
     }
 
+    fn context_trimmed(&self, results_elided: usize, tokens_saved: u64) {
+        self.emit(json!({
+            "type": "context_trimmed",
+            "results_elided": results_elided,
+            "tokens_saved": tokens_saved,
+        }));
+    }
+
     fn compacted(
         &self,
         messages_before: usize,

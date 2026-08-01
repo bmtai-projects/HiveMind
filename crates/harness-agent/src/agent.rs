@@ -300,6 +300,11 @@ impl Agent {
                 self.ui.interjected(pending);
             }
 
+            // Free, so it runs before compaction rather than after it:
+            // eliding a superseded 18k-token project_map costs nothing,
+            // while compaction is a real billed model call that also folds
+            // away the conversation. Only what this can't fix reaches it.
+            self.trim_if_needed();
             self.compact_if_needed().await;
             let estimated_tokens = crate::tokens::estimate_tokens(&self.messages);
             if self.context_window > 0
@@ -531,6 +536,25 @@ impl Agent {
             );
             self.current_model = self.policy.escalate_to_model.clone();
             self.repeat_count = 0;
+        }
+    }
+
+    /// Elide large, superseded tool results. Cheap and deterministic, so it
+    /// is the first line of defence against context growth -- see
+    /// `crate::trim`.
+    fn trim_if_needed(&mut self) {
+        let estimated = self
+            .last_total_tokens
+            .max(crate::tokens::estimate_tokens(&self.messages));
+        if let Some(report) =
+            crate::trim::trim_old_tool_results(&mut self.messages, estimated, self.context_window)
+        {
+            self.ui
+                .context_trimmed(report.results_elided, report.tokens_saved);
+            // The next request is genuinely smaller than the last response's
+            // usage implies; leaving the old figure would make compaction
+            // fire on a transcript that no longer exists.
+            self.last_total_tokens = 0;
         }
     }
 

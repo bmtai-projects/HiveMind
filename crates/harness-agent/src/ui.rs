@@ -55,6 +55,13 @@ pub trait Ui: Send + Sync {
     /// landed, and when.
     fn interjected(&self, count: usize);
 
+    /// Fired when large, superseded tool results were dropped from history
+    /// to free context (see `crate::trim`). Distinct from `compacted`:
+    /// nothing was summarized and no model call was made, so this is free
+    /// and the conversation itself is untouched. Defaulted to a no-op --
+    /// a host that ignores it is still correct, just quieter.
+    fn context_trimmed(&self, _results_elided: usize, _tokens_saved: u64) {}
+
     /// Fired after a compaction pass folds older turns into a summary.
     /// `summary_cost_usd` is the cost of the summarization call itself (the
     /// compactor samples a real model to write the summary) -- `None` when

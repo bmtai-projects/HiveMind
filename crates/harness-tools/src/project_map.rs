@@ -52,8 +52,31 @@ const MAX_SYMBOLS_PER_FILE: usize = 40;
 /// Signatures are truncated to this; enough for a name plus argument shape.
 const MAX_SIGNATURE_CHARS: usize = 110;
 /// Hard ceiling on the whole result. This tool exists to *save* context, so
-/// it must never be the thing that floods it. Matches `read_file`'s cap.
-const MAX_OUTPUT_CHARS: usize = 60_000;
+/// it must never be the thing that floods it.
+///
+/// Was 60_000 (~18k tokens). Measured across real sessions, a map that size
+/// was 42-92% of the entire transcript and got re-sent on every later model
+/// call -- one cost ~91k tokens over a single session. A map is an index to
+/// read *from*, not the codebase itself, so it is now budgeted like one and
+/// `SYMBOL_CAP_LADDER` keeps the whole tree visible within it.
+///
+/// 30_000 (~9k tokens), not lower, because the bare tree has a floor: a
+/// file line costs ~85 chars, so ~350 files fit with no symbols at all.
+/// Below this, big repos would start losing *files* rather than detail,
+/// which is the failure this whole change exists to remove.
+const MAX_OUTPUT_CHARS: usize = 30_000;
+
+/// Per-file symbol caps tried in order, largest first; rendering uses the
+/// first one whose output fits [`MAX_OUTPUT_CHARS`].
+///
+/// The point is *which* detail gets dropped under pressure. Rendering at
+/// full density until the budget runs out and then stopping (the previous
+/// behaviour) silently truncated whole directories -- on a big repo you got
+/// every symbol of `app/` and no indication `src/` existed at all, which is
+/// worse than useless in the one tool whose job is telling you what is
+/// where. Thinning symbols uniformly keeps every file visible and degrades
+/// detail instead of coverage.
+const SYMBOL_CAP_LADDER: [usize; 7] = [MAX_SYMBOLS_PER_FILE, 20, 12, 6, 3, 1, 0];
 /// Source indentation is echoed (so methods visibly nest under their type)
 /// but clamped — deeply nested code shouldn't push signatures off the right.
 const MAX_INDENT: usize = 6;
@@ -452,6 +475,43 @@ fn render(files: &[FileOutline], hit_file_cap: bool) -> String {
         return "(no files found — check the path, or the directory may contain only ignored/build output)".to_string();
     }
 
+    // Try progressively thinner symbol density until the whole tree fits.
+    // The last rung is 0 symbols (tree only), which always fits for any
+    // plausible file count, so the fallback below is a formality rather
+    // than a real branch.
+    for (i, cap) in SYMBOL_CAP_LADDER.iter().enumerate() {
+        let thinned = i > 0;
+        let out = render_at_density(files, hit_file_cap, *cap, thinned);
+        if out.len() <= MAX_OUTPUT_CHARS {
+            return out;
+        }
+    }
+
+    // Past the last rung there are no symbols left to drop and the file
+    // list alone is still over budget (roughly 350+ files). Cut it on a
+    // line boundary and say so plainly -- an abridged map the model knows
+    // is abridged is recoverable via `path`; one that silently ends is not.
+    let full = render_at_density(files, hit_file_cap, 0, true);
+    let cut = full[..MAX_OUTPUT_CHARS.min(full.len())]
+        .rfind('\n')
+        .unwrap_or(0);
+    format!(
+        "{}\n[too many files to list in one map — this is a partial tree. \
+         Re-run with `path` scoped to a subdirectory for the rest]\n",
+        &full[..cut]
+    )
+}
+
+/// One rendering pass at a fixed per-file symbol cap. `thinned` says the
+/// caller had to reduce density to fit, which the map states outright --
+/// the model needs to know it is seeing an abridged index so it reads the
+/// files rather than trusting the outline to be complete.
+fn render_at_density(
+    files: &[FileOutline],
+    hit_file_cap: bool,
+    symbol_cap: usize,
+    thinned: bool,
+) -> String {
     let mut by_dir: BTreeMap<&str, Vec<&FileOutline>> = BTreeMap::new();
     for f in files {
         let dir = match f.rel.rfind('/') {
@@ -464,36 +524,35 @@ fn render(files: &[FileOutline], hit_file_cap: bool) -> String {
     let total_symbols: usize = files.iter().map(|f| f.symbols.len()).sum();
     let mut out = format!("{} files, {} definitions\n", files.len(), total_symbols);
 
-    let mut truncated_output = false;
-    'dirs: for (dir, group) in &by_dir {
+    for (dir, group) in &by_dir {
         out.push_str(&format!("\n{dir}/\n"));
         for f in group {
             let name = f.rel.rsplit('/').next().unwrap_or(&f.rel);
             out.push_str(&format!("  {name}  ({} lines)\n", f.lines));
-            for (line_no, indent, sig) in &f.symbols {
+            for (line_no, indent, sig) in f.symbols.iter().take(symbol_cap) {
                 out.push_str(&format!(
                     "    {line_no:>5}  {:indent$}{sig}\n",
                     "",
                     indent = indent
                 ));
             }
-            if f.truncated {
+            let hidden = f.symbols.len().saturating_sub(symbol_cap);
+            if hidden > 0 || f.truncated {
                 out.push_str(&format!(
-                    "           … more than {MAX_SYMBOLS_PER_FILE} definitions; read the file for the rest\n"
+                    "           … {hidden}+ more definitions; read the file for the rest\n"
                 ));
-            }
-            if out.len() >= MAX_OUTPUT_CHARS {
-                truncated_output = true;
-                break 'dirs;
             }
         }
     }
 
-    if truncated_output {
+    if thinned {
         out.push_str(
-            "\n[map truncated to stay within context — pass `path` to map one subdirectory at a time]\n",
+            "\n[large repo: showing fewer definitions per file so the whole tree fits. \
+             Every file is listed; read a file, or re-run with `path` scoped to one \
+             subdirectory, for its full outline]\n",
         );
-    } else if hit_file_cap {
+    }
+    if hit_file_cap {
         out.push_str(&format!(
             "\n[stopped after {MAX_FILES} files — pass `path` to map a subdirectory]\n"
         ));
@@ -721,7 +780,7 @@ mod tests {
             .await
             .unwrap();
         assert!(out.contains("many.rs"));
-        assert!(out.contains("more than"), "expected a cap notice:\n{out}");
+        assert!(out.contains("more definitions"), "expected a cap notice:\n{out}");
         assert!(!out.contains("f60"), "cap was not enforced:\n{out}");
     }
 
@@ -744,7 +803,68 @@ mod tests {
             "output was {} chars",
             out.len()
         );
-        assert!(out.contains("truncated"), "should say it was cut:\n{out}");
+        assert!(out.contains("large repo"), "should say density was reduced:\n{out}");
+    }
+
+    /// The point of the density ladder: staying within budget by thinning
+    /// symbols, NOT by silently dropping directories. Rendering at full
+    /// density until the budget ran out (the previous behaviour) left later
+    /// files completely absent, so the map claimed a file did not exist.
+    #[tokio::test]
+    async fn a_repo_too_big_to_map_fully_still_lists_every_file() {
+        let w = ws("every_file_listed");
+        std::fs::create_dir_all(w.root.join("zzz_last")).unwrap();
+        for i in 0..300 {
+            let body: String = (0..30)
+                .map(|j| format!("pub fn f{i}_{j}() {{}}\n"))
+                .collect();
+            std::fs::write(w.root.join(format!("aaa_{i:03}.rs")), body).unwrap();
+        }
+        // Sorts last, so the old "stop once full" path never reached it.
+        std::fs::write(w.root.join("zzz_last/needle.rs"), "pub fn findme() {}\n").unwrap();
+
+        let out = ProjectMap(w.clone())
+            .execute(&args(serde_json::json!({})))
+            .await
+            .unwrap();
+
+        assert!(out.len() <= MAX_OUTPUT_CHARS + 500, "{} chars", out.len());
+        assert!(
+            out.contains("needle.rs"),
+            "the last-sorting file must still be listed:\n{}",
+            &out[out.len().saturating_sub(600)..]
+        );
+        assert!(out.contains("aaa_000.rs"), "first file should be listed too");
+        assert!(
+            out.contains("aaa_299.rs"),
+            "a middle-to-late file must not vanish either"
+        );
+    }
+
+    /// Past ~350 files even the bare tree exceeds the budget, so something
+    /// has to give. It must give *visibly*: a map that just stops looks
+    /// identical to a repo that ends there.
+    #[tokio::test]
+    async fn a_repo_past_the_tree_floor_says_the_map_is_partial() {
+        let w = ws("tree_floor");
+        for i in 0..MAX_FILES {
+            std::fs::write(
+                w.root.join(format!("file_{i:04}.rs")),
+                "pub fn a() {}\npub fn b() {}\n",
+            )
+            .unwrap();
+        }
+        let out = ProjectMap(w.clone())
+            .execute(&args(serde_json::json!({})))
+            .await
+            .unwrap();
+
+        assert!(out.len() <= MAX_OUTPUT_CHARS + 500, "{} chars", out.len());
+        assert!(
+            out.contains("partial tree") || out.contains("stopped after"),
+            "must admit it is incomplete:\n{}",
+            &out[out.len().saturating_sub(400)..]
+        );
     }
 
     #[tokio::test]

@@ -32,16 +32,20 @@ const PER_MESSAGE_OVERHEAD_TOKENS: u64 = 4;
 /// turn's real `Usage` alone would, and as a last-resort pre-send guard;
 /// never a substitute for a real provider-reported `Usage`.
 pub fn estimate_tokens(messages: &[Message]) -> u64 {
-    messages
-        .iter()
-        .map(|m| {
-            let mut chars = m.content.chars().count();
-            for tc in &m.tool_calls {
-                chars += tc.name.chars().count() + tc.args.get().chars().count();
-            }
-            (chars as f64 / CHARS_PER_TOKEN).ceil() as u64 + PER_MESSAGE_OVERHEAD_TOKENS
-        })
-        .sum()
+    messages.iter().map(estimate_message_tokens).sum()
+}
+
+/// One message's share of the estimate above. Split out so `crate::trim` can
+/// price an individual result before and after eliding it using the exact
+/// same arithmetic the trigger thresholds are measured in -- two separate
+/// formulas would let the saving it reports drift from the total it is
+/// trying to bring down.
+pub fn estimate_message_tokens(m: &Message) -> u64 {
+    let mut chars = m.content.chars().count();
+    for tc in &m.tool_calls {
+        chars += tc.name.chars().count() + tc.args.get().chars().count();
+    }
+    (chars as f64 / CHARS_PER_TOKEN).ceil() as u64 + PER_MESSAGE_OVERHEAD_TOKENS
 }
 
 #[cfg(test)]

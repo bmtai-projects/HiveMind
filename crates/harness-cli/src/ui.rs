@@ -202,6 +202,14 @@ impl Ui for TermUi {
         eprintln!("\x1b[90m  {tool}: {message}\x1b[0m");
     }
 
+    fn context_trimmed(&self, results_elided: usize, tokens_saved: u64) {
+        self.clear_preview();
+        let noun = if results_elided == 1 { "result" } else { "results" };
+        println!(
+            "\x1b[90m  ⤵ freed ~{tokens_saved} tokens ({results_elided} old tool {noun} dropped)\x1b[0m"
+        );
+    }
+
     fn compacted(
         &self,
         messages_before: usize,
