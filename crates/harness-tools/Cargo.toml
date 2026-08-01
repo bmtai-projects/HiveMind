@@ -23,3 +23,9 @@ rust_xlsxwriter = "0.96.0"
 # fonts (no embedding, no HTML), which needs none of that -- keeps the
 # release binary lean across all 5 cross-compiled targets.
 printpdf = { version = "0.12.4", default-features = false }
+
+# Only for `kill(-pgid)` in run_shell's process-group reaping (see bash.rs).
+# Windows has no process groups and uses `taskkill /T` instead, so this is
+# deliberately unix-only rather than a workspace-wide dependency.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
