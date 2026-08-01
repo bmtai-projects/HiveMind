@@ -256,6 +256,10 @@ impl Ui for JsonUi {
         }));
     }
 
+    fn stalled(&self, after_turns: u32) {
+        self.emit(json!({"type": "stalled", "after_turns": after_turns}));
+    }
+
     fn model_escalated(&self, from: &str, to: &str, reason: &str) {
         self.emit(json!({
             "type": "model_escalated",

@@ -27,5 +27,5 @@ pub use remote_embed::RemoteEmbedder;
 pub use search::Search;
 pub use semantic::{Embedder, HashingEmbedder, ProgressSink, SemanticSearch};
 pub use todo::TodoWrite;
-pub use tool::{Registry, Tool, obj_schema};
+pub use tool::{Registry, Tool, looks_like_failure, obj_schema};
 pub use xlsx::CreateSpreadsheet;

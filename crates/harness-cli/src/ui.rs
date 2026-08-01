@@ -189,6 +189,13 @@ impl Ui for TermUi {
         );
     }
 
+    fn stalled(&self, after_turns: u32) {
+        self.clear_preview();
+        println!(
+            "\x1b[33m  ↯ no progress in {after_turns} turns — asked the model to reconsider\x1b[0m"
+        );
+    }
+
     fn model_escalated(&self, from: &str, to: &str, reason: &str) {
         println!("\x1b[35m  ⤴ escalating {from} → {to}: {reason}\x1b[0m");
     }
