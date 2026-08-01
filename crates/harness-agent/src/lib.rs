@@ -11,6 +11,7 @@ mod hooks;
 mod interjection;
 mod session;
 mod tokens;
+mod trim;
 mod ui;
 
 pub use agent::Agent;
