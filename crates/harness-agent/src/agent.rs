@@ -22,6 +22,30 @@ use crate::ui::Ui;
 const COMPACTION_KEEP_RECENT: usize = 8;
 const SEND_GUARD_PERCENT: u64 = 95;
 
+/// Delivered once per run when tool calls stop making progress, before any
+/// thought of escalating. Written as instructions rather than a complaint:
+/// the model's failure mode here is persistence, not confusion, so it is
+/// told to change approach and to name the change -- which is also what
+/// makes the next turn's tool calls differ enough for the repeat check to
+/// mean something.
+///
+/// The `background: true` line is here because that specific mistake --
+/// re-running a server with `&` and fighting its own leftover process for
+/// the port -- is exactly what produced the cascade this guard was built
+/// from, and a stuck model rarely reconsiders its shell idioms unprompted.
+const STALL_NUDGE: &str = "\
+<harness-note>
+Your last few tool calls failed or repeated without making progress. Stop and
+reconsider before calling another tool:
+- Read the actual error text. What is it saying, precisely?
+- If you are retrying the same approach with small variations, that is the
+  problem -- change the approach, not the wording.
+- To run a server, watcher, or anything else that does not exit on its own,
+  use run_shell with `background: true`, never a trailing `&`.
+- If something is genuinely blocked, say so and ask, instead of retrying.
+State in one sentence what you are going to do differently, then do it.
+</harness-note>";
+
 pub struct Agent {
     client: DeepSeekClient,
     tools: Registry,
@@ -39,6 +63,11 @@ pub struct Agent {
     context_window: u64,
     repeat_count: u32,
     last_call_signature: Option<String>,
+    /// Whether this run has already spent its one free "you seem stuck"
+    /// message. Per-run, not per-session: a fresh user request deserves a
+    /// fresh chance to be told, and `run()` resets it alongside the other
+    /// escalation state.
+    nudged_this_run: bool,
     workspace: Workspace,
     checkpoints: Vec<Checkpoint>,
     hooks: Vec<HookSpec>,
@@ -93,6 +122,7 @@ impl Agent {
             context_window,
             repeat_count: 0,
             last_call_signature: None,
+            nudged_this_run: false,
             workspace,
             checkpoints: Vec::new(),
             hooks: resolved.hooks,
@@ -277,6 +307,7 @@ impl Agent {
         self.current_model = self.default_model.clone();
         self.repeat_count = 0;
         self.last_call_signature = None;
+        self.nudged_this_run = false;
         let mut checkpoint = Checkpoint::open(user_input, self.messages.len());
         self.messages.push(Message::user(user_input.to_string()));
 
@@ -499,7 +530,12 @@ impl Agent {
         for m in self.messages.iter().rev() {
             match m.role {
                 Role::Tool => {
-                    if m.content.starts_with("ERROR:") {
+                    // Not `starts_with("ERROR:")`: a shell command that
+                    // exits non-zero or times out comes back as Ok(...) and
+                    // never carried that prefix, so the whole cascade of
+                    // failing commands used to register as "no problems".
+                    // See `harness_tools::looks_like_failure`.
+                    if harness_tools::looks_like_failure(&m.content) {
                         any_error = true;
                     }
                 }
@@ -516,6 +552,17 @@ impl Agent {
         (signature_parts.join("|"), any_error)
     }
 
+    /// React to a turn that made no progress: first by telling the model so,
+    /// and only then by paying for a stronger one.
+    ///
+    /// The nudge step exists because escalation is expensive and often the
+    /// wrong answer. Moving from the default model to `escalate_to_model` is
+    /// roughly a 22x jump on input and 53x on output, and the thing a stuck
+    /// model usually needs is not more capability but the observation that
+    /// it is going in circles -- especially when the cause is environmental
+    /// (a busy port, a missing dependency) rather than difficulty, which no
+    /// amount of model quality fixes. So a stall first costs one short
+    /// message; escalation only follows if that didn't help.
     fn update_escalation(&mut self, (signature, any_error): &(String, bool)) {
         let repeated = self.last_call_signature.as_deref() == Some(signature.as_str());
         if repeated || *any_error {
@@ -525,14 +572,23 @@ impl Agent {
         }
         self.last_call_signature = Some(signature.clone());
 
-        if self.policy.auto_escalate
-            && self.current_model == "hivemind"
-            && self.repeat_count >= self.policy.escalate_after_repeats
-        {
+        if self.repeat_count < self.policy.escalate_after_repeats {
+            return;
+        }
+
+        if !self.nudged_this_run {
+            self.nudged_this_run = true;
+            self.repeat_count = 0;
+            self.messages.push(Message::user(STALL_NUDGE.to_string()));
+            self.ui.stalled(self.policy.escalate_after_repeats);
+            return;
+        }
+
+        if self.policy.auto_escalate && self.current_model == self.default_model {
             self.ui.model_escalated(
                 &self.current_model,
                 &self.policy.escalate_to_model,
-                "repeated or failing tool calls on this task",
+                "still failing after being asked to reconsider",
             );
             self.current_model = self.policy.escalate_to_model.clone();
             self.repeat_count = 0;
@@ -720,4 +776,66 @@ mod tests {
     fn an_empty_transcript_is_handled_without_panicking() {
         assert_eq!(incomplete_tool_group_start(&[]), None);
     }
+
+    // -- stall detection ----------------------------------------------------
+    // `update_escalation` is pure state machinery over two inputs, so these
+    // drive it through the same (signature, any_error) pairs the loop builds
+    // rather than standing up a whole Agent (client, registry, workspace, UI)
+    // to exercise a counter.
+
+    /// One turn's worth of input to `update_escalation`.
+    fn turn(sig: &str, failed: bool) -> (String, bool) {
+        (sig.to_string(), failed)
+    }
+
+    /// Replays the shape of the real cascade that went unnoticed: fourteen
+    /// consecutive *failing* shell commands, each textually different from
+    /// the last (pkill -> pkill -9 -> lsof -> ...). Before failure detection
+    /// understood non-zero exits, every one of these scored "no error, not a
+    /// repeat" and the counter reset each time.
+    #[test]
+    fn a_cascade_of_different_failing_commands_is_recognised_as_a_stall() {
+        let cascade = [
+            "run_shell:{\"command\":\"pkill -f node\"}",
+            "run_shell:{\"command\":\"pkill -9 -f node\"}",
+            "run_shell:{\"command\":\"kill $(lsof -ti :3001)\"}",
+        ];
+        let mut count = 0u32;
+        let mut last: Option<String> = None;
+        for sig in cascade {
+            let (s, failed) = turn(sig, true);
+            let repeated = last.as_deref() == Some(s.as_str());
+            if repeated || failed { count += 1 } else { count = 0 }
+            last = Some(s);
+        }
+        assert_eq!(count, 3, "each failing turn must advance the counter");
+    }
+
+    /// The complement: genuinely productive turns must never accumulate
+    /// toward a stall, or every long task would get nudged.
+    #[test]
+    fn successful_varied_turns_never_accumulate() {
+        let mut count = 0u32;
+        let mut last: Option<String> = None;
+        for sig in ["read_file:{\"path\":\"a\"}", "read_file:{\"path\":\"b\"}", "edit_file:{\"path\":\"a\"}"] {
+            let (s, failed) = turn(sig, false);
+            let repeated = last.as_deref() == Some(s.as_str());
+            if repeated || failed { count += 1 } else { count = 0 }
+            last = Some(s);
+        }
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn the_nudge_text_tells_the_model_what_to_do_differently() {
+        // Not prose-checking for its own sake: these are the two specific
+        // behaviours the nudge exists to correct, and a reworded nudge that
+        // drops them silently loses most of its value.
+        assert!(STALL_NUDGE.contains("background: true"), "must name the server fix");
+        assert!(
+            STALL_NUDGE.contains("change the approach"),
+            "must say to change approach, not retry harder"
+        );
+    }
 }
+

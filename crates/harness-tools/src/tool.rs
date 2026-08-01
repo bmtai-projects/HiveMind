@@ -184,6 +184,31 @@ fn tracing_stub(msg: &str) {
     eprintln!("[harness-tools] {msg}");
 }
 
+/// Did this tool result represent a failure the model should notice?
+///
+/// `"ERROR:"` alone is not enough, and assuming it was is what left the
+/// agent's stall detection blind to the most common kind of trouble. A
+/// shell command that exits non-zero, or times out, is reported through
+/// `Ok(...)` -- deliberately, because its output is still worth reading --
+/// so it never started with `"ERROR:"` and never counted as anything going
+/// wrong. A real session ran fourteen consecutive failing commands
+/// (`pkill`, `lsof`, retry, repeat) without a single one registering.
+///
+/// Lives here, next to the tools whose output conventions it recognizes,
+/// rather than in the agent: the agent should not have to know how
+/// `run_shell` formats an exit status.
+pub fn looks_like_failure(result: &str) -> bool {
+    if result.starts_with("ERROR:") {
+        return true;
+    }
+    // Markers are emitted at the start of their own line (see
+    // `bash::format_output`), so anchor there -- a file whose *contents*
+    // mention "[exit:" is not a failure.
+    result
+        .lines()
+        .any(|l| l.starts_with("[exit:") || l.starts_with("[timed out after"))
+}
+
 /// Small JSON-Schema object builder so tool definitions stay readable.
 pub fn obj_schema(props: &[(&str, serde_json::Value)], required: &[&str]) -> serde_json::Value {
     let properties: serde_json::Map<String, serde_json::Value> = props
@@ -513,5 +538,49 @@ mod dispatch_tests {
 
         assert_eq!(out[0].0.id, "a");
         assert_eq!(out[1].0.id, "b");
+    }
+}
+
+#[cfg(test)]
+mod failure_detection_tests {
+    use super::looks_like_failure;
+
+    #[test]
+    fn a_tool_level_error_is_a_failure() {
+        assert!(looks_like_failure("ERROR: no such file"));
+    }
+
+    /// The case the agent's stall detection used to miss entirely: a shell
+    /// command that ran fine as a *tool call* but failed as a command.
+    #[test]
+    fn a_non_zero_shell_exit_is_a_failure() {
+        assert!(looks_like_failure(
+            "bind EADDRINUSE 0.0.0.0:3001\n[exit: exit status: 1]"
+        ));
+        assert!(looks_like_failure("[exit: exit status: 7]"));
+    }
+
+    #[test]
+    fn a_timed_out_command_is_a_failure() {
+        assert!(looks_like_failure(
+            "[timed out after 120s; the command and anything it started were killed.]"
+        ));
+    }
+
+    #[test]
+    fn ordinary_successful_output_is_not_a_failure() {
+        assert!(!looks_like_failure("hello\n"));
+        assert!(!looks_like_failure("(no output; exit 0)"));
+        assert!(!looks_like_failure("{\"ok\":true}"));
+    }
+
+    /// The markers are line-anchored, so a file that merely talks about
+    /// them isn't misread as a failed command.
+    #[test]
+    fn output_that_merely_mentions_a_marker_is_not_a_failure() {
+        assert!(!looks_like_failure(
+            "the docs say results end with [exit: status] on failure"
+        ));
+        assert!(!looks_like_failure("grep found: // [timed out after N]"));
     }
 }

@@ -44,6 +44,15 @@ pub trait Ui: Send + Sync {
     /// Fired before each retry sleep (429/5xx/network hiccup).
     fn retrying(&self, attempt: u32, max: u32, delay: Duration, err: &str);
 
+    /// Fired when consecutive tool calls stopped making progress and the
+    /// agent told the model so, in place of silently retrying (or of
+    /// immediately paying for a stronger model -- escalation only follows
+    /// if this doesn't help). Worth surfacing because it explains an
+    /// otherwise-invisible extra message in the transcript, and because a
+    /// stall is usually the first sign of something the user may want to
+    /// step in on. Defaulted: a host that ignores it is still correct.
+    fn stalled(&self, _after_turns: u32) {}
+
     /// Fired when the agent bumps away from the cheap "hivemind" default
     /// after repeated/failing tool calls on the current task.
     fn model_escalated(&self, from: &str, to: &str, reason: &str);
