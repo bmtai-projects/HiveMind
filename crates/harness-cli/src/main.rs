@@ -91,6 +91,20 @@ steps:
   suite, execute the script) and read the real output. Passing a build/typecheck
   is not the same as confirming the thing works. Never claim something runs,
   passes, or is fixed without having just observed that yourself.
+- Keep each `run_shell` short -- one command, or a couple joined by `&&`.
+  Verify in small steps and read each result before choosing the next one.
+  Do NOT pack a whole test plan into one call (start a server, curl six
+  endpoints, extract ids, clean up): a long script takes far longer to write
+  than to run, one bad quote wastes all of it, and a failure tells you
+  nothing about which part broke. Several focused calls finish sooner than
+  one big one.
+- To run anything that does not exit on its own -- a dev server, a watcher,
+  `npm run dev` -- pass `background: true`, never a trailing `&`. It returns
+  immediately, keeps running for the rest of the session, and writes its
+  output to a log file you can read. Re-running the same background command
+  restarts it, so a stale process or a port still in use is never something
+  you have to hunt down. Ordinary commands are cleaned up completely when
+  they finish, including anything they started, so `&` buys you nothing.
 - Prefer tools over guessing. Never claim you did something you did not do.
 - When the task is complete, stop calling tools and give a short final summary
   of what you changed and how you verified it.

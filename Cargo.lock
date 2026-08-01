@@ -626,7 +626,7 @@ checksum = "c3531d702d6c1a3ba92a5fb55a404c7b8c476c8e7ca249951077afcbe4bc807f"
 
 [[package]]
 name = "harness-agent"
-version = "1.5.0"
+version = "1.6.0"
 dependencies = [
  "anyhow",
  "harness-config",
@@ -641,7 +641,7 @@ dependencies = [
 
 [[package]]
 name = "harness-cli"
-version = "1.5.0"
+version = "1.6.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -663,7 +663,7 @@ dependencies = [
 
 [[package]]
 name = "harness-config"
-version = "1.5.0"
+version = "1.6.0"
 dependencies = [
  "serde",
  "thiserror 2.0.19",
@@ -672,7 +672,7 @@ dependencies = [
 
 [[package]]
 name = "harness-provider"
-version = "1.5.0"
+version = "1.6.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -688,10 +688,11 @@ dependencies = [
 
 [[package]]
 name = "harness-tools"
-version = "1.5.0"
+version = "1.6.0"
 dependencies = [
  "async-trait",
  "harness-types",
+ "libc",
  "printpdf",
  "reqwest",
  "rust_xlsxwriter",
@@ -704,7 +705,7 @@ dependencies = [
 
 [[package]]
 name = "harness-types"
-version = "1.5.0"
+version = "1.6.0"
 dependencies = [
  "serde",
  "serde_json",
