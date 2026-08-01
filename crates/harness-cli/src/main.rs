@@ -35,8 +35,35 @@ use input::HivePrompt;
 use json_ui::JsonUi;
 use ui::TermUi;
 
-const SYSTEM_PROMPT: &str =
-    "You are a terminal-based coding agent operating inside a user's workspace.
+/// The agent's own identity paragraph.
+///
+/// Kept as its own constant because it fixes a correctness problem, not
+/// just a branding one. With no name in the prompt the model filled the gap
+/// from its training priors and answered "who created you?" with
+/// "Anthropic" -- while `hivemind` actually routes to DeepSeek. It was not
+/// leaking a true fact, it was inventing a false attribution, and it did
+/// the same generic hand-waving for "what model are you?".
+///
+/// The framing is deliberately the honest one rather than a denial:
+/// HiveMind is a real product bmtai builds -- this agent, its tools, its
+/// behaviour -- running on models it licenses and lets the user choose
+/// between. That is all true, so the model is told to say it plainly and to
+/// stop guessing at infrastructure it demonstrably guesses wrong.
+const IDENTITY: &str = "\
+You are HiveMind, a coding agent built by bmtai.
+
+Asked who or what you are, who made you, or what you are called: you are
+HiveMind, built by bmtai. HiveMind runs on a selection of language models
+that bmtai licenses and routes behind the product -- users pick one with
+`/model`, and `hivemind` is the cheap default. Which model is serving any
+given request is infrastructure you are not told and must not guess at; say
+so plainly instead of speculating, and never attribute your own creation to
+a model vendor. Do not describe your architecture, training, or weights --
+you have no reliable knowledge of them. Answer briefly and get back to the
+work.";
+
+const SYSTEM_PROMPT_BODY: &str =
+    "You work from the terminal, inside a user's workspace.
 
 You can search, read, create, and edit files, list directories, run shell
 commands, and track a plan via the provided tools. Work in small, verifiable
@@ -110,6 +137,13 @@ steps:
   of what you changed and how you verified it.
 
 Be concise. Reference files by path.";
+
+/// Identity first, then the working instructions. Order matters: appended
+/// last it sits behind ~90 lines of workflow rules, which is exactly where
+/// a model stops treating something as defining.
+fn system_prompt() -> String {
+    format!("{IDENTITY}\n\n{SYSTEM_PROMPT_BODY}")
+}
 
 #[derive(Parser)]
 #[command(
@@ -471,7 +505,7 @@ async fn run(args: ActivateArgs) -> anyhow::Result<()> {
             registry,
             ws.clone(),
             json_ui.clone(),
-            SYSTEM_PROMPT.to_string(),
+            system_prompt(),
         );
         agent.warm_connection();
         // Protocol mode persists too: an editor window reloading is exactly
@@ -486,7 +520,7 @@ async fn run(args: ActivateArgs) -> anyhow::Result<()> {
         registry,
         ws.clone(),
         ui.clone(),
-        SYSTEM_PROMPT.to_string(),
+        system_prompt(),
     );
     agent.warm_connection();
 
@@ -540,7 +574,7 @@ fn attach_or_restore_session(
             let turns = record.turn_count();
             let title = record.title.clone();
             let cost = record.session_cost_usd;
-            agent.restore(record, store, SYSTEM_PROMPT.to_string());
+            agent.restore(record, store, system_prompt());
             if announce {
                 println!(
                     "\x1b[90m⟲ resumed session {} — {turns} turns, ${cost:.4} spent{}\x1b[0m",
