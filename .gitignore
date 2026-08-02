@@ -5,3 +5,5 @@
 /config.toml
 *.log
 .idea/
+/Mydoc/
+/scripts
