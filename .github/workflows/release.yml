@@ -76,6 +76,18 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+
+      # One file covering every archive, so a manual download (the only
+      # path that can trigger a SmartScreen/Gatekeeper warning today, since
+      # neither install script sets Mark-of-the-Web/quarantine) has a way to
+      # verify it wasn't tampered with in transit, even before real code
+      # signing exists. Filenames in the sums file are relative
+      # (`sha256sum *` from inside dist/), matching what `shasum -c` and
+      # `Get-FileHash` expect sitting next to the downloaded archive.
+      - name: Generate checksums
+        working-directory: dist
+        run: sha256sum * > SHA256SUMS.txt
+
       # Publishes to the public BibhabenduMukherjee/HiveMind-releases repo,
       # not this one — this repo is private (source-only). The default
       # GITHUB_TOKEN is scoped to the repo the workflow runs in and cannot
@@ -93,4 +105,4 @@ jobs:
           # fine-grained PAT even with Contents: Read/write (confirmed via
           # the actual run logs, not assumed). A static body avoids the
           # call entirely; the assets are what install.sh actually needs.
-          body: "Pre-built `hivemind` binaries for macOS (x86_64/aarch64), Linux (x86_64/aarch64), and Windows (x86_64)."
+          body: "Pre-built `hivemind` binaries for macOS (x86_64/aarch64), Linux (x86_64/aarch64), and Windows (x86_64). Installed via install.sh/install.ps1 by default; if you download an archive directly, verify it against SHA256SUMS.txt (`shasum -a 256 -c SHA256SUMS.txt` / `Get-FileHash`)."
