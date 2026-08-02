@@ -28,7 +28,7 @@ const MAX_ENTRIES: usize = 50_000;
 /// 64-bit hash would be fine for collision *frequency*, but a collision
 /// here returns a confidently wrong vector for unrelated code, which is
 /// exactly the kind of silent corruption worth two extra words to avoid.
-type Key = (u64, u64);
+pub(crate) type Key = (u64, u64);
 
 pub struct EmbedCache {
     path: PathBuf,
@@ -152,7 +152,7 @@ const FNV_OFFSET_A: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_OFFSET_B: u64 = 0x9e37_79b9_7f4a_7c15;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 
-fn key_of(text: &str) -> Key {
+pub(crate) fn key_of(text: &str) -> Key {
     let bytes = text.as_bytes();
     let mut a = FNV_OFFSET_A;
     for &b in bytes {
