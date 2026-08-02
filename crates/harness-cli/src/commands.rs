@@ -3,6 +3,9 @@
 
 pub const COMMAND_NAMES: &[&str] = &[
     "/help",
+    "/status",
+    "/context",
+    "/diff",
     "/clear",
     "/compact",
     "/model",
@@ -17,6 +20,9 @@ pub const COMMAND_NAMES: &[&str] = &[
 pub const HELP_TEXT: &str = "\
 Commands:
   /help              show this list
+  /status            model, mode, cost, and what this session has changed
+  /context           how much of the model's context window is in use
+  /diff [path]       what this session changed on disk, as a diff
   /compact           fold older turns into a summary now
   /model [id]        show available models, or switch the active one
   /reasoning [level]  show/set reasoning effort for the active model, or `off`
@@ -59,6 +65,12 @@ pub enum UndoArg {
 
 pub enum SlashCommand {
     Help,
+    Status,
+    Context,
+    /// `None` means every changed file; `Some(path)` narrows to one, matched
+    /// as a suffix of the tracked path so `/diff main.rs` works without
+    /// typing the whole thing.
+    Diff(Option<String>),
     Clear,
     Compact,
     Model(ModelArg),
@@ -80,6 +92,9 @@ pub fn parse(line: &str) -> Option<SlashCommand> {
 
     Some(match name {
         "help" | "h" | "?" => SlashCommand::Help,
+        "status" => SlashCommand::Status,
+        "context" => SlashCommand::Context,
+        "diff" | "changes" => SlashCommand::Diff(arg.map(str::to_string)),
         "clear" | "cls" => SlashCommand::Clear,
         "compact" => SlashCommand::Compact,
         "model" => SlashCommand::Model(match arg {
@@ -131,6 +146,40 @@ mod tests {
         assert!(matches!(parse("/cost"), Some(SlashCommand::Cost)));
         assert!(matches!(parse("/exit"), Some(SlashCommand::Exit)));
         assert!(matches!(parse("/quit"), Some(SlashCommand::Exit)));
+        assert!(matches!(parse("/status"), Some(SlashCommand::Status)));
+        assert!(matches!(parse("/context"), Some(SlashCommand::Context)));
+        assert!(matches!(parse("/diff"), Some(SlashCommand::Diff(None))));
+        assert!(matches!(parse("/changes"), Some(SlashCommand::Diff(None))));
+    }
+
+    #[test]
+    fn diff_takes_an_optional_path_filter() {
+        match parse("/diff src/main.rs") {
+            Some(SlashCommand::Diff(Some(p))) => assert_eq!(p, "src/main.rs"),
+            _ => panic!("expected a filtered diff"),
+        }
+    }
+
+    #[test]
+    fn every_completable_command_actually_parses() {
+        // The completer offers COMMAND_NAMES; a name there that dispatch
+        // doesn't know would tab-complete straight into "unknown command".
+        for name in COMMAND_NAMES {
+            assert!(
+                !matches!(parse(name), Some(SlashCommand::Unknown(_)) | None),
+                "{name} completes but does not parse"
+            );
+        }
+    }
+
+    #[test]
+    fn every_completable_command_is_documented() {
+        for name in COMMAND_NAMES {
+            assert!(
+                HELP_TEXT.contains(name),
+                "{name} is offered by the completer but missing from /help"
+            );
+        }
     }
 
     #[test]

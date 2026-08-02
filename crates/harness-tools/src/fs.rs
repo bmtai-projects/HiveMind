@@ -5,13 +5,21 @@ use serde::Deserialize;
 use serde_json::value::RawValue;
 
 use crate::error::ToolError;
+use crate::readset::ReadSet;
 use crate::tool::{Tool, obj_schema};
 
 /// Confines file tools to a root directory. All paths are resolved relative
 /// to `root` and may not escape it.
-#[derive(Clone)]
+///
+/// Also carries the session's [`ReadSet`]. Every file tool is built from a
+/// clone of one `Workspace`, so hanging the read tracking here is what lets
+/// `read_file` and `edit_file` — separate tools that never talk to each
+/// other — share a view of what has been seen. Cloning shares that view
+/// rather than copying it.
+#[derive(Clone, Default)]
 pub struct Workspace {
     pub root: PathBuf,
+    pub read_set: ReadSet,
 }
 
 /// Shared [`crate::tool::Tool::conflict_key`] implementation for every tool
@@ -34,7 +42,10 @@ pub(crate) fn path_conflict_key(ws: &Workspace, args: &RawValue) -> Option<Strin
 
 impl Workspace {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            read_set: ReadSet::new(),
+        }
     }
 
     /// Resolve `rel` against the workspace root, rejecting anything that
@@ -108,6 +119,11 @@ impl Tool for ReadFile {
         let a: PathArgs = serde_json::from_str(args.get())?;
         let p = self.0.resolve(&a.path)?;
         let bytes = tokio::fs::read(&p).await?;
+        // Fingerprint the *whole* file, including on the truncated path: the
+        // question this answers later is "did this file change since we
+        // looked at it", which a prefix can't answer. That the model saw
+        // only part of it is a separate limitation, unaffected either way.
+        self.0.read_set.record(&p, &String::from_utf8_lossy(&bytes));
         if bytes.len() > MAX_READ_BYTES {
             let head = String::from_utf8_lossy(&bytes[..MAX_READ_BYTES]).into_owned();
             return Ok(format!(
@@ -170,7 +186,19 @@ impl Tool for WriteFile {
         // Re-resolve now that the parent exists, to enforce the workspace boundary.
         let p = self.0.resolve(&a.path)?;
         tokio::fs::write(&p, &a.content).await?;
-        Ok(format!("wrote {} bytes to {}", a.content.len(), a.path))
+        // A tool that just wrote the file knows exactly what's in it, so
+        // this counts as having seen it -- otherwise a write-then-edit
+        // sequence would leave the edit unguarded.
+        self.0.read_set.record(&p, &a.content);
+
+        let mut out = format!("wrote {} bytes to {}", a.content.len(), a.path);
+        // Appended to a *successful* result rather than raised as an error:
+        // the write is legitimate far more often than not (fixtures, docs,
+        // examples), so this informs without blocking. See `crate::secrets`.
+        if let Some(note) = crate::secrets::warning(&crate::secrets::scan(&a.content)) {
+            out.push_str(&note);
+        }
+        Ok(out)
     }
 }
 

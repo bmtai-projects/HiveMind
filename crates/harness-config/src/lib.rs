@@ -267,11 +267,30 @@ pub struct HookSpec {
     /// every tool.
     #[serde(default)]
     pub matcher: Option<Vec<String>>,
-    /// Spawned the same way `run_shell` spawns (`bash -lc <command>`) in
-    /// the workspace root, with the event envelope written to stdin.
+    /// Spawned the same way `run_shell` spawns (`bash -lc` on Unix,
+    /// `cmd /C` on Windows) in the workspace root, with the event envelope
+    /// written to stdin.
     pub command: String,
     #[serde(default = "default_hook_timeout_ms")]
     pub timeout_ms: u64,
+    /// Whether this hook's *failure* is itself a denial.
+    ///
+    /// Off by default, which keeps the advisory behaviour every existing
+    /// config already relies on: a hook that can't spawn, times out, or
+    /// exits weirdly is ignored and the tool call proceeds. That's right
+    /// for linting, logging, and notifications — a broken formatter should
+    /// never wedge the agent.
+    ///
+    /// It is exactly wrong for a security control. "Block writes outside
+    /// the sandbox" that silently permits everything the moment the script
+    /// has a syntax error is not a control, it's a decoration. Setting
+    /// `enforcement = true` inverts every failure path to a denial, so the
+    /// only way past such a hook is for it to run and explicitly allow.
+    ///
+    /// Meaningful on `PreToolUse` only — a `PostToolUse` hook observes work
+    /// that has already happened, so there is nothing left for it to veto.
+    #[serde(default)]
+    pub enforcement: bool,
 }
 
 /// Fully resolved runtime configuration.

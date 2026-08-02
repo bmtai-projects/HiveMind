@@ -104,6 +104,19 @@ impl Tool for EditFile {
                 _ => ToolError::Io(e),
             })?;
 
+        // Checked before the match, not after: when a file has been
+        // rewritten underneath the agent, "this file moved under you" is a
+        // more useful thing to hear than "your old_string wasn't found",
+        // and it points at a different fix (re-read, don't re-guess).
+        if self.0.read_set.is_stale(&p, &original) {
+            return Err(ToolError::Message(format!(
+                "{} changed since you last read it -- something else (a formatter, the user, \
+                 another process) has written to it. Read it again before editing, so the edit \
+                 is based on what the file actually contains now.",
+                a.path
+            )));
+        }
+
         let occurrences = original.matches(&a.old_string).count();
         if occurrences == 0 {
             return Err(ToolError::Message(format!(
@@ -126,13 +139,24 @@ impl Tool for EditFile {
             original.replacen(&a.old_string, &a.new_string, 1)
         };
         tokio::fs::write(&p, &updated).await?;
+        // Re-fingerprint to what we just wrote, so a second edit to this
+        // same file doesn't see the first edit as interference.
+        self.0.read_set.record(&p, &updated);
 
         let n = if a.replace_all { occurrences } else { 1 };
-        Ok(format!(
+        let mut out = format!(
             "edited {} ({n} replacement{})",
             a.path,
             if n == 1 { "" } else { "s" }
-        ))
+        );
+        // Only the text being introduced is scanned, never the whole file:
+        // an unrelated credential already sitting in the file would
+        // otherwise re-fire on every edit forever, which is exactly how a
+        // warning becomes background noise nobody reads.
+        if let Some(note) = crate::secrets::warning(&crate::secrets::scan(&a.new_string)) {
+            out.push_str(&note);
+        }
+        Ok(out)
     }
 }
 
@@ -268,5 +292,139 @@ mod tests {
             "edit_file must never write outside the workspace root"
         );
         let _ = std::fs::remove_file(&outside);
+    }
+}
+
+/// Integration of the read-set staleness guard through the real tools --
+/// `ReadSet`'s own unit tests live in `crate::readset`, but the wiring
+/// between `read_file`, `write_file` and `edit_file` is what actually has
+/// to hold, and it spans three files.
+#[cfg(test)]
+mod staleness_tests {
+    use super::*;
+    use crate::fs::{ReadFile, WriteFile};
+
+    fn ws(name: &str) -> Workspace {
+        let dir = std::env::temp_dir().join(format!("hivemind_stale_test_{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        Workspace::new(dir)
+    }
+
+    fn args(json: serde_json::Value) -> Box<RawValue> {
+        RawValue::from_string(json.to_string()).unwrap()
+    }
+
+    async fn read(w: &Workspace, path: &str) {
+        ReadFile(w.clone())
+            .execute(&args(serde_json::json!({ "path": path })))
+            .await
+            .unwrap();
+    }
+
+    async fn edit(w: &Workspace, path: &str, old: &str, new: &str) -> Result<String, ToolError> {
+        EditFile(w.clone())
+            .execute(&args(serde_json::json!({
+                "path": path, "old_string": old, "new_string": new
+            })))
+            .await
+    }
+
+    #[tokio::test]
+    async fn editing_a_file_nobody_read_is_still_allowed() {
+        // Finding a file via `search` or `project_map` and editing it
+        // without a separate read is a normal flow. Blocking it would be a
+        // regression, not a safety feature.
+        let w = ws("unread");
+        std::fs::write(w.root.join("a.txt"), "hello world").unwrap();
+        assert!(edit(&w, "a.txt", "world", "there").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn read_then_edit_works_normally() {
+        let w = ws("normal");
+        std::fs::write(w.root.join("a.txt"), "hello world").unwrap();
+        read(&w, "a.txt").await;
+        assert!(edit(&w, "a.txt", "world", "there").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn an_edit_after_someone_else_rewrote_the_file_is_refused() {
+        let w = ws("rewritten");
+        std::fs::write(w.root.join("a.txt"), "hello world").unwrap();
+        read(&w, "a.txt").await;
+        // Someone else touches the file *outside* the region being edited,
+        // so `old_string` still matches -- exactly the case the exact-match
+        // requirement cannot catch on its own.
+        std::fs::write(w.root.join("a.txt"), "// added by a formatter\nhello world").unwrap();
+
+        let err = edit(&w, "a.txt", "world", "there")
+            .await
+            .expect_err("a stale edit must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("changed since you last read it"),
+            "got {msg:?}"
+        );
+        assert!(msg.contains("Read it again"), "must say how to recover");
+
+        // And the refusal must be a no-op on disk, not a partial write.
+        assert_eq!(
+            std::fs::read_to_string(w.root.join("a.txt")).unwrap(),
+            "// added by a formatter\nhello world"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_consecutive_edits_to_one_file_both_succeed() {
+        // The regression this guards: if the first edit didn't re-record,
+        // the second would see the agent's own change as interference and
+        // refuse, breaking an entirely ordinary sequence.
+        let w = ws("consecutive");
+        std::fs::write(w.root.join("a.txt"), "one two three").unwrap();
+        read(&w, "a.txt").await;
+        assert!(edit(&w, "a.txt", "one", "1").await.is_ok());
+        assert!(
+            edit(&w, "a.txt", "three", "3").await.is_ok(),
+            "the first edit's own write must not read as someone else's"
+        );
+        assert_eq!(
+            std::fs::read_to_string(w.root.join("a.txt")).unwrap(),
+            "1 two 3"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_then_edit_is_guarded_too() {
+        let w = ws("write_then_edit");
+        WriteFile(w.clone())
+            .execute(&args(serde_json::json!({
+                "path": "a.txt", "content": "generated content"
+            })))
+            .await
+            .unwrap();
+        // Clean edit right after our own write: fine.
+        assert!(edit(&w, "a.txt", "generated", "produced").await.is_ok());
+        // Now something else clobbers it -- that must be caught even though
+        // the agent learned the contents by writing rather than reading.
+        std::fs::write(w.root.join("a.txt"), "produced content\n// clobbered").unwrap();
+        assert!(edit(&w, "a.txt", "produced", "made").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn re_reading_a_changed_file_clears_the_refusal() {
+        // The recovery path the error message tells the model to take has
+        // to actually work.
+        let w = ws("recovery");
+        std::fs::write(w.root.join("a.txt"), "hello world").unwrap();
+        read(&w, "a.txt").await;
+        std::fs::write(w.root.join("a.txt"), "prefix\nhello world").unwrap();
+        assert!(edit(&w, "a.txt", "world", "there").await.is_err());
+
+        read(&w, "a.txt").await; // do what the error said
+        assert!(
+            edit(&w, "a.txt", "world", "there").await.is_ok(),
+            "re-reading must actually unblock the edit"
+        );
     }
 }

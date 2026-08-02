@@ -103,6 +103,43 @@ impl Checkpoint {
     }
 }
 
+/// One file the session has touched, paired with how it looked before the
+/// session touched it. `before: None` means the session created it.
+pub struct OriginalState {
+    pub path: PathBuf,
+    pub before: Option<String>,
+}
+
+/// Every file the session has changed, each paired with its state *before
+/// the earliest turn that touched it* — which is what "what has this
+/// session done to my workspace" actually means.
+///
+/// Walks oldest checkpoint first and keeps the first snapshot seen per
+/// path, mirroring the first-touch-wins rule inside a single checkpoint.
+/// Taking the newest instead would describe only the last turn's edit and
+/// silently hide everything before it.
+///
+/// Bounded by the same [`MAX_CHECKPOINTS`] window as `/undo`: a file
+/// changed more than 20 turns ago has aged out of the in-memory history and
+/// cannot be reported here. Callers that show this to a user should say so
+/// rather than implying the list is exhaustive.
+pub fn original_states(checkpoints: &[Checkpoint]) -> Vec<OriginalState> {
+    let mut seen: Vec<OriginalState> = Vec::new();
+    for cp in checkpoints {
+        for snap in &cp.files {
+            if seen.iter().any(|s| s.path == snap.path) {
+                continue;
+            }
+            seen.push(OriginalState {
+                path: snap.path.clone(),
+                before: snap.before.clone(),
+            });
+        }
+    }
+    seen.sort_by(|a, b| a.path.cmp(&b.path));
+    seen
+}
+
 /// What actually happened when a checkpoint (or several, for `/undo n`)
 /// was restored -- for the REPL to report back to the user.
 pub struct UndoReport {

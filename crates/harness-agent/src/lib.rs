@@ -15,7 +15,7 @@ mod trim;
 mod ui;
 
 pub use agent::Agent;
-pub use checkpoint::UndoReport;
+pub use checkpoint::{OriginalState, UndoReport};
 pub use compaction::{CompactionPolicy, CompactionReport};
 pub use cost::estimate_cost_usd;
 pub use interjection::InterjectionQueue;

@@ -10,6 +10,8 @@ mod auth;
 mod banner;
 mod commands;
 mod completion;
+mod conventions;
+mod diff;
 mod input;
 mod json_ui;
 mod mentions;
@@ -62,8 +64,7 @@ a model vendor. Do not describe your architecture, training, or weights --
 you have no reliable knowledge of them. Answer briefly and get back to the
 work.";
 
-const SYSTEM_PROMPT_BODY: &str =
-    "You work from the terminal, inside a user's workspace.
+const SYSTEM_PROMPT_BODY: &str = "You work from the terminal, inside a user's workspace.
 
 You can search, read, create, and edit files, list directories, run shell
 commands, and track a plan via the provided tools. Work in small, verifiable
@@ -133,16 +134,39 @@ steps:
   you have to hunt down. Ordinary commands are cleaned up completely when
   they finish, including anything they started, so `&` buys you nothing.
 - Prefer tools over guessing. Never claim you did something you did not do.
-- When the task is complete, stop calling tools and give a short final summary
-  of what you changed and how you verified it.
+- When the task is complete, stop calling tools and report back on it. Cover,
+  in prose, only the ones that apply: what changed and where; how you verified
+  it and what the check actually said; what you did NOT verify; anything left
+  risky, unfinished, or worth a second look. Scale it to the work -- a question
+  or a one-line fix gets a sentence or two and no structure at all; a
+  multi-file change earns the full set. Never list a check you did not run,
+  and never quietly drop the \"did not verify\" part: an unverified change
+  presented as a finished one is the single most expensive thing you can hand
+  back, because it costs the user the time to discover it themselves.
 
 Be concise. Reference files by path.";
 
-/// Identity first, then the working instructions. Order matters: appended
-/// last it sits behind ~90 lines of workflow rules, which is exactly where
-/// a model stops treating something as defining.
-fn system_prompt() -> String {
-    format!("{IDENTITY}\n\n{SYSTEM_PROMPT_BODY}")
+/// Identity first, then the working instructions, then whatever this
+/// particular repository asks for.
+///
+/// Order is deliberate at both ends. `IDENTITY` leads because appended last
+/// it would sit behind ~90 lines of workflow rules, which is exactly where
+/// a model stops treating something as defining. Project conventions go
+/// last for the opposite reason: they *specialize* the general rules above
+/// them ("use `just test`, not `cargo test`"), and the nearest instruction
+/// wins ties.
+///
+/// `project` is passed in rather than read here so it is loaded exactly
+/// once per process. This string is the provider's context-cache prefix —
+/// re-reading `AGENTS.md` each turn would let one mid-session file save
+/// silently cost every remaining cache hit in the session.
+fn system_prompt(project: Option<&str>) -> String {
+    let mut prompt = format!("{IDENTITY}\n\n{SYSTEM_PROMPT_BODY}");
+    if let Some(project) = project {
+        prompt.push_str("\n\n");
+        prompt.push_str(project);
+    }
+    prompt
 }
 
 #[derive(Parser)]
@@ -428,6 +452,10 @@ async fn run(args: ActivateArgs) -> anyhow::Result<()> {
     let term_ui: Option<Arc<TermUi>> =
         (!protocol_json).then(|| Arc::new(TermUi::new(args.show_reasoning, resolved.budget_usd)));
 
+    // Read once, here, and hold it for the process's lifetime -- see
+    // `system_prompt`'s doc comment for why re-reading would be expensive.
+    let project_conventions = conventions::load(&workdir);
+
     let mut registry = Registry::new();
     let ws = Workspace::new(workdir.clone());
     registry.register(Arc::new(ReadFile(ws.clone())));
@@ -505,12 +533,19 @@ async fn run(args: ActivateArgs) -> anyhow::Result<()> {
             registry,
             ws.clone(),
             json_ui.clone(),
-            system_prompt(),
+            system_prompt(project_conventions.as_deref()),
         );
         agent.warm_connection();
         // Protocol mode persists too: an editor window reloading is exactly
         // the kind of ordinary interruption a session must survive.
-        attach_or_restore_session(&mut agent, &args, store, workspace, false)?;
+        attach_or_restore_session(
+            &mut agent,
+            &args,
+            store,
+            workspace,
+            false,
+            project_conventions.as_deref(),
+        )?;
         return run_json_protocol(&mut agent, ws, json_ui).await;
     }
 
@@ -520,7 +555,7 @@ async fn run(args: ActivateArgs) -> anyhow::Result<()> {
         registry,
         ws.clone(),
         ui.clone(),
-        system_prompt(),
+        system_prompt(project_conventions.as_deref()),
     );
     agent.warm_connection();
 
@@ -532,9 +567,16 @@ async fn run(args: ActivateArgs) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    attach_or_restore_session(&mut agent, &args, store, workspace, true)?;
+    attach_or_restore_session(
+        &mut agent,
+        &args,
+        store,
+        workspace,
+        true,
+        project_conventions.as_deref(),
+    )?;
 
-    repl(&mut agent, ws, ui, args.yolo, update_check).await
+    repl(&mut agent, ws, ui, args.yolo, update_check, resolved.mode).await
 }
 
 /// Resolve `--continue` / `--resume` into either a restored session or a
@@ -547,6 +589,7 @@ fn attach_or_restore_session(
     store: harness_agent::SessionStore,
     workspace: String,
     announce: bool,
+    project_conventions: Option<&str>,
 ) -> anyhow::Result<()> {
     let restored = if let Some(id) = &args.resume {
         // An explicit id that doesn't exist is a real error: silently
@@ -574,7 +617,7 @@ fn attach_or_restore_session(
             let turns = record.turn_count();
             let title = record.title.clone();
             let cost = record.session_cost_usd;
-            agent.restore(record, store, system_prompt());
+            agent.restore(record, store, system_prompt(project_conventions));
             if announce {
                 println!(
                     "\x1b[90m⟲ resumed session {} — {turns} turns, ${cost:.4} spent{}\x1b[0m",
@@ -724,6 +767,7 @@ async fn repl(
     ui: Arc<TermUi>,
     yolo: bool,
     update_check: tokio::task::JoinHandle<Option<String>>,
+    mode: harness_config::Mode,
 ) -> anyhow::Result<()> {
     banner::print(update_check).await;
     println!("\x1b[90m@ to reference a file\x1b[0m");
@@ -761,6 +805,9 @@ async fn repl(
         if let Some(cmd) = commands::parse(input) {
             match cmd {
                 SlashCommand::Help => println!("{}", commands::HELP_TEXT),
+                SlashCommand::Status => print_status(agent, mode),
+                SlashCommand::Context => print_context(agent),
+                SlashCommand::Diff(filter) => print_diff(agent, filter.as_deref()),
                 SlashCommand::Clear => print!("\x1b[2J\x1b[H"),
                 SlashCommand::Compact => {
                     if !agent.force_compact().await {
@@ -935,4 +982,330 @@ async fn read_interjection() -> Option<String> {
     .flatten()?;
     let trimmed = line.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+/// One line of `/status`'s change list, or `None` for a file that neither
+/// existed before nor exists now (nothing meaningful to say about it).
+///
+/// Split out from the printing so the classification is testable: the four
+/// cases — created, deleted, modified, and *reverted back to its original
+/// contents* — are easy to get subtly wrong, and the last one especially
+/// matters, since reporting "modified" for a file the agent put back
+/// exactly as it found it would send the user hunting for a change that
+/// isn't there.
+fn change_line(label: &str, before: Option<&str>, now: Option<&str>) -> Option<String> {
+    match (before, now) {
+        (None, Some(_)) => Some(format!("  \x1b[32m+\x1b[0m {label} \x1b[90m(new)\x1b[0m")),
+        (Some(_), None) => Some(format!(
+            "  \x1b[31m-\x1b[0m {label} \x1b[90m(deleted)\x1b[0m"
+        )),
+        (Some(b), Some(n)) => {
+            let s = diff::stats(&diff::diff(b, n));
+            Some(if s.is_empty() {
+                format!("  \x1b[90m·\x1b[0m {label} \x1b[90m(reverted to original)\x1b[0m")
+            } else {
+                format!(
+                    "  \x1b[90m~\x1b[0m {label} \x1b[32m+{}\x1b[0m \x1b[31m-{}\x1b[0m",
+                    s.added, s.removed
+                )
+            })
+        }
+        (None, None) => None,
+    }
+}
+
+/// Percentage of the context window in use, and how many cells of a
+/// `width`-wide bar that fills. Saturates at 100% rather than overflowing
+/// the bar: an over-window request is already handled by the send guard,
+/// and a bar longer than its brackets just looks broken.
+fn context_gauge(used: u64, window: u64, width: usize) -> (u64, usize) {
+    let percent = (used * 100).checked_div(window).unwrap_or(0).min(100);
+    (percent, (percent as usize * width) / 100)
+}
+
+/// `/status` — one screen answering "where am I and what has this done to
+/// my workspace". Deliberately includes the change list: cost and model are
+/// easy to remember, but "which files has it touched" is the thing a user
+/// actually loses track of during a long session.
+fn print_status(agent: &Agent, mode: harness_config::Mode) {
+    println!("\x1b[1mmodel\x1b[0m      {}", agent.current_model());
+    println!(
+        "\x1b[1mmode\x1b[0m       {}",
+        match mode {
+            harness_config::Mode::Pro => "Pro (hosted reranking for semantic_search)",
+            harness_config::Mode::Standard => "Standard (local embeddings)",
+        }
+    );
+    println!(
+        "\x1b[1mreasoning\x1b[0m  {}",
+        agent.reasoning_effort().unwrap_or("off")
+    );
+    match agent.budget_usd() {
+        Some(b) => println!(
+            "\x1b[1mcost\x1b[0m       ${:.6} of ${b:.2} budget",
+            agent.session_cost_usd()
+        ),
+        None => println!(
+            "\x1b[1mcost\x1b[0m       ${:.6} (no budget set)",
+            agent.session_cost_usd()
+        ),
+    }
+    println!(
+        "\x1b[1mturns\x1b[0m      {} · context ~{} of {} tokens",
+        agent.turn_count(),
+        agent.estimated_tokens(),
+        agent.context_window()
+    );
+    if let Some(id) = agent.session_id() {
+        println!("\x1b[1msession\x1b[0m    {id}");
+    }
+
+    let changed = agent.changed_files();
+    if changed.is_empty() {
+        println!("\x1b[1mchanged\x1b[0m    nothing yet");
+        return;
+    }
+    println!("\x1b[1mchanged\x1b[0m    {} file(s):", changed.len());
+    for f in &changed {
+        let now = std::fs::read_to_string(&f.path).ok();
+        if let Some(line) = change_line(&display_path(&f.path), f.before.as_deref(), now.as_deref())
+        {
+            println!("{line}");
+        }
+    }
+    if agent.change_history_truncated() {
+        println!(
+            "\x1b[90m  (only the most recent turns are tracked -- earlier changes may be missing)\x1b[0m"
+        );
+    }
+    println!("\x1b[90m  run_shell changes are not tracked; /diff shows the detail\x1b[0m");
+}
+
+/// `/context` — the numbers that decide when trimming, compaction, and the
+/// send guard fire, taken from the same estimator those passes use.
+fn print_context(agent: &Agent) {
+    // A 40-cell bar is readable at any terminal width worth supporting.
+    const BAR_WIDTH: usize = 40;
+    let used = agent.estimated_tokens();
+    let window = agent.context_window();
+    let (percent, filled) = context_gauge(used, window, BAR_WIDTH);
+
+    println!(
+        "context: ~{used} of {window} tokens ({percent}%) across {} messages",
+        agent.history().len()
+    );
+    println!(
+        "  [\x1b[36m{}\x1b[0m{}]",
+        "█".repeat(filled),
+        "·".repeat(BAR_WIDTH - filled)
+    );
+    println!(
+        "\x1b[90m  estimated, not tokenized -- the harness brokers several providers with\n  \
+         different tokenizers, so this deliberately over-counts rather than risk\n  \
+         under-counting into a rejected request.\x1b[0m"
+    );
+    println!(
+        "\x1b[90m  old tool results are dropped automatically above ~25k tokens; older turns\n  \
+         are folded into a summary near {}% of the window.\x1b[0m",
+        agent.compaction_threshold_percent()
+    );
+}
+
+/// `/diff` — what actually changed on disk this session.
+fn print_diff(agent: &Agent, filter: Option<&str>) {
+    /// Enough to read a real change without scrolling a whole file past.
+    const MAX_LINES_PER_FILE: usize = 120;
+
+    let changed = agent.changed_files();
+    let matching: Vec<_> = changed
+        .iter()
+        .filter(|f| match filter {
+            None => true,
+            Some(want) => f.path.to_string_lossy().ends_with(want),
+        })
+        .collect();
+
+    if matching.is_empty() {
+        match filter {
+            Some(want) if !changed.is_empty() => {
+                println!("no changed file matches {want:?} -- /status lists them")
+            }
+            Some(want) => println!("nothing changed this session (and nothing matches {want:?})"),
+            None => println!("nothing changed this session"),
+        }
+        return;
+    }
+
+    for f in matching {
+        let before = f.before.clone().unwrap_or_default();
+        let Ok(after) = std::fs::read_to_string(&f.path) else {
+            println!(
+                "\x1b[1m{}\x1b[0m \x1b[31m(deleted, or no longer readable)\x1b[0m",
+                display_path(&f.path)
+            );
+            continue;
+        };
+        let lines = diff::diff(&before, &after);
+        let s = diff::stats(&lines);
+        if s.is_empty() {
+            continue;
+        }
+        println!(
+            "\n\x1b[1m{}\x1b[0m \x1b[32m+{}\x1b[0m \x1b[31m-{}\x1b[0m{}",
+            display_path(&f.path),
+            s.added,
+            s.removed,
+            if f.before.is_none() {
+                " \x1b[90m(new file)\x1b[0m"
+            } else {
+                ""
+            }
+        );
+        print!("{}", diff::render(&lines, MAX_LINES_PER_FILE));
+    }
+
+    if agent.change_history_truncated() {
+        println!(
+            "\n\x1b[90m(only the most recent turns are tracked -- earlier changes may be missing)\x1b[0m"
+        );
+    }
+}
+
+/// Shorten an absolute path against the current directory, so a diff header
+/// reads `src/main.rs` rather than 90 characters of machine-specific prefix.
+fn display_path(p: &std::path::Path) -> String {
+    std::env::current_dir()
+        .ok()
+        .and_then(|cwd| p.strip_prefix(cwd).ok())
+        .unwrap_or(p)
+        .display()
+        .to_string()
+}
+
+#[cfg(test)]
+mod system_prompt_tests {
+    use super::*;
+
+    #[test]
+    fn identity_leads_the_prompt() {
+        let p = system_prompt(None);
+        assert!(p.starts_with("You are HiveMind, a coding agent built by bmtai."));
+    }
+
+    #[test]
+    fn a_workspace_with_no_conventions_changes_nothing() {
+        assert_eq!(
+            system_prompt(None),
+            format!("{IDENTITY}\n\n{SYSTEM_PROMPT_BODY}")
+        );
+    }
+
+    #[test]
+    fn project_conventions_land_last_so_they_win_ties() {
+        let p = system_prompt(Some(
+            "<project-instructions>use just</project-instructions>",
+        ));
+        assert!(p.contains("use just"));
+        // Specializations have to sit *after* the general rules they
+        // override, or the nearest-instruction-wins heuristic works against
+        // the project instead of for it.
+        let conventions_at = p.find("use just").unwrap();
+        let workflow_at = p.find("Prefer tools over guessing").unwrap();
+        assert!(conventions_at > workflow_at);
+    }
+
+    #[test]
+    fn the_final_answer_contract_survives_in_the_prompt() {
+        let p = system_prompt(None);
+        // The "did not verify" clause is the load-bearing half of the
+        // contract -- a summary that only lists successes is the failure
+        // mode this exists to prevent.
+        assert!(p.contains("what you did NOT verify"));
+        assert!(p.contains("Scale it to the work"));
+    }
+}
+
+#[cfg(test)]
+mod status_tests {
+    use super::*;
+
+    fn plain(s: Option<String>) -> String {
+        // Strip SGR sequences so assertions are about content, not colour.
+        let s = s.unwrap_or_default();
+        let mut out = String::new();
+        let mut chars = s.chars();
+        while let Some(c) = chars.next() {
+            if c == '\x1b' {
+                for c in chars.by_ref() {
+                    if c == 'm' {
+                        break;
+                    }
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out.trim().to_string()
+    }
+
+    #[test]
+    fn a_file_the_session_created_reads_as_new() {
+        assert_eq!(plain(change_line("a.rs", None, Some("x"))), "+ a.rs (new)");
+    }
+
+    #[test]
+    fn a_file_the_session_deleted_reads_as_deleted() {
+        assert_eq!(
+            plain(change_line("a.rs", Some("x"), None)),
+            "- a.rs (deleted)"
+        );
+    }
+
+    #[test]
+    fn a_modified_file_reports_its_line_counts() {
+        assert_eq!(
+            plain(change_line(
+                "a.rs",
+                Some("one\ntwo"),
+                Some("one\nTWO\nthree")
+            )),
+            "~ a.rs +2 -1"
+        );
+    }
+
+    #[test]
+    fn a_file_put_back_exactly_as_found_is_not_reported_as_modified() {
+        // The agent edited this and then undid it. Saying "modified" would
+        // send the user looking for a change that no longer exists.
+        assert_eq!(
+            plain(change_line("a.rs", Some("same"), Some("same"))),
+            "· a.rs (reverted to original)"
+        );
+    }
+
+    #[test]
+    fn a_file_that_never_existed_either_side_says_nothing() {
+        assert!(change_line("a.rs", None, None).is_none());
+    }
+
+    #[test]
+    fn the_context_gauge_tracks_usage() {
+        assert_eq!(context_gauge(0, 1000, 40), (0, 0));
+        assert_eq!(context_gauge(500, 1000, 40), (50, 20));
+        assert_eq!(context_gauge(1000, 1000, 40), (100, 40));
+    }
+
+    #[test]
+    fn the_gauge_saturates_rather_than_overflowing_its_bar() {
+        // The send guard already stops an over-window request; the bar must
+        // not print more cells than it has brackets for.
+        let (percent, filled) = context_gauge(5_000, 1_000, 40);
+        assert_eq!(percent, 100);
+        assert_eq!(filled, 40);
+    }
+
+    #[test]
+    fn an_unknown_context_window_does_not_divide_by_zero() {
+        assert_eq!(context_gauge(1_000, 0, 40), (0, 0));
+    }
 }

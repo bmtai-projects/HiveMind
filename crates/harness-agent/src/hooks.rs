@@ -5,7 +5,6 @@ use harness_config::{HookEvent, HookSpec};
 use harness_types::ToolCall;
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
-use tokio::process::Command;
 
 /// Cap on the serialized size of a tool call's args/result embedded in a
 /// hook's stdin envelope, matching grok-build's own constant
@@ -83,6 +82,12 @@ pub async fn run_pre_tool_use(
 
 /// Runs every `PostToolUse` hook matching `call`, purely observationally —
 /// the return value is discarded by design (see module docs).
+///
+/// `enforcement` is therefore inert here, and deliberately not treated as a
+/// config error: the side effect has already happened by the time this
+/// runs, so there is no call left to block, and rolling one back is not
+/// something this layer can offer. A hook that must be able to *stop*
+/// something has to be registered on `PreToolUse`.
 pub async fn run_post_tool_use(
     hooks: &[HookSpec],
     call: &ToolCall,
@@ -124,21 +129,28 @@ async fn run_one(
         workspace_root,
     };
     let Ok(stdin_json) = serde_json::to_string(&envelope) else {
-        return HookDecision::Allow; // couldn't even build the envelope -- fail open
+        return on_failure(spec, "hook input could not be serialized");
     };
 
-    let mut cmd = Command::new("bash");
-    cmd.arg("-lc")
-        .arg(&spec.command)
-        .current_dir(workspace_root)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
+    // Same shell selection `run_shell` uses, imported rather than repeated:
+    // this was a hardcoded `bash` until enforcement made the difference
+    // load-bearing (see `harness_tools::shell_command`).
+    let mut cmd = harness_tools::shell_command(&spec.command);
+    // The CLI canonicalizes the workspace root, which on Windows yields a
+    // `\\?\C:\...` verbatim path that `cmd.exe` refuses to start in --
+    // so without this every hook fails to spawn there, and an enforcement
+    // hook that cannot spawn blocks every tool call.
+    cmd.current_dir(harness_tools::strip_verbatim(std::path::Path::new(
+        workspace_root,
+    )))
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .kill_on_drop(true);
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
-        Err(_) => return HookDecision::Allow, // couldn't even spawn -- fail open
+        Err(e) => return on_failure(spec, &format!("hook could not be started ({e})")),
     };
     if let Some(mut stdin) = child.stdin.take() {
         let _ = stdin.write_all(stdin_json.as_bytes()).await;
@@ -150,13 +162,39 @@ async fn run_one(
     let run = child.wait_with_output();
     let output = match tokio::time::timeout(Duration::from_millis(spec.timeout_ms), run).await {
         Ok(Ok(output)) => output,
-        _ => return HookDecision::Allow, // timed out, or the wait itself errored -- fail open
+        Ok(Err(e)) => return on_failure(spec, &format!("hook could not be waited on ({e})")),
+        Err(_) => return on_failure(spec, "hook timed out"),
     };
 
-    parse_decision(&output, &spec.name)
+    parse_decision(spec, &output)
 }
 
-fn parse_decision(output: &std::process::Output, hook_name: &str) -> HookDecision {
+/// The single place a hook that did not produce a usable answer is turned
+/// into a decision. Advisory hooks (the default) fall through to `Allow`;
+/// an `enforcement` hook denies instead, because a control that opens when
+/// it breaks is not a control.
+///
+/// The reason string always names the hook and says the hook *failed*,
+/// rather than implying the tool call was judged and rejected — otherwise
+/// the model reads a broken script as a deliberate policy decision and
+/// argues with it instead of surfacing it.
+fn on_failure(spec: &HookSpec, what_went_wrong: &str) -> HookDecision {
+    if !spec.enforcement {
+        return HookDecision::Allow;
+    }
+    HookDecision::Deny {
+        reason: format!(
+            "{what_went_wrong}; '{}' is an enforcement hook, so the call was blocked rather than \
+             allowed through unchecked. Fix or disable the hook -- retrying the same call will \
+             fail the same way.",
+            spec.name
+        ),
+        hook_name: spec.name.clone(),
+    }
+}
+
+fn parse_decision(spec: &HookSpec, output: &std::process::Output) -> HookDecision {
+    let hook_name = &spec.name;
     let stdout = String::from_utf8_lossy(&output.stdout);
     if let Ok(parsed) = serde_json::from_str::<HookOutput>(stdout.trim()) {
         return if parsed.decision.eq_ignore_ascii_case("deny") {
@@ -177,7 +215,12 @@ fn parse_decision(output: &std::process::Output, hook_name: &str) -> HookDecisio
             reason: format!("denied by hook '{hook_name}' (exit code {DENY_EXIT_CODE})"),
             hook_name: hook_name.to_string(),
         },
-        _ => HookDecision::Allow, // the hook itself failed -- fail open, not a deny
+        // Any other exit code means the hook itself broke, not that it
+        // reached a verdict -- so this is a failure path, not an allow.
+        Some(code) => on_failure(spec, &format!("hook exited with code {code}")),
+        // No code at all means a signal killed it (Unix) -- also a failure,
+        // never a verdict.
+        None => on_failure(spec, "hook was killed by a signal"),
     }
 }
 
@@ -202,8 +245,34 @@ mod tests {
             matcher: matcher.map(|v| v.into_iter().map(String::from).collect()),
             command: command.to_string(),
             timeout_ms: 2_000,
+            enforcement: false,
         }
     }
+
+    /// Same hook, but one whose failure is a denial.
+    fn enforcing(command: &str) -> HookSpec {
+        HookSpec {
+            enforcement: true,
+            ..spec(HookEvent::PreToolUse, None, command)
+        }
+    }
+
+    // Hooks now spawn through `harness_tools::shell_command`, so these run
+    // under `cmd.exe` on Windows and `bash` everywhere else. The two
+    // commands below are the only ones in this module whose syntax differs.
+    //
+    // `timeout /t` is deliberately not used for the Windows sleep: it reads
+    // the console directly and errors out when stdin is a pipe, which it
+    // always is here.
+    #[cfg(windows)]
+    const SLEEP_LONGER_THAN_ANY_TIMEOUT: &str = "ping -n 6 127.0.0.1 > nul";
+    #[cfg(not(windows))]
+    const SLEEP_LONGER_THAN_ANY_TIMEOUT: &str = "sleep 5";
+
+    #[cfg(windows)]
+    const ECHO_JSON_DENY: &str = r#"echo {"decision":"deny","reason":"nope"}"#;
+    #[cfg(not(windows))]
+    const ECHO_JSON_DENY: &str = r#"echo '{"decision":"deny","reason":"nope"}'; exit 0"#;
 
     #[tokio::test]
     async fn exit_zero_allows() {
@@ -238,11 +307,7 @@ mod tests {
 
     #[tokio::test]
     async fn structured_json_deny_takes_precedence_over_exit_code() {
-        let hooks = vec![spec(
-            HookEvent::PreToolUse,
-            None,
-            r#"echo '{"decision":"deny","reason":"nope"}'; exit 0"#,
-        )];
+        let hooks = vec![spec(HookEvent::PreToolUse, None, ECHO_JSON_DENY)];
         let decision =
             run_pre_tool_use(&hooks, &call("run_shell", serde_json::json!({})), ".").await;
         match decision {
@@ -255,7 +320,7 @@ mod tests {
     async fn timeout_fails_open() {
         let hooks = vec![HookSpec {
             timeout_ms: 100,
-            ..spec(HookEvent::PreToolUse, None, "sleep 5; exit 2")
+            ..spec(HookEvent::PreToolUse, None, SLEEP_LONGER_THAN_ANY_TIMEOUT)
         }];
         let decision =
             run_pre_tool_use(&hooks, &call("run_shell", serde_json::json!({})), ".").await;
@@ -264,6 +329,94 @@ mod tests {
             HookDecision::Allow,
             "a timed-out hook must fail open"
         );
+    }
+
+    // --- enforcement hooks -------------------------------------------------
+    //
+    // Each of these pairs with an advisory test above that runs the *same*
+    // failing command and asserts Allow. That pairing is the actual
+    // guarantee: enforcement changes the outcome, and its absence leaves
+    // every existing config behaving exactly as before.
+
+    #[tokio::test]
+    async fn an_enforcement_hook_that_succeeds_still_allows() {
+        let decision = run_pre_tool_use(
+            &[enforcing("exit 0")],
+            &call("run_shell", serde_json::json!({})),
+            ".",
+        )
+        .await;
+        assert_eq!(
+            decision,
+            HookDecision::Allow,
+            "enforcement must gate failures, not block everything"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_broken_enforcement_hook_denies_instead_of_failing_open() {
+        // Compare with `other_exit_code_fails_open`: identical command,
+        // opposite outcome, and the flag is the only difference.
+        let decision = run_pre_tool_use(
+            &[enforcing("exit 17")],
+            &call("run_shell", serde_json::json!({})),
+            ".",
+        )
+        .await;
+        match decision {
+            HookDecision::Deny { reason, hook_name } => {
+                assert_eq!(hook_name, "test-hook");
+                // The message has to read as "the hook broke", not "your
+                // call was rejected" -- otherwise the model treats a syntax
+                // error as a policy it should argue with.
+                assert!(reason.contains("17"), "reason should name the exit code");
+                assert!(reason.contains("enforcement hook"));
+            }
+            HookDecision::Allow => panic!("a broken enforcement hook must not fail open"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_enforcement_hook_denies() {
+        let hooks = vec![HookSpec {
+            timeout_ms: 100,
+            ..enforcing(SLEEP_LONGER_THAN_ANY_TIMEOUT)
+        }];
+        let decision =
+            run_pre_tool_use(&hooks, &call("run_shell", serde_json::json!({})), ".").await;
+        match decision {
+            HookDecision::Deny { reason, .. } => assert!(reason.contains("timed out")),
+            HookDecision::Allow => panic!("a hung enforcement hook must not fail open"),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_enforcement_hook_can_still_explicitly_allow() {
+        // A hook that runs cleanly and says nothing is an allow -- proving
+        // enforcement doesn't require special output to pass.
+        let decision = run_pre_tool_use(
+            &[enforcing("exit 0")],
+            &call("edit_file", serde_json::json!({"path": "a.txt"})),
+            ".",
+        )
+        .await;
+        assert_eq!(decision, HookDecision::Allow);
+    }
+
+    #[tokio::test]
+    async fn enforcement_does_not_change_an_explicit_deny() {
+        let decision = run_pre_tool_use(
+            &[enforcing(ECHO_JSON_DENY)],
+            &call("run_shell", serde_json::json!({})),
+            ".",
+        )
+        .await;
+        match decision {
+            HookDecision::Deny { reason, .. } => {
+                assert_eq!(reason, "nope", "the hook's own reason must survive intact")
+            }
+            HookDecision::Allow => panic!("expected the hook's explicit deny"),
+        }
     }
 
     #[tokio::test]

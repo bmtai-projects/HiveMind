@@ -226,7 +226,6 @@ impl Agent {
         &self.current_model
     }
 
-   
     pub fn set_model(&mut self, model: String) {
         self.default_model = model.clone();
         self.current_model = model;
@@ -236,7 +235,6 @@ impl Agent {
         self.reasoning_effort.as_deref()
     }
 
- 
     pub fn reasoning_efforts_for_current_model(&self) -> &'static [&'static str] {
         harness_config::lookup_model(&self.current_model)
             .map(|m| m.reasoning_efforts)
@@ -264,6 +262,46 @@ impl Agent {
 
     pub fn set_budget_usd(&mut self, budget: Option<f64>) {
         self.budget_usd = budget;
+    }
+
+    /// Context window of the *active* model, in tokens.
+    pub fn context_window(&self) -> u64 {
+        self.context_window
+    }
+
+    /// Percentage of the context window at which compaction fires — read
+    /// from the live policy rather than restated by callers, so `/context`
+    /// can't quote a threshold the agent isn't actually using.
+    pub fn compaction_threshold_percent(&self) -> u8 {
+        self.policy.compaction_threshold_percent
+    }
+
+    /// Estimated size of the next request, by the same estimator the
+    /// trim/compact/send-guard ladder uses — so what `/context` shows and
+    /// what actually triggers those passes can never disagree.
+    pub fn estimated_tokens(&self) -> u64 {
+        crate::tokens::estimate_tokens(&self.messages)
+    }
+
+    /// How many user turns this session has taken.
+    pub fn turn_count(&self) -> usize {
+        self.messages
+            .iter()
+            .filter(|m| m.role == Role::User)
+            .count()
+    }
+
+    /// Every file this session has changed, with its pre-session contents.
+    /// See [`checkpoint::original_states`] for the window this covers —
+    /// notably, changes made by `run_shell` are not tracked at all.
+    pub fn changed_files(&self) -> Vec<checkpoint::OriginalState> {
+        checkpoint::original_states(&self.checkpoints)
+    }
+
+    /// Whether the checkpoint history has aged out any turns, meaning
+    /// [`Self::changed_files`] can no longer be complete.
+    pub fn change_history_truncated(&self) -> bool {
+        self.checkpoints.len() >= checkpoint::MAX_CHECKPOINTS
     }
 
     pub async fn force_compact(&mut self) -> bool {
@@ -372,7 +410,7 @@ impl Agent {
             self.ui.turn_started();
             let mut rx = self.client.stream(&req);
             self.messages = std::mem::take(&mut req.messages);
-            
+
             let resp = self.drain_stream(&mut rx).await?;
 
             self.last_total_tokens = resp.usage.total_tokens;
@@ -513,7 +551,10 @@ impl Agent {
         for (call, result) in results {
             let is_error = result.starts_with("ERROR:");
             self.ui.tool_end(&call.name, &result, is_error);
-            hooks::run_post_tool_use(&self.hooks, &call, &result, &workspace_root).await;
+            if !self.hooks.is_empty() {
+                hooks::run_post_tool_use(&self.hooks, &call, &result, &workspace_root).await;
+                forget_if_a_hook_may_have_rewritten_it(&self.workspace, &call);
+            }
             self.messages
                 .push(Message::tool_result(call.id, call.name, result));
         }
@@ -619,7 +660,6 @@ impl Agent {
             threshold_percent: self.policy.compaction_threshold_percent,
             keep_recent: COMPACTION_KEEP_RECENT,
         };
-        
 
         let effective_tokens = self
             .last_total_tokens
@@ -647,7 +687,6 @@ impl Agent {
         }
     }
 
-    
     fn account_for_compaction_cost(
         &mut self,
         report: &crate::compaction::CompactionReport,
@@ -659,7 +698,6 @@ impl Agent {
     }
 }
 
-
 fn incomplete_tool_group_start(messages: &[Message]) -> Option<usize> {
     let idx = messages
         .iter()
@@ -670,6 +708,32 @@ fn incomplete_tool_group_start(messages: &[Message]) -> Option<usize> {
         .filter(|m| m.role == Role::Tool)
         .count();
     (recorded < expected).then_some(idx)
+}
+
+/// A `PostToolUse` hook is very often a formatter, and a formatter runs
+/// *after* the write that the read-set just fingerprinted. Left alone, the
+/// agent's next edit to that file would be refused as stale — because of a
+/// change the harness itself caused.
+///
+/// Rather than re-read the file to re-fingerprint it (an extra I/O on every
+/// edit, to fix a case that only exists when hooks are configured), the
+/// entry is simply dropped. An untracked file is allowed through, so this
+/// fails open — the same direction every other uncertainty in the read-set
+/// resolves.
+fn forget_if_a_hook_may_have_rewritten_it(workspace: &Workspace, call: &ToolCall) {
+    if !matches!(call.name.as_str(), "edit_file" | "write_file") {
+        return;
+    }
+    #[derive(serde::Deserialize)]
+    struct PathOnly {
+        path: String,
+    }
+    let Ok(parsed) = serde_json::from_str::<PathOnly>(call.args.get()) else {
+        return;
+    };
+    if let Ok(resolved) = workspace.resolve(&parsed.path) {
+        workspace.read_set.forget(&resolved);
+    }
 }
 
 #[cfg(test)]
@@ -805,7 +869,11 @@ mod tests {
         for sig in cascade {
             let (s, failed) = turn(sig, true);
             let repeated = last.as_deref() == Some(s.as_str());
-            if repeated || failed { count += 1 } else { count = 0 }
+            if repeated || failed {
+                count += 1
+            } else {
+                count = 0
+            }
             last = Some(s);
         }
         assert_eq!(count, 3, "each failing turn must advance the counter");
@@ -817,10 +885,18 @@ mod tests {
     fn successful_varied_turns_never_accumulate() {
         let mut count = 0u32;
         let mut last: Option<String> = None;
-        for sig in ["read_file:{\"path\":\"a\"}", "read_file:{\"path\":\"b\"}", "edit_file:{\"path\":\"a\"}"] {
+        for sig in [
+            "read_file:{\"path\":\"a\"}",
+            "read_file:{\"path\":\"b\"}",
+            "edit_file:{\"path\":\"a\"}",
+        ] {
             let (s, failed) = turn(sig, false);
             let repeated = last.as_deref() == Some(s.as_str());
-            if repeated || failed { count += 1 } else { count = 0 }
+            if repeated || failed {
+                count += 1
+            } else {
+                count = 0
+            }
             last = Some(s);
         }
         assert_eq!(count, 0);
@@ -831,7 +907,10 @@ mod tests {
         // Not prose-checking for its own sake: these are the two specific
         // behaviours the nudge exists to correct, and a reworded nudge that
         // drops them silently loses most of its value.
-        assert!(STALL_NUDGE.contains("background: true"), "must name the server fix");
+        assert!(
+            STALL_NUDGE.contains("background: true"),
+            "must name the server fix"
+        );
         assert!(
             STALL_NUDGE.contains("change the approach"),
             "must say to change approach, not retry harder"
@@ -839,3 +918,94 @@ mod tests {
     }
 }
 
+/// The read-set's interaction with `PostToolUse` hooks. `ReadSet` itself is
+/// tested in `harness_tools::readset`; what needs pinning here is that a
+/// formatter hook can't turn the harness's own write into a false "this
+/// file changed under you" on the agent's next edit.
+#[cfg(test)]
+mod read_set_hook_tests {
+    use super::*;
+    use harness_types::ToolCall;
+
+    fn ws() -> Workspace {
+        let dir = std::env::temp_dir().join(format!(
+            "hivemind_rs_hook_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        Workspace::new(dir)
+    }
+
+    fn call(name: &str, args: serde_json::Value) -> ToolCall {
+        ToolCall {
+            id: "c0".into(),
+            name: name.into(),
+            args: serde_json::value::RawValue::from_string(args.to_string()).unwrap(),
+        }
+    }
+
+    #[test]
+    fn a_hook_that_may_have_formatted_the_file_clears_its_fingerprint() {
+        let w = ws();
+        let path = w.root.join("a.rs");
+        std::fs::write(&path, "fn main(){}").unwrap();
+        let resolved = w.resolve("a.rs").unwrap();
+        w.read_set.record(&resolved, "fn main(){}");
+
+        // Stands in for the formatter hook rewriting the file after our write.
+        std::fs::write(&path, "fn main() {}").unwrap();
+        assert!(
+            w.read_set.is_stale(&resolved, "fn main() {}"),
+            "precondition: without the fix this edit would be refused"
+        );
+
+        forget_if_a_hook_may_have_rewritten_it(
+            &w,
+            &call("edit_file", serde_json::json!({"path": "a.rs"})),
+        );
+
+        assert!(
+            !w.read_set.is_stale(&resolved, "fn main() {}"),
+            "a change the harness's own hook caused must not be blamed on the user"
+        );
+    }
+
+    #[test]
+    fn a_read_only_tool_does_not_clear_anything() {
+        // Only the tools that actually write can have been followed by a
+        // rewrite; forgetting on every call would silently disable the
+        // whole guard the moment any hook exists.
+        let w = ws();
+        let resolved = w.resolve(".").unwrap().join("a.rs");
+        w.read_set.record(&resolved, "original");
+        forget_if_a_hook_may_have_rewritten_it(
+            &w,
+            &call("read_file", serde_json::json!({"path": "a.rs"})),
+        );
+        assert!(w.read_set.is_stale(&resolved, "changed"));
+    }
+
+    #[test]
+    fn malformed_tool_args_are_ignored_rather_than_panicking() {
+        let w = ws();
+        forget_if_a_hook_may_have_rewritten_it(
+            &w,
+            &call("edit_file", serde_json::json!({"no_path": 1})),
+        );
+        forget_if_a_hook_may_have_rewritten_it(
+            &w,
+            &call("edit_file", serde_json::json!("not an object")),
+        );
+    }
+
+    #[test]
+    fn a_path_outside_the_workspace_is_ignored() {
+        let w = ws();
+        forget_if_a_hook_may_have_rewritten_it(
+            &w,
+            &call("write_file", serde_json::json!({"path": "../../etc/hosts"})),
+        );
+    }
+}

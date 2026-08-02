@@ -342,7 +342,12 @@ impl Tool for Bash {
 /// Windows has no `bash`; `cmd.exe /C` is the only shell guaranteed to be
 /// present. Elsewhere `bash -lc` is kept as-is so login-shell PATH setup
 /// (nvm, pyenv, ...) still applies.
-fn shell_command(command: &str) -> Command {
+///
+/// `pub` so hooks (`harness_agent::hooks`) spawn through the exact same
+/// selection rather than keeping their own copy. They previously hardcoded
+/// `bash`, which meant hooks silently never ran on Windows — invisible
+/// while hooks failed open, but a hard stop the moment one can fail closed.
+pub fn shell_command(command: &str) -> Command {
     #[cfg(windows)]
     {
         let mut cmd = Command::new("cmd");
@@ -361,7 +366,13 @@ fn shell_command(command: &str) -> Command {
 /// `Path::canonicalize` on Windows returns a `\\?\C:\...` verbatim path, and
 /// `cmd.exe` refuses to start in one ("UNC paths are not supported"). Strip
 /// the prefix back to a plain `C:\...` for use as a working directory.
-fn strip_verbatim(path: &Path) -> PathBuf {
+///
+/// `pub` for the same reason as [`shell_command`]: hooks spawn a shell in
+/// the workspace root too, and the CLI canonicalizes that root before
+/// handing it over — so on Windows every hook would fail to spawn without
+/// this. Any new spawn site that sets `current_dir` from a canonicalized
+/// path needs it as well.
+pub fn strip_verbatim(path: &Path) -> PathBuf {
     #[cfg(windows)]
     {
         use std::path::{Component, Prefix};
@@ -387,11 +398,7 @@ fn strip_verbatim(path: &Path) -> PathBuf {
 
 /// `status` is `None` when the command timed out and never produced one --
 /// the caller reports that itself, so no exit line is appended here.
-fn format_output(
-    stdout: &[u8],
-    stderr: &[u8],
-    status: Option<std::process::ExitStatus>,
-) -> String {
+fn format_output(stdout: &[u8], stderr: &[u8], status: Option<std::process::ExitStatus>) -> String {
     let mut stdout = String::from_utf8_lossy(stdout).into_owned();
     let mut stderr = String::from_utf8_lossy(stderr).into_owned();
     truncate_in_place(&mut stdout);
@@ -464,11 +471,16 @@ mod tests {
         assert!(out.contains("hello"), "{out}");
 
         let failed = bash()
-            .execute(&args(serde_json::json!({"command": "echo oops >&2; exit 3"})))
+            .execute(&args(
+                serde_json::json!({"command": "echo oops >&2; exit 3"}),
+            ))
             .await
             .unwrap();
         assert!(failed.contains("oops"), "{failed}");
-        assert!(failed.contains("[exit:"), "a non-zero exit must be visible: {failed}");
+        assert!(
+            failed.contains("[exit:"),
+            "a non-zero exit must be visible: {failed}"
+        );
     }
 
     /// The measured bug: `wait_with_output()` waits for pipe EOF, and a
@@ -591,8 +603,14 @@ mod tests {
             .and_then(|(_, rest)| rest.split(')').next())
             .and_then(|p| p.trim().parse().ok())
             .unwrap_or_else(|| panic!("no pid in output: {out}"));
-        assert!(alive(pid), "a backgrounded command must outlive its own call");
-        assert!(out.contains("hivemind-bg-"), "must report a log path: {out}");
+        assert!(
+            alive(pid),
+            "a backgrounded command must outlive its own call"
+        );
+        assert!(
+            out.contains("hivemind-bg-"),
+            "must report a log path: {out}"
+        );
 
         // Session end.
         drop(tool);
@@ -622,7 +640,10 @@ mod tests {
             .unwrap();
 
         let second = tool.execute(&args(cmd)).await.unwrap();
-        assert!(second.contains("replaced"), "should say it replaced: {second}");
+        assert!(
+            second.contains("replaced"),
+            "should say it replaced: {second}"
+        );
 
         for _ in 0..50 {
             if !alive(first_pid) {
