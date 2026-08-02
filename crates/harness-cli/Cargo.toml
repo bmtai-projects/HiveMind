@@ -34,3 +34,8 @@ self-replace = "1"
 # this is Windows-only in practice but built for both to avoid a #[cfg] split
 # in the dependency graph itself.
 zip = { version = "7", default-features = false, features = ["deflate"] }
+
+[dev-dependencies]
+# Test-only: confirms `hooks_config`'s generated `[[hooks]]` blocks are
+# actually valid TOML, not just strings that look plausible.
+toml = { workspace = true }
