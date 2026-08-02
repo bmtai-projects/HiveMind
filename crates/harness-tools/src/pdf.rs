@@ -279,7 +279,13 @@ fn draw_table_row(
     is_header: bool,
 ) {
     layout.ensure_space(TABLE_ROW_HEIGHT_PT);
-    let row_top = layout.cursor_y + BODY_SIZE * 0.3;
+    // `cursor_y` is already the top of this row's box (same convention
+    // `ensure_space` assumes). Center the text baseline in the box instead
+    // of placing it near the top edge -- otherwise ascenders poke through
+    // the row's own top border, rendering as a strikethrough through every
+    // cell's text.
+    let row_top = layout.cursor_y;
+    let text_baseline_y = row_top - (TABLE_ROW_HEIGHT_PT - BODY_SIZE) / 2.0 - BODY_SIZE * 0.75;
     let font = if is_header {
         BuiltinFont::HelveticaBold
     } else {
@@ -324,7 +330,7 @@ fn draw_table_row(
         layout.cur_ops.push(Op::SetTextCursor {
             pos: Point {
                 x: Pt(x + 4.0),
-                y: Pt(layout.cursor_y),
+                y: Pt(text_baseline_y),
             },
         });
         layout.cur_ops.push(Op::ShowText {
