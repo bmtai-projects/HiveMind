@@ -12,6 +12,8 @@ mod commands;
 mod completion;
 mod conventions;
 mod diff;
+mod hook_presets;
+mod hooks_config;
 mod input;
 mod json_ui;
 mod mentions;
@@ -199,6 +201,36 @@ enum Command {
     /// `crate::self_update` for the full explanation of why this is
     /// explicit-only, not automatic.
     Update,
+    /// Turn built-in safety rules on or off (e.g. "never write outside
+    /// src/") without hand-writing shell into config.toml yourself. Run
+    /// with no subcommand to list what's available.
+    Hooks(HooksArgs),
+}
+
+#[derive(Args)]
+struct HooksArgs {
+    #[command(subcommand)]
+    action: Option<HooksAction>,
+}
+
+#[derive(Subcommand)]
+enum HooksAction {
+    /// List available presets and whether each is currently enabled.
+    List,
+    /// Turn a preset on, writing it into config.toml.
+    Enable {
+        preset: String,
+        /// Required by presets that need one (e.g. a directory); omit for
+        /// ones that don't -- `hivemind hooks list` shows which is which.
+        arg: Option<String>,
+    },
+    /// Turn a preset off, removing it from config.toml.
+    Disable { preset: String, arg: Option<String> },
+    /// Internal: evaluate one preset against the hook JSON envelope on
+    /// stdin. This is what a preset's generated hook actually runs when
+    /// the agent is about to call a tool -- not meant to be run by hand.
+    #[command(hide = true)]
+    Check { preset: String, arg: Option<String> },
 }
 
 #[derive(Args)]
@@ -403,6 +435,21 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Sessions(args) => list_sessions(args),
         Command::Update => self_update::run().await,
+        Command::Hooks(args) => match args.action {
+            None | Some(HooksAction::List) => {
+                hooks_config::list();
+                Ok(())
+            }
+            Some(HooksAction::Enable { preset, arg }) => {
+                hooks_config::enable(&preset, arg.as_deref())
+            }
+            Some(HooksAction::Disable { preset, arg }) => {
+                hooks_config::disable(&preset, arg.as_deref())
+            }
+            Some(HooksAction::Check { preset, arg }) => {
+                hooks_config::check(&preset, arg.as_deref())
+            }
+        },
     };
     if let Err(e) = result {
         eprintln!("\nerror: {e:#}");
