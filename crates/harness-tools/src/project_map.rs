@@ -780,7 +780,10 @@ mod tests {
             .await
             .unwrap();
         assert!(out.contains("many.rs"));
-        assert!(out.contains("more definitions"), "expected a cap notice:\n{out}");
+        assert!(
+            out.contains("more definitions"),
+            "expected a cap notice:\n{out}"
+        );
         assert!(!out.contains("f60"), "cap was not enforced:\n{out}");
     }
 
@@ -803,7 +806,10 @@ mod tests {
             "output was {} chars",
             out.len()
         );
-        assert!(out.contains("large repo"), "should say density was reduced:\n{out}");
+        assert!(
+            out.contains("large repo"),
+            "should say density was reduced:\n{out}"
+        );
     }
 
     /// The point of the density ladder: staying within budget by thinning
@@ -834,7 +840,10 @@ mod tests {
             "the last-sorting file must still be listed:\n{}",
             &out[out.len().saturating_sub(600)..]
         );
-        assert!(out.contains("aaa_000.rs"), "first file should be listed too");
+        assert!(
+            out.contains("aaa_000.rs"),
+            "first file should be listed too"
+        );
         assert!(
             out.contains("aaa_299.rs"),
             "a middle-to-late file must not vanish either"

@@ -267,8 +267,7 @@ impl DeepSeekClient {
                                 // of the same call, and a host UI must not
                                 // announce one call several times.
                                 if entry.name.is_empty() && !name.is_empty() {
-                                    let _ =
-                                        tx.send(Ok(StreamEvent::ToolCallStarted(name.clone())));
+                                    let _ = tx.send(Ok(StreamEvent::ToolCallStarted(name.clone())));
                                 }
                                 entry.name = name;
                             }

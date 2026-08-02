@@ -23,6 +23,14 @@ escalate_after_repeats = 2          # consecutive repeats/errors before escalati
                                      # error) once estimated spend reaches this, at the next turn
                                      # boundary -- an in-flight turn always finishes first.
 
+# For common cases -- "never let it force-push", "only let it write inside
+# src/" -- you don't need to write any of the below by hand. Run:
+#   hivemind hooks list             # see what's available
+#   hivemind hooks enable <preset>  # turn one on
+# It writes a [[hooks]] block just like the ones below into this exact
+# file. Hand-write your own hook (below) only for something a preset
+# doesn't cover.
+#
 # Zero or more hooks. `event` is "pre_tool_use" (can block a call before it
 # runs) or "post_tool_use" (observes after; can't block). `matcher` limits
 # which tool names it applies to — omit it to match every tool. `command`
@@ -49,3 +57,10 @@ escalate_after_repeats = 2          # consecutive repeats/errors before escalati
 # matcher = ["run_shell"]
 # command = 'grep -q "push --force" && exit 2 || exit 0'
 # timeout_ms = 5000
+#
+# [[hooks]]
+# name = "no-writes-outside-src"
+# event = "pre_tool_use"
+# matcher = ["write_file", "edit_file"]
+# command = 'jq -e ".tool_args | fromjson | .path | startswith(\"src/\")" > /dev/null || exit 2'
+# enforcement = true
