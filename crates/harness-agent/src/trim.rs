@@ -163,8 +163,15 @@ mod tests {
         // The message survives as a valid tool result -- only its body changed.
         let elided = m.iter().find(|x| x.role == Role::Tool).unwrap();
         assert_eq!(elided.tool_call_id.as_deref(), Some("call-1"));
-        assert!(elided.content.starts_with(ELIDED_PREFIX), "{}", elided.content);
-        assert!(elided.content.contains("project_map"), "should name the tool");
+        assert!(
+            elided.content.starts_with(ELIDED_PREFIX),
+            "{}",
+            elided.content
+        );
+        assert!(
+            elided.content.contains("project_map"),
+            "should name the tool"
+        );
     }
 
     /// The regression this module's trigger was redesigned around: the
@@ -216,7 +223,11 @@ mod tests {
             remaining > 0,
             "should have stopped at the target, not elided all 6"
         );
-        assert!(report.results_elided < 6, "elided {}", report.results_elided);
+        assert!(
+            report.results_elided < 6,
+            "elided {}",
+            report.results_elided
+        );
     }
 
     #[test]

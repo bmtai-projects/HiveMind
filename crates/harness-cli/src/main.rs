@@ -32,8 +32,8 @@ use commands::{BudgetArg, ModelArg, ReasoningArg, SlashCommand, UndoArg};
 use harness_agent::{Agent, Ui};
 use harness_config::CliOverrides;
 use harness_tools::{
-    Bash, CreatePdf, CreateSpreadsheet, EditFile, ListDir, ProjectMap, ReadFile, Registry, Search,
-    SemanticSearch, TodoWrite, Workspace, WriteFile,
+    Bash, CreateDiagram, CreatePdf, CreateSpreadsheet, EditFile, ListDir, ProjectMap, ReadFile,
+    Registry, Search, SemanticSearch, TodoWrite, Workspace, WriteFile,
 };
 use input::HivePrompt;
 use json_ui::JsonUi;
@@ -110,6 +110,11 @@ steps:
   reportlab, openpyxl) and run it with `run_shell` -- check the runtime/
   library is available first and install it if not, then verify the output
   file actually exists afterward.
+- To visualize a flowchart, sequence, class, ER, state, or gantt diagram,
+  use `create_diagram` with Mermaid syntax -- it always writes the raw
+  source, and additionally renders an image if `mmdc` is available. If it
+  isn't, the result says so and the source is still directly usable; do not
+  treat that as a failure needing a retry.
 - To change an existing file, use `edit_file` — an exact old_string→new_string
   replacement. It is cheaper than rewriting the file and cannot corrupt the
   parts you leave untouched. Copy `old_string` verbatim from the file
@@ -550,6 +555,7 @@ async fn run(args: ActivateArgs) -> anyhow::Result<()> {
     registry.register(Arc::new(TodoWrite));
     registry.register(Arc::new(CreatePdf(ws.clone())));
     registry.register(Arc::new(CreateSpreadsheet(ws.clone())));
+    registry.register(Arc::new(CreateDiagram(ws.clone())));
 
     // Shell approval has three shapes:
     // - `--yolo` (either mode): auto-approved, no round-trip at all.

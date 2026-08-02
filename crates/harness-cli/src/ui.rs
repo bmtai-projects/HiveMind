@@ -93,7 +93,10 @@ impl Ui for TermUi {
         }
         let mut pending = self.pending_calls.lock().expect("preview mutex poisoned");
         pending.push(name.to_string());
-        print!("\r\x1b[2K\x1b[36m⚙ {}\x1b[0m \x1b[90m…\x1b[0m", pending.join(", "));
+        print!(
+            "\r\x1b[2K\x1b[36m⚙ {}\x1b[0m \x1b[90m…\x1b[0m",
+            pending.join(", ")
+        );
         flush_stdout();
     }
 
@@ -211,7 +214,11 @@ impl Ui for TermUi {
 
     fn context_trimmed(&self, results_elided: usize, tokens_saved: u64) {
         self.clear_preview();
-        let noun = if results_elided == 1 { "result" } else { "results" };
+        let noun = if results_elided == 1 {
+            "result"
+        } else {
+            "results"
+        };
         println!(
             "\x1b[90m  ⤵ freed ~{tokens_saved} tokens ({results_elided} old tool {noun} dropped)\x1b[0m"
         );

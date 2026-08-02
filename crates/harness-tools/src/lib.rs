@@ -2,6 +2,7 @@
 //! `xai-tool-runtime` + the file/shell tools in `xai-grok-tools`.
 
 mod bash;
+mod diagram;
 mod edit;
 mod embed_cache;
 mod error;
@@ -19,6 +20,7 @@ mod walk;
 mod xlsx;
 
 pub use bash::{ApproveFn, Bash, shell_command, strip_verbatim};
+pub use diagram::CreateDiagram;
 pub use edit::EditFile;
 pub use embed_cache::EmbedCache;
 pub use error::ToolError;

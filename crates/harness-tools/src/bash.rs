@@ -172,7 +172,13 @@ impl Bash {
 /// groups don't work this way, `taskkill /T` walks the process tree instead.
 /// Failure is ignored throughout: the usual cause is that everything already
 /// exited, which is the outcome we wanted anyway.
-fn kill_process_group(pid: u32) {
+///
+/// `pub(crate)`: `create_diagram` (`diagram.rs`) reuses this rather than
+/// reimplementing the same unsafe platform code a second time -- it shells
+/// out to `mmdc`, which launches a full headless Chromium under the hood,
+/// so a timeout there has exactly the same orphan-process risk `run_shell`
+/// already solved here.
+pub(crate) fn kill_process_group(pid: u32) {
     if pid == 0 {
         return;
     }
@@ -197,7 +203,7 @@ fn kill_process_group(pid: u32) {
 /// Put the child in its own process group so [`kill_process_group`] can
 /// reap its descendants without touching the agent itself. No-op on
 /// Windows, which has no equivalent (see `kill_process_group`).
-fn own_process_group(cmd: &mut Command) {
+pub(crate) fn own_process_group(cmd: &mut Command) {
     #[cfg(unix)]
     {
         cmd.process_group(0);
@@ -363,6 +369,25 @@ pub fn shell_command(command: &str) -> Command {
     }
 }
 
+/// Wraps `s` (a real filesystem path, not arbitrary text) in double quotes
+/// for embedding in a [`shell_command`] string, for the common case of a
+/// path containing a space. Rejects (`None`) anything containing a literal
+/// `"` or a control character rather than attempting to escape it.
+///
+/// `bash -lc` and `cmd /C` don't share one escaping grammar, so there is no
+/// single correct answer for "escape a quote inside a quoted string" that
+/// works identically on both — but there doesn't need to be: a real
+/// filesystem path can't legally contain `"` on Windows at all, so refusing
+/// it here costs nothing for the actual use case (`create_diagram`'s
+/// resolved output paths) and avoids the class of bug plain wrapping alone
+/// would silently mishandle.
+pub(crate) fn shell_quote_path(s: &str) -> Option<String> {
+    if s.is_empty() || s.contains('"') || s.chars().any(|c| c.is_control()) {
+        return None;
+    }
+    Some(format!("\"{s}\""))
+}
+
 /// `Path::canonicalize` on Windows returns a `\\?\C:\...` verbatim path, and
 /// `cmd.exe` refuses to start in one ("UNC paths are not supported"). Strip
 /// the prefix back to a plain `C:\...` for use as a working directory.
@@ -448,6 +473,33 @@ mod tests {
 
     fn args(json: serde_json::Value) -> Box<RawValue> {
         RawValue::from_string(json.to_string()).unwrap()
+    }
+
+    #[test]
+    fn shell_quote_path_wraps_a_plain_path() {
+        assert_eq!(
+            shell_quote_path("/tmp/a.svg"),
+            Some("\"/tmp/a.svg\"".to_string())
+        );
+    }
+
+    #[test]
+    fn shell_quote_path_wraps_a_path_containing_a_space() {
+        assert_eq!(
+            shell_quote_path("/tmp/my diagrams/a.svg"),
+            Some("\"/tmp/my diagrams/a.svg\"".to_string())
+        );
+    }
+
+    #[test]
+    fn shell_quote_path_rejects_an_embedded_quote() {
+        assert_eq!(shell_quote_path("/tmp/weird\"name/a.svg"), None);
+    }
+
+    #[test]
+    fn shell_quote_path_rejects_empty_and_control_characters() {
+        assert_eq!(shell_quote_path(""), None);
+        assert_eq!(shell_quote_path("/tmp/a\nb.svg"), None);
     }
 
     fn bash() -> Bash {
