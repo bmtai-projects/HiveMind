@@ -257,12 +257,40 @@ fn rules_for(extension: &str) -> Option<&'static Rules> {
 }
 
 /// Does this line open a definition? Returns the cleaned-up signature.
+/// `mod auth;` / `pub mod auth;` — a declaration that a sibling file belongs
+/// to this crate, with no body of its own.
+///
+/// Excluded from outlines because it is pure duplication of the tree this
+/// same map already prints: `mod auth;` says exactly what the `auth.rs` line
+/// directly above it says. On a crate root that adds up — `harness-cli`'s
+/// `main.rs` spent 14 of its 40 symbol slots on these, pushing `enum Command`
+/// (the thing a "what commands exist" question actually needs) from position
+/// 5 to position 19, past every cap the ladder can reach. The model then had
+/// no line number to aim at and paged through 1471 lines to find it.
+///
+/// `mod tests { … }` and any other inline module keeps its entry: that one
+/// has a body, so it is real structure rather than a pointer to another file.
+fn is_bare_module_declaration(trimmed: &str) -> bool {
+    let rest = trimmed.strip_prefix("pub ").unwrap_or(trimmed);
+    let rest = match rest.strip_prefix("mod ") {
+        Some(r) => r.trim(),
+        None => return false,
+    };
+    // Only a terminating `;` — `mod tests {` has a body and is kept.
+    rest.strip_suffix(';').is_some_and(|name| {
+        !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_')
+    })
+}
+
 fn is_definition(line: &str, rules: &Rules) -> Option<String> {
     let trimmed = line.trim();
     if trimmed.is_empty() {
         return None;
     }
     if rules.comments.iter().any(|c| trimmed.starts_with(c)) {
+        return None;
+    }
+    if is_bare_module_declaration(trimmed) {
         return None;
     }
 
@@ -523,6 +551,7 @@ fn render_at_density(
 
     let total_symbols: usize = files.iter().map(|f| f.symbols.len()).sum();
     let mut out = format!("{} files, {} definitions\n", files.len(), total_symbols);
+    let mut any_hidden = false;
 
     for (dir, group) in &by_dir {
         out.push_str(&format!("\n{dir}/\n"));
@@ -538,18 +567,34 @@ fn render_at_density(
             }
             let hidden = f.symbols.len().saturating_sub(symbol_cap);
             if hidden > 0 || f.truncated {
-                out.push_str(&format!(
-                    "           … {hidden}+ more definitions; read the file for the rest\n"
-                ));
+                // Just the count. How to get the rest is explained once in
+                // the footer below rather than repeated on every truncated
+                // file -- on this repo that is ~50 files, so an inline hint
+                // costs thousands of characters of the very budget this tool
+                // exists to protect.
+                any_hidden = true;
+                out.push_str(&format!("           … {hidden}+ more definitions\n"));
             }
         }
     }
 
+    if any_hidden {
+        // Said once, at the end. The previous per-file wording was "read the
+        // file for the rest", which is the most expensive advice this tool
+        // can give: on a 1471-line file that is ~19k tokens of input, re-sent
+        // every later turn, to reach one definition. Both routes named here
+        // cost a fraction of it.
+        out.push_str(
+            "\n[to see definitions hidden above: re-run project_map with `path` set to that \
+             file or its directory for a full outline, or read_file with offset/limit to pull \
+             just the lines you need. Reading a whole large file to find one definition is \
+             the expensive way]\n",
+        );
+    }
     if thinned {
         out.push_str(
             "\n[large repo: showing fewer definitions per file so the whole tree fits. \
-             Every file is listed; read a file, or re-run with `path` scoped to one \
-             subdirectory, for its full outline]\n",
+             Every file is listed]\n",
         );
     }
     if hit_file_cap {
@@ -769,6 +814,87 @@ mod tests {
         assert!(out.contains("real"), "{out}");
         assert!(!out.contains("dep"), "node_modules leaked:\n{out}");
         assert!(!out.contains("generated"), "target/ leaked:\n{out}");
+    }
+
+    #[test]
+    fn bare_module_declarations_are_not_definitions() {
+        // `mod auth;` duplicates the `auth.rs` line the tree already prints,
+        // and on a crate root there are enough of them to push the real
+        // structure past every symbol cap.
+        assert!(is_definition("mod auth;", &RUST).is_none());
+        assert!(is_definition("pub mod auth;", &RUST).is_none());
+        assert!(is_definition("  mod deeply_nested;", &RUST).is_none());
+    }
+
+    #[test]
+    fn a_module_with_a_body_is_still_a_definition() {
+        // `mod tests { ... }` is real structure living in this file, not a
+        // pointer to another one.
+        assert!(is_definition("mod tests {", &RUST).is_some());
+        assert!(is_definition("pub mod helpers {", &RUST).is_some());
+    }
+
+    #[tokio::test]
+    async fn a_crate_root_shows_real_structure_not_its_module_list() {
+        // The regression this exists for. main.rs spent 14 of 40 symbol
+        // slots on `mod x;` lines, pushing `enum Command` from position 5 to
+        // 19 -- past any cap -- so a "what commands exist" question had no
+        // line number to aim at and paged the whole 1471-line file.
+        let w = ws("crate_root");
+        let mut body = String::new();
+        for m in ["auth", "banner", "commands", "ui", "input", "diff"] {
+            body.push_str(&format!("mod {m};\n"));
+        }
+        body.push_str("enum Command {\n}\n");
+        std::fs::write(w.root.join("main.rs"), &body).unwrap();
+        std::fs::write(w.root.join("auth.rs"), "pub fn login() {}\n").unwrap();
+
+        let out = ProjectMap(w)
+            .execute(&args(serde_json::json!({})))
+            .await
+            .unwrap();
+
+        assert!(
+            out.contains("enum Command"),
+            "the real structure must show:\n{out}"
+        );
+        assert!(
+            !out.contains("mod auth"),
+            "module list is redundant with the tree:\n{out}"
+        );
+        assert!(
+            out.contains("auth.rs"),
+            "the tree still names the module's file:\n{out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_hidden_definitions_hint_appears_once_not_per_file() {
+        // It used to be printed on every truncated file. On a repo with ~50
+        // such files that is thousands of characters of the exact budget
+        // this tool exists to protect.
+        let w = ws("hint_once");
+        for f in ["a.rs", "b.rs", "c.rs"] {
+            let body: String = (0..MAX_SYMBOLS_PER_FILE + 5)
+                .map(|i| format!("pub fn f{i}() {{}}\n"))
+                .collect();
+            std::fs::write(w.root.join(f), body).unwrap();
+        }
+        let out = ProjectMap(w)
+            .execute(&args(serde_json::json!({})))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            out.matches("more definitions").count(),
+            3,
+            "one count per file"
+        );
+        assert_eq!(
+            out.matches("read_file with offset/limit").count(),
+            1,
+            "but only one explanation:\n{out}"
+        );
     }
 
     #[tokio::test]
