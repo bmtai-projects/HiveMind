@@ -1,9 +1,17 @@
-//! Streaming DeepSeek client — the only concrete backend this harness ships
-//! today. Normalizes DeepSeek's OpenAI-compatible SSE dialect into
-//! [`harness_types`], with connection reuse and transparent retry/backoff.
+//! Streaming client for the OpenAI-compatible Chat Completions dialect —
+//! normalized into [`harness_types`], with connection reuse and transparent
+//! retry/backoff.
 //!
-//! Scoped deliberately: a second provider (OpenAI, Anthropic, xAI — any of
-//! which is wire-compatible or a small adapter away) is a new module behind
+//! One client covers every model in the catalog: hosted models are reached
+//! through HiveMind's own proxy, and BYOK keys talk to their vendor
+//! directly, but both speak the same dialect over `{base_url}/chat/
+//! completions` with a bearer token. Nothing here is specific to any one
+//! provider.
+//!
+//! [`DeepSeekClient`] keeps its name for historical reasons — it was the
+//! first backend wired up — and renaming a type used across four crates has
+//! not been worth the churn. It is not a statement of scope; a provider
+//! speaking a genuinely different wire format would be a new module behind
 //! the same [`DeepSeekClient::stream`] shape, not a rewrite.
 
 mod client;

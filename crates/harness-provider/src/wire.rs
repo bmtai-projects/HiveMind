@@ -1,7 +1,11 @@
-//! DeepSeek's wire dialect (OpenAI Chat Completions-compatible). Kept
-//! separate from [`crate::client`] so the request/response JSON shape is
-//! easy to audit against DeepSeek's docs independent of transport/retry
-//! logic.
+//! The OpenAI Chat Completions wire dialect every backend here speaks.
+//! Kept separate from [`crate::client`] so the request/response JSON shape
+//! is easy to audit against a provider's docs independent of
+//! transport/retry logic.
+//!
+//! Provider-specific *additions* are handled by accepting either spelling
+//! rather than branching on who is answering — see [`WireUsage`] for the
+//! two context-caching shapes.
 
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;

@@ -101,10 +101,11 @@ pub struct ToolSchema {
 }
 
 /// Token accounting for a completed response. `cache_hit_tokens` /
-/// `cache_miss_tokens` come from DeepSeek's context-caching usage fields
-/// (`prompt_cache_hit_tokens` / `prompt_cache_miss_tokens`) — the whole
-/// point of keeping the prompt prefix stable. `None` when a provider
-/// doesn't report them.
+/// `cache_miss_tokens` come from whichever context-caching usage fields the
+/// provider reports — `prompt_cache_hit_tokens`/`prompt_cache_miss_tokens`,
+/// or `prompt_tokens_details.cached_tokens` — which is the whole point of
+/// keeping the prompt prefix stable. `None` when a provider reports
+/// neither.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct Usage {
     pub prompt_tokens: u64,

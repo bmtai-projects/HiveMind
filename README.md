@@ -1,13 +1,23 @@
 # HiveMind
 
-A fast, cost-optimized, DeepSeek-only coding agent — a from-scratch Rust
-harness in the shape of [grok-build](https://x.ai/cli), scoped down to one
-provider and built around one goal: **make an agentic coding loop cheap
-enough to give away.** The CLI binary is called `hivemind`; you run it with
-`hivemind activate`.
+A fast, cost-optimized coding agent — a from-scratch Rust harness in the
+shape of [grok-build](https://x.ai/cli), built around one goal: **make an
+agentic coding loop cheap enough to give away.** The CLI binary is called
+`hivemind`; you run it with `hivemind activate`.
 
-Free while pricing is undecided. Modular by design so a second provider
-(OpenAI, Anthropic, xAI) is a new module later, not a rewrite.
+Seven models are selectable with `--model` / `/model`: `hivemind` — the
+cheap, fast default — plus six third-party coding models (`claude-sonnet-5`,
+`gpt-5.3-codex`, `gemini-3.1-pro`, `grok-build`, `qwen3-coder-plus`,
+`kimi-k2-code`) resold through the hosted proxy. BYOK users point their own
+key at whatever their provider supports.
+
+> **`hivemind` is a brand alias, not a passthrough.** Which upstream model
+> serves it is infrastructure, resolved server-side and deliberately not
+> exposed client-side — the proxy rewrites every stream chunk's `model`
+> field back to the alias (see `HiveMind-server/src/proxy/upstream.ts`), and
+> the agent's own `IDENTITY` prompt tells it to say so plainly rather than
+> guess. Naming the upstream vendor in user-facing copy undoes that on
+> purpose-built work, so don't.
 
 > **This repo is source-only and private.** Compiled binaries are published
 > to the public [`HiveMind-releases`](https://github.com/BibhabenduMukherjee/HiveMind-releases)
@@ -15,25 +25,28 @@ Free while pricing is undecided. Modular by design so a second provider
 > lives. See [Distributing a release](#distributing-a-release) for how the
 > two repos connect.
 
-## Why DeepSeek-only, for now
+## Why it's cheap
 
 Model choice isn't what makes Cursor/Claude expensive — **re-sent context**
 is. Every turn of an agent loop resends the whole growing conversation, and
 by mid-session that's tens of thousands of tokens billed on every call. Two
 things close that gap almost entirely:
 
-1. **Prompt-prefix caching.** DeepSeek caches automatically and bills
-   cache-hit prompt tokens at roughly **1/50th** the cache-miss rate. Keep
-   the prefix (system prompt, tool schemas) byte-stable turn to turn and
-   most of a session's input tokens land in that discount.
+1. **Prompt-prefix caching.** Cache-hit prompt tokens bill at roughly
+   **1/50th** the cache-miss rate. Keep the prefix (system prompt, tool
+   schemas) byte-stable turn to turn and most of a session's input tokens
+   land in that discount. Most providers do this automatically; the ones
+   that need an explicit breakpoint are flagged per-model by
+   `needs_explicit_cache_control` in the catalog.
 2. **Compaction.** Once a session's usage crosses a threshold, fold older
    turns into one summary instead of re-sending (and re-billing) them
    forever.
 
-DeepSeek V4 Flash at ~$0.14/$0.28 per M tokens (cache-hit ~$0.0028/M) makes a
-full coding session cost cents, not dollars — cheap enough to run the whole
-product on before pricing is even decided. See [Optimizations](#optimizations-implemented)
-for what's actually wired up.
+On the default model that puts a full coding session in cents, not dollars.
+Real per-model rates live in `KNOWN_MODELS`
+([`harness-config/src/lib.rs`](crates/harness-config/src/lib.rs)) — the
+single source of truth, so quoting numbers here would just rot. See
+[Optimizations](#optimizations-implemented) for what's actually wired up.
 
 ## Quick start
 
@@ -58,11 +71,15 @@ cargo build --release -p harness-cli
 ### Run
 
 ```sh
-export DEEPSEEK_API_KEY=sk-...
+hivemind auth login                            # hosted: no provider key of your own
+# or, BYOK:
+export HIVEMIND_API_KEY=sk-...                 # $DEEPSEEK_API_KEY still works (legacy)
 
-hivemind activate                              # interactive REPL, starts on Flash
+hivemind activate                              # interactive REPL, on the default model
 hivemind activate -p "summarize src/main.rs"   # headless one-shot
-hivemind activate --tier pro                   # start on the stronger tier
+hivemind activate --model claude-sonnet-5      # start on a specific model
+hivemind activate --continue                   # resume the last session here
+hivemind models                                # what's selectable
 ```
 
 No config file is required. To customize models, thresholds, or a proxy
@@ -75,23 +92,23 @@ Every one of these is real, wired-up behavior — not a roadmap item:
 
 | Optimization | Where | Effect |
 |---|---|---|
-| **Prefix-stable requests + cache-hit visibility** | [`harness-cli/src/ui.rs`](crates/harness-cli/src/ui.rs), [`harness-provider/src/wire.rs`](crates/harness-provider/src/wire.rs) | Tool schemas serialize in sorted, deterministic order; DeepSeek's `prompt_cache_hit_tokens`/`prompt_cache_miss_tokens` are parsed and shown live (`cache 92%`) so the win is visible, not assumed. |
-| **Context compaction** | [`harness-agent/src/compaction.rs`](crates/harness-agent/src/compaction.rs) | At `compaction_threshold_percent` (default 75%) of the context window, older turns are folded into one model-generated summary via a cheap Flash call — never silently truncated, never re-billed forever. |
-| **Anchored edits over full rewrites** | [`harness-tools/src/edit.rs`](crates/harness-tools/src/edit.rs) | `edit_file` replaces just an `old_string`→`new_string` span, so modifying a file emits tens of output tokens instead of re-emitting the whole thing. Output is the priciest token class (never cached), which makes this the largest single lever on a coding session's cost — and it can't corrupt untouched code, so fewer botched edits means fewer retry turns and less Pro escalation. |
-| **Two-tier routing with auto-escalation** | [`harness-agent/src/agent.rs`](crates/harness-agent/src/agent.rs) | Every task starts on Flash. If the model repeats an identical tool call or hits repeated tool errors (a doom-loop symptom), the harness auto-escalates to Pro for that task only, then resets to Flash on the next input. |
+| **Prefix-stable requests + cache-hit visibility** | [`harness-cli/src/ui.rs`](crates/harness-cli/src/ui.rs), [`harness-provider/src/wire.rs`](crates/harness-provider/src/wire.rs) | Tool schemas serialize in sorted, deterministic order; the provider's `prompt_cache_hit_tokens`/`prompt_cache_miss_tokens` are parsed and shown live (`cache 92%`) so the win is visible, not assumed. |
+| **Context compaction** | [`harness-agent/src/compaction.rs`](crates/harness-agent/src/compaction.rs) | At `compaction_threshold_percent` (default 75%) of the context window, older turns are folded into one model-generated summary via a cheap model call — never silently truncated, never re-billed forever. |
+| **Anchored edits over full rewrites** | [`harness-tools/src/edit.rs`](crates/harness-tools/src/edit.rs) | `edit_file` replaces just an `old_string`→`new_string` span, so modifying a file emits tens of output tokens instead of re-emitting the whole thing. Output is the priciest token class (never cached), which makes this the largest single lever on a coding session's cost — and it can't corrupt untouched code, so fewer botched edits means fewer retry turns and less escalation. |
+| **Auto-escalation off the cheap default** | [`harness-agent/src/agent.rs`](crates/harness-agent/src/agent.rs) | Every task starts on the cheap default. If the model repeats an identical tool call or hits repeated tool errors (a doom-loop symptom), the harness escalates to `escalate_to_model` for that task only, then resets on the next input. Scoped to rescuing the default: it never fires once a user has explicitly picked a model, since that could be a much bigger cost jump than they expect. |
 | **Parallel tool dispatch** | [`harness-tools/src/tool.rs`](crates/harness-tools/src/tool.rs) | Multiple tool calls in one turn run concurrently via `tokio::JoinSet`, then are reassembled in original call order — concurrent latency, deterministic transcript. |
 | **Retry/backoff with jitter** | [`harness-provider/src/retry.rs`](crates/harness-provider/src/retry.rs) | 429/5xx/network errors retry with exponential backoff + jitter, honoring a server's `Retry-After` header, surfaced to the UI via a retry hook. |
 | **Connection reuse** | [`harness-provider/src/client.rs`](crates/harness-provider/src/client.rs) | One pooled `reqwest::Client` per process — every request, retry, and background summarization call reuses keep-alive HTTP connections. |
 | **Zero-clone request path** | [`harness-provider/src/client.rs`](crates/harness-provider/src/client.rs) | The provider borrows the conversation only long enough to serialize it; sending a turn never clones the (potentially large) message history. Retries resend a cheaply-refcounted `Bytes` body, not a re-copy. |
-| **Live cost readout** | [`harness-cli/src/ui.rs`](crates/harness-cli/src/ui.rs) | Every response line shows `$turn / $session` cost, computed from real usage × tier pricing — the point of all of the above is a number you can watch stay small. |
+| **Live cost readout** | [`harness-cli/src/ui.rs`](crates/harness-cli/src/ui.rs) | Every response line shows `$turn / $session` cost, computed from real usage × that model's pricing — the point of all of the above is a number you can watch stay small. |
 
 ## Architecture
 
 ```
 crates/
   harness-types      provider-neutral wire model (Message, ToolCall, Usage, StreamEvent)
-  harness-config     config.toml + env resolution: DeepSeek Flash/Pro catalog, keys, policy
-  harness-provider   the DeepSeek streaming client: SSE decode, retries, connection reuse
+  harness-config     config.toml + env resolution: model catalog, keys, policy
+  harness-provider   the streaming client: SSE decode, retries, connection reuse
   harness-tools      the Tool trait, registry, parallel dispatch, fs + shell builtins
   harness-agent      the sample<->tools loop: compaction, tiering/escalation, doom-loop guard
   harness-cli        the `hivemind` binary (activate subcommand): clap args, REPL/headless, terminal UI, cost display
@@ -105,12 +122,18 @@ implements. No crate reaches back up the stack.
 
 ### Provider abstraction, kept honest
 
-There's no `Provider` trait today — `Agent` is concretely typed against
-`DeepSeekClient`, on purpose, per the current one-provider scope. Adding a
-second provider means: define its wire dialect in a new module (mirroring
-[`harness-provider/src/wire.rs`](crates/harness-provider/src/wire.rs)), then
-introduce the trait `Agent` needs at that point. Not before — an
-abstraction with one implementation is just indirection.
+There's no `Provider` trait today — `Agent` is concretely typed against a
+single client, on purpose. Every model in the catalog is reached over the
+same OpenAI-compatible Chat Completions dialect (hosted models via the
+proxy, BYOK straight to the vendor), so one client covers all of them and a
+trait would be an abstraction with one implementation. A provider speaking a
+genuinely different wire format means: define its dialect in a new module
+(mirroring [`harness-provider/src/wire.rs`](crates/harness-provider/src/wire.rs)),
+then introduce the trait `Agent` needs at that point. Not before.
+
+The client type is still named `DeepSeekClient` — a historical name from
+when that was the only backend, not a statement of scope. It speaks the
+generic dialect described above.
 
 ## Tools
 
@@ -141,17 +164,25 @@ Seven built-ins, all workspace-confined (`--workdir`, default `.`):
 
 ## Flags
 
-All of these are flags on `hivemind activate`, e.g. `hivemind activate --tier pro`.
+All of these are flags on `hivemind activate`, e.g.
+`hivemind activate --model claude-sonnet-5`. `hivemind activate --help` is
+the authoritative list; this table is a summary.
 
 | Flag | Meaning |
 |---|---|
 | `-p, --prompt` | Run one prompt headlessly (auto-approves shell), then exit. |
 | `--workdir` | Workspace root. Default `.`. |
 | `--config` | Config file path. Default `~/.config/hivemind/config.toml`. |
-| `--tier` | Start on `flash` (default) or `pro`. |
+| `--model` | Model to start on. `hivemind models` lists what's selectable. |
 | `--api-key` / `--base-url` | Override resolved endpoint (e.g. point at a proxy or local mock). |
 | `--yolo` | Auto-approve all shell commands. Off by default. |
-| `--show-reasoning` | Print streamed chain-of-thought (deepseek-v4-pro). |
+| `--reasoning-effort` | Thinking depth on models that support it. Opt-in: slower and pricier. |
+| `--show-reasoning` | Also dump the raw reasoning text, on models that emit it. |
+| `--budget` | Hard USD cap for the session. Stops at a turn boundary, never mid-edit. |
+| `--mode` | `standard` (default, local and free) or `pro` (hosted embeddings, billed). |
+| `--continue` | Resume the most recent session for this workspace. |
+| `--resume <ID>` | Resume one specific session (see `hivemind sessions`). |
+| `--protocol json` | Speak NDJSON on stdin/stdout instead of the REPL — what the VS Code extension uses. |
 
 ## Development
 
@@ -194,7 +225,7 @@ existing seam:
 - **Neural `semantic_search`** — the retrieval pipeline (chunk/index/cosine/cache) is shipped behind an `Embedder` trait with a lean local default; swapping in a real embedding model (`fastembed`/BGE locally, or a hosted embeddings API) behind a cargo feature makes it truly semantic. Persist the index to disk to skip the cold-start rebuild.
 - **MCP client** — mount external tool servers.
 - **Session persistence** — `Agent::history()` already exposes the full transcript; save/resume is a serialization layer away.
-- **Explicit `anthropic-style` cache breakpoints** — not needed for DeepSeek (caching is automatic), but relevant the moment a second provider needs it.
+- **Explicit `anthropic-style` cache breakpoints** — wired up and gated per-model by `needs_explicit_cache_control`; most models cache automatically and must not be sent it.
 - **A `/cost` and `/tier` REPL command** — the pricing and tier machinery already exists in `harness-config`/`harness-cli/src/ui.rs`; this is UI wiring, not new logic.
 
 ## License

@@ -20,7 +20,7 @@ pub type EventStream = UnboundedReceiver<Result<StreamEvent, ProviderError>>;
 /// depending on a logging framework or knowing about terminals.
 pub type RetryHook = Arc<dyn Fn(u32, u32, Duration, &ProviderError) + Send + Sync>;
 
-/// Streaming DeepSeek client. Holds one [`reqwest::Client`] — cloning
+/// Streaming Chat Completions client. Holds one [`reqwest::Client`] — cloning
 /// `DeepSeekClient` clones an `Arc`-backed handle to the same connection
 /// pool, so every request (including retries and concurrent tool-triggered
 /// escalation calls) reuses keep-alive HTTP/2 connections rather than
