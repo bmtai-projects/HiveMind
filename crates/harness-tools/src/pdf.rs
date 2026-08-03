@@ -46,10 +46,25 @@ struct PdfArgs {
     path: String,
     #[serde(default)]
     title: Option<String>,
+    /// Inline content. Optional so a long document can come from
+    /// `from_file` instead -- see that field for why that matters.
+    #[serde(default)]
     blocks: Vec<Block>,
+    /// Workspace-relative Markdown file to render instead of `blocks`.
+    ///
+    /// A multi-page document passed inline is a single tool call whose
+    /// arguments run to tens of thousands of tokens, and a model that hits
+    /// its output cap partway through loses the entire call (the arguments
+    /// are truncated mid-JSON and discarded). Sourcing from a file lets the
+    /// content be built up incrementally with `write_file`/`edit_file` --
+    /// no single oversized call, and a later correction rewrites one
+    /// section instead of regenerating the whole document. Markdown is also
+    /// simply cheaper per unit of content than the equivalent block JSON.
+    #[serde(default)]
+    from_file: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Debug)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum Block {
     Heading {
@@ -78,13 +93,18 @@ impl Tool for CreatePdf {
         "create_pdf"
     }
     fn description(&self) -> &str {
-        "Create a real PDF document (report, memo, invoice) at a workspace-relative path from \
-         structured content -- no external tools required. `blocks` is an array of objects, each \
-         with a \"type\" field: {\"type\":\"heading\",\"text\":...}, \
-         {\"type\":\"paragraph\",\"text\":...}, {\"type\":\"bullets\",\"items\":[...]}, or \
-         {\"type\":\"table\",\"headers\":[...],\"rows\":[[...], ...]}. Content flows across as \
-         many pages as needed automatically. For layouts this can't express (charts, images, \
-         precise pixel layout), write and run a script instead."
+        "Create a real PDF document (report, memo, invoice) at a workspace-relative path -- no \
+         external tools required. Two ways to supply content. For anything longer than about a \
+         page, use `from_file`: write the document as Markdown with write_file/edit_file first, \
+         then point `from_file` at it. This is required for multi-page documents -- passing a \
+         long document inline instead will hit the output token limit mid-call and lose the \
+         whole thing. Headings (#/##/###), paragraphs, bullets (-/*), and | pipe | tables | are \
+         understood. For short content, pass `blocks` inline: an array of objects, each with a \
+         \"type\" field: {\"type\":\"heading\",\"text\":...}, {\"type\":\"paragraph\",\
+         \"text\":...}, {\"type\":\"bullets\",\"items\":[...]}, or {\"type\":\"table\",\
+         \"headers\":[...],\"rows\":[[...], ...]}. Content flows across as many pages as needed \
+         automatically. For layouts this can't express (charts, images, precise pixel layout), \
+         write and run a script instead."
     }
     fn schema(&self) -> serde_json::Value {
         obj_schema(
@@ -101,12 +121,19 @@ impl Tool for CreatePdf {
                     "blocks",
                     serde_json::json!({
                         "type": "array",
-                        "description": "content blocks in order -- see tool description for the exact shape of each type",
+                        "description": "inline content blocks in order, for short documents only -- see tool description for the exact shape of each type. Omit when using from_file.",
                         "items": {"type": "object"},
                     }),
                 ),
+                (
+                    "from_file",
+                    serde_json::json!({
+                        "type": "string",
+                        "description": "workspace-relative Markdown file to render, e.g. \"draft.md\". Preferred for anything over a page; write the file first, then call this. Omit when using blocks.",
+                    }),
+                ),
             ],
-            &["path", "blocks"],
+            &["path"],
         )
     }
     async fn execute(&self, args: &RawValue) -> Result<String, ToolError> {
@@ -115,7 +142,24 @@ impl Tool for CreatePdf {
             return Err(ToolError::Message("path is required".into()));
         }
 
-        let pages = render_pages(a.title.as_deref(), &a.blocks);
+        let blocks = match &a.from_file {
+            Some(src) => {
+                let p = self.0.resolve(src)?;
+                let text = tokio::fs::read_to_string(&p).await.map_err(|e| {
+                    ToolError::Message(format!("could not read from_file '{src}': {e}"))
+                })?;
+                parse_markdown(&text)
+            }
+            None => a.blocks,
+        };
+        if blocks.is_empty() {
+            return Err(ToolError::Message(
+                "no content -- pass `blocks`, or `from_file` naming a non-empty Markdown file"
+                    .into(),
+            ));
+        }
+
+        let pages = render_pages(a.title.as_deref(), &blocks);
         let page_count = pages.len();
         let mut doc = PdfDocument::new(a.title.as_deref().unwrap_or("document"));
         doc.with_pages(
@@ -218,6 +262,147 @@ impl Layout {
             self.indented_text_line(&line, font, size, indent);
         }
     }
+}
+
+/// Drop the inline Markdown this renderer has no way to express. Emphasis
+/// and code markers become their plain text and links keep their label --
+/// every one of these would otherwise be drawn literally, since the page
+/// only ever gets one font weight per block.
+fn strip_inline(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '*' | '`' => {}
+            '[' => {
+                // `[label](url)` -- the label is the only part a printed
+                // page can use.
+                let label: String = chars.by_ref().take_while(|c| *c != ']').collect();
+                out.push_str(&label);
+                if chars.peek() == Some(&'(') {
+                    for c in chars.by_ref() {
+                        if c == ')' {
+                            break;
+                        }
+                    }
+                }
+            }
+            _ => out.push(c),
+        }
+    }
+    out.trim().to_string()
+}
+
+/// True for a `|---|:--:|` alignment row, which carries no content.
+fn is_table_separator(cells: &[String]) -> bool {
+    !cells.is_empty()
+        && cells
+            .iter()
+            .all(|c| !c.is_empty() && c.chars().all(|ch| ch == '-' || ch == ':'))
+}
+
+/// Parse the Markdown subset that maps onto [`Block`]: ATX headings,
+/// blank-line-separated paragraphs, `-`/`*`/`1.` lists, and pipe tables.
+///
+/// Deliberately hand-rolled rather than a Markdown crate: the target is
+/// four block types with no inline styling, so a full CommonMark parse
+/// would produce a tree that is almost entirely discarded again. Anything
+/// unrecognized degrades to paragraph text rather than being dropped.
+fn parse_markdown(src: &str) -> Vec<Block> {
+    let mut blocks = Vec::new();
+    let mut para: Vec<String> = Vec::new();
+    let mut bullets: Vec<String> = Vec::new();
+    let mut table: Vec<Vec<String>> = Vec::new();
+
+    fn flush_para(blocks: &mut Vec<Block>, para: &mut Vec<String>) {
+        if !para.is_empty() {
+            blocks.push(Block::Paragraph {
+                text: para.join(" "),
+            });
+            para.clear();
+        }
+    }
+    fn flush_bullets(blocks: &mut Vec<Block>, bullets: &mut Vec<String>) {
+        if !bullets.is_empty() {
+            blocks.push(Block::Bullets {
+                items: std::mem::take(bullets),
+            });
+        }
+    }
+    fn flush_table(blocks: &mut Vec<Block>, table: &mut Vec<Vec<String>>) {
+        if table.is_empty() {
+            return;
+        }
+        let mut rows = std::mem::take(table);
+        let headers = rows.remove(0);
+        blocks.push(Block::Table { headers, rows });
+    }
+
+    for raw in src.lines() {
+        let line = raw.trim();
+
+        if line.is_empty() {
+            flush_para(&mut blocks, &mut para);
+            flush_bullets(&mut blocks, &mut bullets);
+            flush_table(&mut blocks, &mut table);
+            continue;
+        }
+
+        // Pipe table row. Checked before headings so a cell starting with
+        // `#` isn't mistaken for one.
+        if line.starts_with('|') && line.len() > 1 {
+            let cells: Vec<String> = line
+                .trim_matches('|')
+                .split('|')
+                .map(strip_inline)
+                .collect();
+            if is_table_separator(&cells) {
+                continue;
+            }
+            flush_para(&mut blocks, &mut para);
+            flush_bullets(&mut blocks, &mut bullets);
+            table.push(cells);
+            continue;
+        }
+
+        if let Some(rest) = line.strip_prefix('#') {
+            flush_para(&mut blocks, &mut para);
+            flush_bullets(&mut blocks, &mut bullets);
+            flush_table(&mut blocks, &mut table);
+            blocks.push(Block::Heading {
+                text: strip_inline(rest.trim_start_matches('#')),
+            });
+            continue;
+        }
+
+        // `- item`, `* item`, or `1. item`. Ordered lists render with the
+        // same bullet glyph: the alternative is a paragraph run-on, and
+        // losing the numbering is much the smaller loss.
+        let bullet_text = line
+            .strip_prefix("- ")
+            .or_else(|| line.strip_prefix("* "))
+            .map(str::to_string)
+            .or_else(|| {
+                let (num, rest) = line.split_once(". ")?;
+                (!num.is_empty() && num.chars().all(|c| c.is_ascii_digit()))
+                    .then(|| rest.to_string())
+            });
+        if let Some(text) = bullet_text {
+            flush_para(&mut blocks, &mut para);
+            flush_table(&mut blocks, &mut table);
+            bullets.push(strip_inline(&text));
+            continue;
+        }
+
+        flush_bullets(&mut blocks, &mut bullets);
+        flush_table(&mut blocks, &mut table);
+        para.push(strip_inline(line));
+    }
+
+    flush_para(&mut blocks, &mut para);
+    flush_bullets(&mut blocks, &mut bullets);
+    flush_table(&mut blocks, &mut table);
+    blocks
 }
 
 fn render_pages(title: Option<&str>, blocks: &[Block]) -> Vec<Vec<Op>> {
@@ -498,5 +683,133 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::Message(_)));
+    }
+
+    #[test]
+    fn markdown_maps_onto_every_block_type() {
+        let blocks = parse_markdown(
+            "# Title\n\nFirst paragraph, which\nwraps across source lines.\n\n\
+             - one\n- two\n\n| A | B |\n|---|---|\n| 1 | 2 |\n",
+        );
+        assert_eq!(blocks.len(), 4);
+        assert!(matches!(&blocks[0], Block::Heading { text } if text == "Title"));
+        // Soft-wrapped source lines are one paragraph, not two.
+        assert!(matches!(&blocks[1], Block::Paragraph { text }
+                if text == "First paragraph, which wraps across source lines."));
+        assert!(matches!(&blocks[2], Block::Bullets { items } if items.len() == 2));
+        match &blocks[3] {
+            Block::Table { headers, rows } => {
+                assert_eq!(headers, &["A", "B"]);
+                assert_eq!(rows, &[vec!["1".to_string(), "2".to_string()]]);
+            }
+            other => panic!("expected a table, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn inline_markup_does_not_reach_the_page_literally() {
+        let blocks = parse_markdown("Plain **bold**, `code`, and a [label](http://x.dev).");
+        assert!(matches!(&blocks[0], Block::Paragraph { text }
+                if text == "Plain bold, code, and a label."));
+    }
+
+    #[test]
+    fn ordered_lists_become_one_list_not_a_run_on_paragraph() {
+        let blocks = parse_markdown("1. first\n2. second\n3. third\n");
+        assert_eq!(blocks.len(), 1);
+        assert!(matches!(&blocks[0], Block::Bullets { items } if items.len() == 3));
+    }
+
+    #[tokio::test]
+    async fn from_file_renders_a_markdown_document() {
+        let w = ws("from_file");
+        let root = w.root.clone();
+        std::fs::write(
+            root.join("draft.md"),
+            "# Chapter 1\n\nSome prose.\n\n- a\n- b\n",
+        )
+        .unwrap();
+
+        let out = CreatePdf(w)
+            .execute(&args(serde_json::json!({
+                "path": "out.pdf",
+                "title": "Guide",
+                "from_file": "draft.md",
+            })))
+            .await
+            .unwrap();
+
+        assert!(out.contains("out.pdf"), "unexpected summary: {out}");
+        let bytes = std::fs::read(root.join("out.pdf")).unwrap();
+        assert!(bytes.starts_with(b"%PDF-"));
+    }
+
+    #[tokio::test]
+    async fn content_with_neither_blocks_nor_from_file_is_rejected() {
+        // Previously `blocks` was schema-required, so this shape could not
+        // arrive; now that it's optional, an empty call must still fail
+        // loudly rather than writing a blank document.
+        let w = ws("no_content");
+        let err = CreatePdf(w)
+            .execute(&args(serde_json::json!({"path": "out.pdf"})))
+            .await
+            .unwrap_err();
+        let ToolError::Message(m) = &err else {
+            panic!("expected a message error, got {err:?}")
+        };
+        assert!(m.contains("from_file"), "unhelpful message: {m}");
+    }
+
+    #[tokio::test]
+    async fn a_missing_from_file_names_the_file_it_could_not_read() {
+        let w = ws("missing_src");
+        let err = CreatePdf(w)
+            .execute(&args(
+                serde_json::json!({"path": "out.pdf", "from_file": "nope.md"}),
+            ))
+            .await
+            .unwrap_err();
+        assert!(format!("{err:?}").contains("nope.md"), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn a_multipage_document_comes_from_one_small_call() {
+        // The regression this whole path exists for. The same content as an
+        // inline `blocks` argument is ~15k characters -- a single tool call
+        // large enough to be cut off at the output limit, which discards it
+        // entirely. Sourced from a file, the call is under 100 characters
+        // no matter how long the document gets.
+        let w = ws("multipage");
+        let root = w.root.clone();
+
+        let mut md = String::new();
+        for ch in 1..=12 {
+            md.push_str(&format!("# Chapter {ch}\n\n"));
+            for p in 1..=4 {
+                md.push_str(&format!(
+                    "Paragraph {p} of chapter {ch}. Market research is the discipline of \
+                     letting data decide what to build, and it breaks into qualitative and \
+                     quantitative halves that answer quite different questions.\n\n"
+                ));
+            }
+            md.push_str("- Define your hypothesis\n- Interview 15 people\n\n");
+            md.push_str("| Dimension | Definition |\n|---|---|\n| TAM | Total addressable |\n\n");
+        }
+        std::fs::write(root.join("guide.md"), &md).unwrap();
+
+        let call = serde_json::json!({
+            "path": "guide.pdf",
+            "title": "Guide",
+            "from_file": "guide.md",
+        });
+        assert!(call.to_string().len() < 100, "the call itself stays tiny");
+
+        let out = CreatePdf(w).execute(&args(call)).await.unwrap();
+        assert!(out.contains("pages"), "expected multiple pages: {out}");
+        assert!(
+            std::fs::read(root.join("guide.pdf"))
+                .unwrap()
+                .starts_with(b"%PDF-")
+        );
     }
 }

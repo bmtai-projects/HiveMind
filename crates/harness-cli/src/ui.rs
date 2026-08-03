@@ -199,6 +199,13 @@ impl Ui for TermUi {
         );
     }
 
+    fn output_limit_truncated(&self) {
+        self.clear_preview();
+        println!(
+            "\x1b[33m  ↯ hit the output limit mid-tool-call — dropped it and asked for smaller steps\x1b[0m"
+        );
+    }
+
     fn model_escalated(&self, from: &str, to: &str, reason: &str) {
         println!("\x1b[35m  ⤴ escalating {from} → {to}: {reason}\x1b[0m");
     }

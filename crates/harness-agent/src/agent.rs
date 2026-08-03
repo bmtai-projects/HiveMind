@@ -46,6 +46,22 @@ reconsider before calling another tool:
 State in one sentence what you are going to do differently, then do it.
 </harness-note>";
 
+/// Returned in place of every tool result when a turn was cut off at the
+/// output limit. Names the cause (the model cannot otherwise tell a
+/// truncated argument from one it malformed itself) and points at the
+/// specific escape hatch, because the default recovery -- resend, slightly
+/// shorter -- usually truncates again and costs another full generation.
+const TRUNCATED_TOOL_CALL: &str = "\
+ERROR: your response hit the output token limit mid-tool-call, so this
+call's arguments were cut off and discarded. Nothing ran.
+
+Do not resend the same call. Split the work instead:
+- Writing a long document? Build the text with write_file, then append the
+  rest with edit_file, and only then call create_pdf with `from_file`
+  pointing at it. Never pass a whole document as inline `blocks`.
+- Otherwise: make this call carry less content, and do it across several
+  calls.";
+
 pub struct Agent {
     client: DeepSeekClient,
     tools: Registry,
@@ -431,6 +447,16 @@ impl Agent {
 
             let calls_for_dispatch = resp.tool_calls.clone();
             let has_tool_calls = !calls_for_dispatch.is_empty();
+            // "length" means the provider stopped us at the output cap, so
+            // whatever was mid-generation is incomplete. For a tool call
+            // that means its JSON arguments were cut off, and `wire::
+            // finalize_args` has already replaced them with `{}` to keep
+            // the decoder alive -- by here the real arguments are simply
+            // gone. Dispatching that is guaranteed waste: it fails on a
+            // generic deserialize error that says nothing about *why*, so
+            // the model re-emits the same oversized call and truncates
+            // again, for as many turns as it has left.
+            let truncated = resp.finish_reason == "length";
 
             self.messages.push(Message {
                 role: Role::Assistant,
@@ -440,6 +466,25 @@ impl Agent {
                 tool_call_id: None,
                 name: None,
             });
+
+            if truncated && has_tool_calls {
+                self.ui.output_limit_truncated();
+                // Every tool_call still needs a matching result or the next
+                // request is malformed, so answer each one -- but with the
+                // actual diagnosis instead of a parse error.
+                for call in &calls_for_dispatch {
+                    self.messages.push(Message::tool_result(
+                        call.id.clone(),
+                        call.name.clone(),
+                        TRUNCATED_TOOL_CALL.to_string(),
+                    ));
+                }
+                // Deliberately not counted toward escalation: this isn't a
+                // model being stuck, and switching to a pricier model just
+                // regenerates the same oversized argument at a higher rate.
+                self.persist();
+                continue;
+            }
 
             if !has_tool_calls {
                 checkpoint::push(&mut self.checkpoints, checkpoint);
@@ -914,6 +959,30 @@ mod tests {
         assert!(
             STALL_NUDGE.contains("change the approach"),
             "must say to change approach, not retry harder"
+        );
+    }
+
+    #[test]
+    fn the_truncation_error_names_the_cause_and_the_way_out() {
+        // This text is the whole mechanism: the model cannot otherwise see
+        // that it was cut off, and its default recovery (resend, a bit
+        // shorter) truncates again at full generation cost. Losing either
+        // half in a reword puts the doom-loop straight back.
+        assert!(
+            TRUNCATED_TOOL_CALL.contains("output token limit"),
+            "must name why the call vanished"
+        );
+        assert!(
+            TRUNCATED_TOOL_CALL.contains("Do not resend the same call"),
+            "must forbid the retry that re-triggers this"
+        );
+        assert!(
+            TRUNCATED_TOOL_CALL.contains("from_file"),
+            "must point at the escape hatch for long documents"
+        );
+        assert!(
+            TRUNCATED_TOOL_CALL.starts_with("ERROR:"),
+            "tool results are classified by this prefix"
         );
     }
 }

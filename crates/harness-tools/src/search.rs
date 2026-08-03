@@ -83,11 +83,7 @@ impl Tool for Search {
             .unwrap_or(DEFAULT_MAX_RESULTS)
             .clamp(1, MAX_RESULTS_CAP);
 
-        // Resolve the walk root (honoring the optional `path`) and the base to
-        // report paths relative to (always the workspace root). Both go
-        // through `Workspace::resolve`, so both are canonical and boundary-
-        // checked — stripping a canonical base off a canonical entry yields a
-        // clean workspace-relative path regardless of symlinked temp dirs.
+        
         let search_root = match &a.path {
             Some(p) if !p.is_empty() => self.0.resolve(p)?,
             _ => self.0.resolve(".")?,
