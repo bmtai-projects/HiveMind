@@ -39,8 +39,8 @@ pub trait Tool: Send + Sync {
 
 /// Registered tools, keyed by name in a `BTreeMap` so [`Registry::schemas`]
 /// is name-sorted — a deliberately stable order, since the tool manifest
-/// sits in the prompt prefix DeepSeek's context cache keys on. Reordering
-/// tools between turns would silently break the cache hit rate.
+/// sits in the prompt prefix that providers' context caches key on.
+/// Reordering tools between turns would silently break the cache hit rate.
 #[derive(Clone, Default)]
 pub struct Registry {
     tools: BTreeMap<String, Arc<dyn Tool>>,
@@ -239,7 +239,11 @@ mod dispatch_tests {
     }
 
     fn ws(name: &str) -> Workspace {
-        let dir = std::env::temp_dir().join(format!("hivemind_dispatch_test_{name}"));
+        let dir = std::env::temp_dir().join(format!(
+            "hivemind_dispatch_test_{name}_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         Workspace::new(dir)
