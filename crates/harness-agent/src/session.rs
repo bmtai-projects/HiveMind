@@ -216,6 +216,94 @@ impl SessionStore {
         let newest = self.list_for_workspace(workspace).into_iter().next()?;
         self.load(&newest.id).ok()
     }
+
+    /// Delete one session by id. `Ok(false)` if it was already gone --
+    /// deleting something twice is the caller getting what they asked for,
+    /// not an error worth propagating.
+    pub fn delete(&self, id: &str) -> Result<bool, SessionError> {
+        let path = self.path_for(id);
+        match std::fs::remove_file(&path) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(source) => Err(SessionError::Io {
+                path: path.display().to_string(),
+                source,
+            }),
+        }
+    }
+
+    /// Every session in the store regardless of workspace, newest first.
+    /// Retention is a property of the whole store, not of whichever project
+    /// happens to be open, so pruning cannot use `list_for_workspace`.
+    pub fn list_all(&self) -> Vec<SessionSummary> {
+        let Ok(entries) = std::fs::read_dir(&self.dir) else {
+            return Vec::new();
+        };
+        let mut out: Vec<SessionSummary> = entries
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+            .filter_map(|e| {
+                let bytes = std::fs::read(e.path()).ok()?;
+                let rec: SessionRecord = serde_json::from_slice(&bytes).ok()?;
+                Some(SessionSummary {
+                    id: rec.id.clone(),
+                    title: rec.title.clone(),
+                    updated_at: rec.updated_at,
+                    turns: rec.turn_count(),
+                    cost_usd: rec.session_cost_usd,
+                })
+            })
+            .collect();
+        out.sort_by_key(|s| std::cmp::Reverse(s.updated_at));
+        out
+    }
+
+    /// Delete every session across all workspaces last updated more than
+    /// `max_age_secs` ago, returning the ids removed. Ids in `keep` are
+    /// never deleted however old they are — a host with those conversations
+    /// open right now would otherwise have one vanish from under a live
+    /// window mid-session.
+    ///
+    /// Keyed on `updated_at` from the record, not the file's mtime: a
+    /// backup/restore, a `cp -r`, or a sync client rewrites mtimes wholesale
+    /// and would otherwise either wipe the store at once or keep it alive
+    /// forever. The record's own timestamp is the only one that tracks when
+    /// the *conversation* was last touched.
+    ///
+    /// A file that cannot be read or parsed is left alone: there is no way
+    /// to tell a corrupt record's age, and silently deleting unreadable user
+    /// data is a worse failure than keeping it.
+    pub fn prune_older_than_except(&self, max_age_secs: u64, keep: &[String]) -> Vec<String> {
+        let Ok(entries) = std::fs::read_dir(&self.dir) else {
+            return Vec::new();
+        };
+        let now = unix_now();
+        let mut removed = Vec::new();
+        for entry in entries.filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if path.extension().is_none_or(|x| x != "json") {
+                continue;
+            }
+            let Ok(bytes) = std::fs::read(&path) else {
+                continue;
+            };
+            let Ok(rec) = serde_json::from_slice::<SessionRecord>(&bytes) else {
+                continue;
+            };
+            if keep.contains(&rec.id) {
+                continue;
+            }
+            // `saturating_sub`: a record written by a machine with a skewed
+            // clock can be dated in the future, which must read as age 0
+            // (keep) rather than wrapping to a huge age (delete).
+            if now.saturating_sub(rec.updated_at) > max_age_secs
+                && std::fs::remove_file(&path).is_ok()
+            {
+                removed.push(rec.id);
+            }
+        }
+        removed
+    }
 }
 
 pub fn unix_now() -> u64 {
@@ -401,5 +489,105 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o600, "a transcript can contain anything it read");
+    }
+
+    /// Age is measured from `updated_at`, so a fixture just has to date
+    /// itself -- no sleeping, and no dependence on file mtimes (which is
+    /// the whole point of keying on the record instead).
+    fn aged(id: &str, workspace: &str, secs_ago: u64) -> SessionRecord {
+        let mut r = record(id, workspace);
+        r.updated_at = unix_now().saturating_sub(secs_ago);
+        r
+    }
+
+    const DAY: u64 = 86_400;
+
+    #[test]
+    fn prune_deletes_only_what_is_past_the_cutoff() {
+        let s = store("prune_cutoff");
+        s.save(&aged("old", "/ws", 20 * DAY)).unwrap();
+        s.save(&aged("fresh", "/ws", 2 * DAY)).unwrap();
+
+        let removed = s.prune_older_than_except(14 * DAY, &[]);
+
+        assert_eq!(removed, vec!["old".to_string()]);
+        assert!(s.load("old").is_err());
+        assert!(s.load("fresh").is_ok(), "a recent session must survive");
+    }
+
+    #[test]
+    fn prune_spans_every_workspace_not_just_one() {
+        // Retention is a property of the store; a stale conversation from a
+        // project the user never opens again is exactly what it's for.
+        let s = store("prune_all_ws");
+        s.save(&aged("a", "/ws/one", 30 * DAY)).unwrap();
+        s.save(&aged("b", "/ws/two", 30 * DAY)).unwrap();
+
+        let mut removed = s.prune_older_than_except(14 * DAY, &[]);
+        removed.sort();
+        assert_eq!(removed, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn a_kept_id_survives_however_old_it_is() {
+        // The host has this one open in a window right now.
+        let s = store("prune_keep");
+        s.save(&aged("open", "/ws", 90 * DAY)).unwrap();
+        s.save(&aged("closed", "/ws", 90 * DAY)).unwrap();
+
+        let removed = s.prune_older_than_except(14 * DAY, &["open".to_string()]);
+
+        assert_eq!(removed, vec!["closed".to_string()]);
+        assert!(
+            s.load("open").is_ok(),
+            "must not vanish under a live window"
+        );
+    }
+
+    #[test]
+    fn a_future_dated_record_is_kept_not_wrapped_into_deletion() {
+        // A skewed clock (or a restored backup) can date a record ahead of
+        // now; unsigned subtraction would otherwise wrap to a huge age and
+        // delete it.
+        let s = store("prune_future");
+        let mut r = record("ahead", "/ws");
+        r.updated_at = unix_now() + 10 * DAY;
+        s.save(&r).unwrap();
+
+        assert!(s.prune_older_than_except(14 * DAY, &[]).is_empty());
+        assert!(s.load("ahead").is_ok());
+    }
+
+    #[test]
+    fn an_unreadable_record_is_left_alone_rather_than_deleted() {
+        // Its age is unknowable, and silently destroying user data that
+        // merely failed to parse is worse than keeping a stale file.
+        let s = store("prune_corrupt");
+        std::fs::create_dir_all(s.dir()).unwrap();
+        std::fs::write(s.dir().join("broken.json"), b"{not json").unwrap();
+
+        assert!(s.prune_older_than_except(0, &[]).is_empty());
+        assert!(s.dir().join("broken.json").exists());
+    }
+
+    #[test]
+    fn deleting_the_same_session_twice_is_not_an_error() {
+        let s = store("delete_twice");
+        s.save(&record("gone", "/ws")).unwrap();
+        assert!(s.delete("gone").unwrap(), "first delete removed it");
+        assert!(
+            !s.delete("gone").unwrap(),
+            "second is a no-op, not a failure"
+        );
+    }
+
+    #[test]
+    fn list_all_ignores_workspace_and_orders_newest_first() {
+        let s = store("list_all");
+        s.save(&aged("older", "/ws/one", 5 * DAY)).unwrap();
+        s.save(&aged("newer", "/ws/two", DAY)).unwrap();
+
+        let ids: Vec<_> = s.list_all().into_iter().map(|x| x.id).collect();
+        assert_eq!(ids, vec!["newer".to_string(), "older".to_string()]);
     }
 }
