@@ -334,8 +334,15 @@ pub fn derive_title(messages: &[Message]) -> String {
 mod tests {
     use super::*;
 
+    /// Process- and thread-unique for the same reason as the pdf tests'
+    /// helper: a fixed path lets two overlapping test runs delete each
+    /// other's fixtures, which shows up as a rare, unexplainable failure.
     fn store(name: &str) -> SessionStore {
-        let dir = std::env::temp_dir().join(format!("hivemind_session_test_{name}"));
+        let dir = std::env::temp_dir().join(format!(
+            "hivemind_session_test_{name}_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         SessionStore::new(dir)
     }

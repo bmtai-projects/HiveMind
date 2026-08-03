@@ -168,7 +168,11 @@ mod tests {
     use super::*;
 
     fn ws(name: &str) -> Workspace {
-        let dir = std::env::temp_dir().join(format!("hivemind_xlsx_test_{name}"));
+        let dir = std::env::temp_dir().join(format!(
+            "hivemind_xlsx_test_{name}_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         Workspace::new(dir)
