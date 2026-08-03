@@ -83,7 +83,6 @@ impl Tool for Search {
             .unwrap_or(DEFAULT_MAX_RESULTS)
             .clamp(1, MAX_RESULTS_CAP);
 
-        
         let search_root = match &a.path {
             Some(p) if !p.is_empty() => self.0.resolve(p)?,
             _ => self.0.resolve(".")?,

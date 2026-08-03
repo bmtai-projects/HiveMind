@@ -243,6 +243,33 @@ struct SessionsArgs {
     /// Workspace whose sessions to list (default: current directory).
     #[arg(long, default_value = ".")]
     workdir: PathBuf,
+
+    /// Emit the listing as JSON instead of a human table, for editors and
+    /// scripts. One object per session, newest first.
+    #[arg(long)]
+    json: bool,
+
+    /// Delete sessions across *all* workspaces last updated more than this
+    /// many days ago, then continue with the listing. 0 disables pruning.
+    /// Deliberately opt-in: nothing deletes a saved conversation unless
+    /// asked to.
+    #[arg(long, value_name = "DAYS")]
+    prune_older_than: Option<u64>,
+
+    /// With --prune-older-than, report what would be deleted without
+    /// deleting anything.
+    #[arg(long, requires = "prune_older_than")]
+    dry_run: bool,
+
+    /// Session ids never to prune, even when older than the cutoff -- for a
+    /// host that has these open right now and would otherwise delete a
+    /// conversation out from under a live window. Repeatable.
+    #[arg(long = "keep", value_name = "ID")]
+    keep: Vec<String>,
+
+    /// Delete one session by id and exit.
+    #[arg(long, value_name = "ID", conflicts_with = "prune_older_than")]
+    delete: Option<String>,
 }
 
 #[derive(Args)]
@@ -393,7 +420,76 @@ fn list_sessions(args: SessionsArgs) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("workdir {:?}: {e}", args.workdir))?;
     let workspace = workdir.to_string_lossy().to_string();
     let store = harness_agent::SessionStore::new(harness_config::default_sessions_dir());
+
+    if let Some(id) = &args.delete {
+        let existed = store.delete(id)?;
+        if args.json {
+            println!(
+                "{}",
+                serde_json::json!({"deleted": if existed { vec![id.clone()] } else { vec![] }})
+            );
+        } else if existed {
+            println!("Deleted session {id}");
+        } else {
+            println!("No session {id}");
+        }
+        return Ok(());
+    }
+
+    let mut pruned: Vec<String> = Vec::new();
+    if let Some(days) = args.prune_older_than.filter(|d| *d > 0) {
+        let max_age = days.saturating_mul(86_400);
+        if args.dry_run {
+            let now = harness_agent::unix_now();
+            pruned = store
+                .list_all()
+                .into_iter()
+                .filter(|s| {
+                    now.saturating_sub(s.updated_at) > max_age && !args.keep.contains(&s.id)
+                })
+                .map(|s| s.id)
+                .collect();
+        } else {
+            // Re-adding a kept id is not possible after the fact, so the
+            // filter has to happen inside the store, not on its result.
+            pruned = store.prune_older_than_except(max_age, &args.keep);
+        }
+    }
+
     let sessions = store.list_for_workspace(&workspace);
+
+    if args.json {
+        let items: Vec<_> = sessions
+            .iter()
+            .map(|s| {
+                serde_json::json!({
+                    "id": s.id,
+                    "title": s.title,
+                    "updated_at": s.updated_at,
+                    "turns": s.turns,
+                    "cost_usd": s.cost_usd,
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::json!({
+                "workspace": workspace,
+                "sessions": items,
+                "pruned": pruned,
+            })
+        );
+        return Ok(());
+    }
+
+    if !pruned.is_empty() {
+        let verb = if args.dry_run {
+            "Would delete"
+        } else {
+            "Deleted"
+        };
+        println!("{verb} {} session(s) past the age cutoff.", pruned.len());
+    }
 
     if sessions.is_empty() {
         println!("No saved sessions for {workspace}");
@@ -716,7 +812,7 @@ async fn run_json_protocol(
 ) -> anyhow::Result<()> {
     use tokio::io::AsyncBufReadExt;
 
-    ui.emit_ready();
+    ui.emit_ready(agent.session_id());
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<json_ui::Command>();
     let reader_ui = ui.clone();

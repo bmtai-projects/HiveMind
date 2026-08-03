@@ -101,7 +101,15 @@ impl JsonUi {
     /// Emit `ready` once at startup — a structured mirror of what
     /// `print_model_catalog()` prints for a human, built from the same
     /// `harness_config::KNOWN_MODELS` table so the two can never drift.
-    pub fn emit_ready(&self) {
+    ///
+    /// `session_id` names the file under `default_sessions_dir()` this
+    /// process is writing to. Without it a host has no way to tell which
+    /// saved conversation belongs to which child process, so it cannot
+    /// offer to reopen one later — guessing by "newest file for this
+    /// workspace" races as soon as two sessions start at once. `None` when
+    /// persistence is off, which a host must treat as "this conversation
+    /// will not be resumable" rather than as an error.
+    pub fn emit_ready(&self, session_id: Option<&str>) {
         let models: Vec<_> = harness_config::KNOWN_MODELS
             .iter()
             .map(|m| {
@@ -115,7 +123,11 @@ impl JsonUi {
                 })
             })
             .collect();
-        self.emit(json!({"type": "ready", "models": models}));
+        self.emit(json!({
+            "type": "ready",
+            "models": models,
+            "session_id": session_id,
+        }));
     }
 
     /// Emitted after every incoming command settles — both a
