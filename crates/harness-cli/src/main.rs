@@ -1,10 +1,14 @@
 //! `hivemind` — a fast, cost-optimized AI coding agent.
 //!
-//! "hivemind" (a branded DeepSeek alias) is the cheap default model; six
-//! real third-party coding models are selectable alongside it in hosted
-//! mode via `--model`/`/model`, and the agent escalates off "hivemind"
-//! automatically when it looks stuck. See the workspace README for the
-//! full architecture and optimization notes.
+//! "hivemind" is the cheap default model and a HiveMind-owned brand name,
+//! not a passthrough to any vendor's model id; six real third-party coding
+//! models are selectable alongside it in hosted mode via `--model`/
+//! `/model`, and the agent escalates off "hivemind" automatically when it
+//! looks stuck. What the alias resolves to upstream is deliberately kept
+//! server-side — see `harness_config::KNOWN_MODELS` for the one place that
+//! is documented, and [`IDENTITY`] for why the agent must not guess at it.
+//! See the workspace README for the full architecture and optimization
+//! notes.
 
 mod auth;
 mod banner;
@@ -88,6 +92,13 @@ steps:
   need later for the actual work -- map first, then `read_file` only the
   few files the map showed to be relevant. Scope big repos with its `path`
   argument rather than mapping everything at once.
+- Read the part of a file you need, not all of it. `project_map` already
+  told you which line each definition is on, so pass `offset`/`limit` to
+  `read_file` and pull those lines plus surrounding context. Every file you
+  read stays in the conversation and is re-billed as input on every later
+  turn, so pulling 1500 lines to use 80 is the single most expensive habit
+  available to you. Read the whole file when you genuinely need all of it --
+  a small file, or one you are about to restructure.
 - Investigate before acting: use `search` for an exact string, or
   `semantic_search` to find code by concept when you don't know the symbol
   (prefer both over shell grep); then `read_file` and `list_dir` for detail.
