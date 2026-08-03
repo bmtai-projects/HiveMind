@@ -604,8 +604,17 @@ fn wrap(text: &str, size: f32, max_width_pt: f32) -> Vec<String> {
 mod tests {
     use super::*;
 
+    /// Process- and thread-unique, matching `harness_agent`'s own test
+    /// helper. A fixed path here is not merely untidy: two overlapping
+    /// `cargo test` runs (or a `--workspace` run alongside a targeted one)
+    /// both `remove_dir_all` the same directory, so one deletes the other's
+    /// fixtures mid-test and fails intermittently for no visible reason.
     fn ws(name: &str) -> Workspace {
-        let dir = std::env::temp_dir().join(format!("hivemind_pdf_test_{name}"));
+        let dir = std::env::temp_dir().join(format!(
+            "hivemind_pdf_test_{name}_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         Workspace::new(dir)

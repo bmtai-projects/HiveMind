@@ -765,7 +765,11 @@ mod tests {
     use super::*;
 
     fn ws(name: &str) -> Workspace {
-        let dir = std::env::temp_dir().join(format!("hivemind_semantic_test_{name}"));
+        let dir = std::env::temp_dir().join(format!(
+            "hivemind_semantic_test_{name}_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         Workspace::new(dir)
@@ -922,7 +926,11 @@ mod embedder_switch_tests {
     }
 
     fn tmp_repo(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("hivemind_semantic_switch_{name}"));
+        let dir = std::env::temp_dir().join(format!(
+            "hivemind_semantic_switch_{name}_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("a.rs"), "fn alpha() {}\nfn beta() {}\n").unwrap();
@@ -959,7 +967,11 @@ mod embedder_switch_tests {
     fn batching_preserves_chunk_to_vector_alignment() {
         // Enough chunks to span multiple EMBED_BATCH groups, so a
         // mis-zipped batch boundary would show up as a wrong preview.
-        let dir = std::env::temp_dir().join("hivemind_semantic_switch_align");
+        let dir = std::env::temp_dir().join(format!(
+            "hivemind_semantic_switch_align_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let body: String = (0..(EMBED_BATCH * 3 * CHUNK_STEP))
@@ -1076,7 +1088,11 @@ mod rerank_tests {
 
     #[test]
     fn a_warm_cache_only_embeds_the_query() {
-        let dir = std::env::temp_dir().join("hivemind_rerank_cache_test");
+        let dir = std::env::temp_dir().join(format!(
+            "hivemind_rerank_cache_test_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 

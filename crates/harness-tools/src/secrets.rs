@@ -544,7 +544,11 @@ mod tool_integration_tests {
     use serde_json::value::RawValue;
 
     fn ws(name: &str) -> Workspace {
-        let dir = std::env::temp_dir().join(format!("hivemind_secrets_{name}"));
+        let dir = std::env::temp_dir().join(format!(
+            "hivemind_secrets_{name}_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         Workspace::new(dir)

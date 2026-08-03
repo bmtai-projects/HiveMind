@@ -165,7 +165,11 @@ mod tests {
     use super::*;
 
     fn ws(name: &str) -> Workspace {
-        let dir = std::env::temp_dir().join(format!("hivemind_edit_test_{name}"));
+        let dir = std::env::temp_dir().join(format!(
+            "hivemind_edit_test_{name}_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         Workspace::new(dir)
@@ -268,17 +272,24 @@ mod tests {
     #[tokio::test]
     async fn escaping_the_workspace_is_rejected_and_the_outside_file_is_untouched() {
         // A real file just outside the workspace root, reached via `../`.
+        //
+        // The target has to live outside the workspace, which puts it in the
+        // shared temp directory -- so unlike every other fixture here it
+        // cannot be isolated by the workspace name, and needs its own unique
+        // filename. A fixed one is shared by any two concurrent test runs,
+        // which then delete it from under each other.
         let w = ws("escape");
-        let outside = w
-            .root
-            .parent()
-            .unwrap()
-            .join("hivemind_edit_escape_target.txt");
+        let target_name = format!(
+            "hivemind_edit_escape_target_{}_{:?}.txt",
+            std::process::id(),
+            std::thread::current().id()
+        );
+        let outside = w.root.parent().unwrap().join(&target_name);
         std::fs::write(&outside, "secret").unwrap();
 
         let err = EditFile(w.clone())
             .execute(&args(serde_json::json!({
-                "path": "../hivemind_edit_escape_target.txt",
+                "path": format!("../{target_name}"),
                 "old_string": "secret",
                 "new_string": "leaked"
             })))
@@ -305,7 +316,11 @@ mod staleness_tests {
     use crate::fs::{ReadFile, WriteFile};
 
     fn ws(name: &str) -> Workspace {
-        let dir = std::env::temp_dir().join(format!("hivemind_stale_test_{name}"));
+        let dir = std::env::temp_dir().join(format!(
+            "hivemind_stale_test_{name}_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         Workspace::new(dir)

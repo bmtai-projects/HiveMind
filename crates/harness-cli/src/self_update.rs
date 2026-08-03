@@ -329,7 +329,11 @@ mod tests {
         // extraction loop actually honours it (`continue`s) rather than
         // unwrapping and panicking or writing outside `into`.
         use std::io::Write;
-        let dir = std::env::temp_dir().join("hivemind_zip_slip_test");
+        let dir = std::env::temp_dir().join(format!(
+            "hivemind_zip_slip_test_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let archive_path = dir.join("evil.zip");
