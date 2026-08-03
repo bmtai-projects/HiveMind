@@ -260,6 +260,10 @@ impl Ui for JsonUi {
         self.emit(json!({"type": "stalled", "after_turns": after_turns}));
     }
 
+    fn output_limit_truncated(&self) {
+        self.emit(json!({"type": "output_limit_truncated"}));
+    }
+
     fn model_escalated(&self, from: &str, to: &str, reason: &str) {
         self.emit(json!({
             "type": "model_escalated",

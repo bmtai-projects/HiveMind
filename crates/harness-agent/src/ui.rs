@@ -53,6 +53,14 @@ pub trait Ui: Send + Sync {
     /// step in on. Defaulted: a host that ignores it is still correct.
     fn stalled(&self, _after_turns: u32) {}
 
+    /// Fired when a turn was cut off at the model's output token limit
+    /// while it was still emitting a tool call, so the call was dropped
+    /// rather than dispatched with arguments that are known-incomplete.
+    /// Worth surfacing because the user otherwise sees a turn that
+    /// produced a wall of text and then, apparently, did nothing at all.
+    /// Defaulted: a host that ignores it is still correct.
+    fn output_limit_truncated(&self) {}
+
     /// Fired when the agent bumps away from the cheap "hivemind" default
     /// after repeated/failing tool calls on the current task.
     fn model_escalated(&self, from: &str, to: &str, reason: &str);
