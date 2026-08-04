@@ -11,7 +11,7 @@ use tokio::process::Command;
 use tokio::sync::Mutex;
 
 use crate::error::ToolError;
-use crate::tool::{Tool, obj_schema};
+use crate::tool::{Tool, ToolResult, ToolStatus, obj_schema};
 
 /// Approval gate for shell commands. Runs synchronously (typically an
 /// interactive stdin prompt), so [`Bash`] always calls it through
@@ -266,17 +266,28 @@ impl Tool for Bash {
             &["command"],
         )
     }
-    async fn execute(&self, args: &RawValue) -> Result<String, ToolError> {
+    async fn execute(&self, args: &RawValue) -> Result<ToolResult, ToolError> {
         let a: BashArgs = serde_json::from_str(args.get())?;
         if a.command.is_empty() {
             return Err(ToolError::Message("command is required".into()));
         }
         if !self.approved(&a.command).await {
-            return Ok("command denied by user".to_string());
+            // Denied, not Failed: the command never ran, and re-running it
+            // will be denied again. The harness must not count this toward
+            // the escalation counter -- a user saying no is not the model
+            // being stuck.
+            return Ok(ToolResult {
+                status: ToolStatus::Denied,
+                summary: "command denied by user".to_string(),
+                retryable: false,
+                ..Default::default()
+            });
         }
 
         if a.background {
-            return self.spawn_background(&a.command);
+            // Spawning succeeded or it didn't; either way the command's own
+            // exit status is unknown by design (it is still running).
+            return self.spawn_background(&a.command).map(ToolResult::ok);
         }
 
         let mut cmd = shell_command(&a.command);
@@ -334,14 +345,37 @@ impl Tool for Bash {
         let stderr = err_task.await.unwrap_or_default();
 
         let Some(status) = status else {
-            return Ok(format!(
-                "[timed out after {}s; the command and anything it started were killed. \
-                 If this was a server or watcher, re-run it with `background: true` instead.]\n{}",
-                self.timeout.as_secs(),
-                format_output(&stdout, &stderr, None)
-            ));
+            // Timeout is its own status: unlike a plain failure, the work may
+            // have partly happened, and a retry (or `background: true`) can
+            // still be the right move.
+            return Ok(ToolResult {
+                status: ToolStatus::Timeout,
+                summary: format!(
+                    "[timed out after {}s; the command and anything it started were killed. \
+                     If this was a server or watcher, re-run it with `background: true` instead.]\n{}",
+                    self.timeout.as_secs(),
+                    format_output(&stdout, &stderr, None)
+                ),
+                retryable: true,
+                ..Default::default()
+            });
         };
-        Ok(format_output(&stdout, &stderr, Some(status)))
+
+        // The whole point of M1, in one line: the exit code is *reported*
+        // here, where it is known for certain, instead of being re-derived
+        // downstream by looking for "[exit:" in the text. Any tool output
+        // that merely contains that marker -- a log, our own source, a
+        // search hit -- used to read as a failed command.
+        Ok(ToolResult {
+            status: if status.success() {
+                ToolStatus::Ok
+            } else {
+                ToolStatus::Failed
+            },
+            summary: format_output(&stdout, &stderr, Some(status)),
+            retryable: false,
+            ..Default::default()
+        })
     }
 }
 
@@ -519,7 +553,8 @@ mod tests {
         let out = bash()
             .execute(&args(serde_json::json!({"command": "echo hello"})))
             .await
-            .unwrap();
+            .unwrap()
+            .summary;
         assert!(out.contains("hello"), "{out}");
 
         let failed = bash()
@@ -527,7 +562,8 @@ mod tests {
                 serde_json::json!({"command": "echo oops >&2; exit 3"}),
             ))
             .await
-            .unwrap();
+            .unwrap()
+            .summary;
         assert!(failed.contains("oops"), "{failed}");
         assert!(
             failed.contains("[exit:"),
@@ -547,7 +583,8 @@ mod tests {
                 serde_json::json!({"command": "sleep 30 & echo started"}),
             ))
             .await
-            .unwrap();
+            .unwrap()
+            .summary;
         let elapsed = started.elapsed();
 
         assert!(out.contains("started"), "{out}");
@@ -569,7 +606,8 @@ mod tests {
                 "command": "sleep 30 & echo \"pid=$!\""
             })))
             .await
-            .unwrap();
+            .unwrap()
+            .summary;
         // Without this the test can pass for the wrong reason: if the call
         // blocks on the pipe instead of reaping, `sleep 30` finishes on its
         // own before the liveness check below and looks correctly cleaned up.
@@ -610,7 +648,8 @@ mod tests {
                 "command": "sleep 30 & echo \"pid=$!\"; sleep 30"
             })))
             .await
-            .unwrap();
+            .unwrap()
+            .summary;
         // Same vacuous-pass guard as the test above: the timeout has to
         // actually cut the call short, not be followed by a 30s pipe drain.
         assert!(
@@ -648,7 +687,8 @@ mod tests {
                 "command": "sleep 30", "background": true
             })))
             .await
-            .unwrap();
+            .unwrap()
+            .summary;
 
         let pid: u32 = out
             .split_once("pid ")
@@ -684,14 +724,14 @@ mod tests {
         let tool = bash();
         let cmd = serde_json::json!({"command": "sleep 31", "background": true});
 
-        let first = tool.execute(&args(cmd.clone())).await.unwrap();
+        let first = tool.execute(&args(cmd.clone())).await.unwrap().summary;
         let first_pid: u32 = first
             .split_once("pid ")
             .and_then(|(_, rest)| rest.split(')').next())
             .and_then(|p| p.trim().parse().ok())
             .unwrap();
 
-        let second = tool.execute(&args(cmd)).await.unwrap();
+        let second = tool.execute(&args(cmd)).await.unwrap().summary;
         assert!(
             second.contains("replaced"),
             "should say it replaced: {second}"
@@ -719,7 +759,8 @@ mod tests {
                 "command": format!("touch {}", marker.display())
             })))
             .await
-            .unwrap();
+            .unwrap()
+            .summary;
 
         assert!(out.contains("denied"), "{out}");
         assert!(!marker.exists(), "a denied command must not have run");

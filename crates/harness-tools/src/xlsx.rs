@@ -14,7 +14,7 @@ use std::path::Path;
 
 use crate::error::ToolError;
 use crate::fs::Workspace;
-use crate::tool::{Tool, obj_schema};
+use crate::tool::{Tool, ToolResult, obj_schema};
 
 #[derive(Deserialize)]
 struct XlsxArgs {
@@ -85,7 +85,7 @@ impl Tool for CreateSpreadsheet {
             &["path", "sheets"],
         )
     }
-    async fn execute(&self, args: &RawValue) -> Result<String, ToolError> {
+    async fn execute(&self, args: &RawValue) -> Result<ToolResult, ToolError> {
         let a: XlsxArgs = serde_json::from_str(args.get())?;
         if a.path.is_empty() {
             return Err(ToolError::Message("path is required".into()));
@@ -109,13 +109,13 @@ impl Tool for CreateSpreadsheet {
         let p = self.0.resolve(&a.path)?;
         tokio::fs::write(&p, &bytes).await?;
 
-        Ok(format!(
+        Ok(ToolResult::ok(format!(
             "wrote {} bytes to {} ({} sheet{})",
             bytes.len(),
             a.path,
             a.sheets.len(),
             if a.sheets.len() == 1 { "" } else { "s" }
-        ))
+        )))
     }
 }
 
@@ -195,7 +195,8 @@ mod tests {
                 }],
             })))
             .await
-            .unwrap();
+            .unwrap()
+            .summary;
         assert!(
             out.contains("data.xlsx") && out.contains("1 sheet"),
             "got: {out}"
@@ -219,7 +220,8 @@ mod tests {
                 ],
             })))
             .await
-            .unwrap();
+            .unwrap()
+            .summary;
         assert!(out.contains("2 sheets"), "got: {out}");
     }
 

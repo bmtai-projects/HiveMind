@@ -25,7 +25,7 @@ use std::path::Path;
 
 use crate::error::ToolError;
 use crate::fs::Workspace;
-use crate::tool::{Tool, obj_schema};
+use crate::tool::{Tool, ToolResult, obj_schema};
 
 const PAGE_WIDTH_PT: f32 = 595.0; // A4
 const PAGE_HEIGHT_PT: f32 = 842.0;
@@ -136,7 +136,7 @@ impl Tool for CreatePdf {
             &["path"],
         )
     }
-    async fn execute(&self, args: &RawValue) -> Result<String, ToolError> {
+    async fn execute(&self, args: &RawValue) -> Result<ToolResult, ToolError> {
         let a: PdfArgs = serde_json::from_str(args.get())?;
         if a.path.is_empty() {
             return Err(ToolError::Message("path is required".into()));
@@ -186,12 +186,12 @@ impl Tool for CreatePdf {
         let p = self.0.resolve(&a.path)?;
         tokio::fs::write(&p, &bytes).await?;
 
-        Ok(format!(
+        Ok(ToolResult::ok(format!(
             "wrote {} bytes to {} ({page_count} page{})",
             bytes.len(),
             a.path,
             if page_count == 1 { "" } else { "s" }
-        ))
+        )))
     }
 }
 
@@ -658,7 +658,7 @@ mod tests {
                 ],
             })))
             .await
-            .unwrap();
+            .unwrap().summary;
         assert!(out.contains("report.pdf"), "got: {out}");
 
         let bytes = std::fs::read(w.root.join("report.pdf")).unwrap();
@@ -677,7 +677,8 @@ mod tests {
                 serde_json::json!({"path": "long.pdf", "blocks": blocks}),
             ))
             .await
-            .unwrap();
+            .unwrap()
+            .summary;
         assert!(
             out.contains("pages") && !out.contains("(1 page)"),
             "expected multiple pages, got: {out}"
@@ -746,7 +747,8 @@ mod tests {
                 "from_file": "draft.md",
             })))
             .await
-            .unwrap();
+            .unwrap()
+            .summary;
 
         assert!(out.contains("out.pdf"), "unexpected summary: {out}");
         let bytes = std::fs::read(root.join("out.pdf")).unwrap();
@@ -813,7 +815,7 @@ mod tests {
         });
         assert!(call.to_string().len() < 100, "the call itself stays tiny");
 
-        let out = CreatePdf(w).execute(&args(call)).await.unwrap();
+        let out = CreatePdf(w).execute(&args(call)).await.unwrap().summary;
         assert!(out.contains("pages"), "expected multiple pages: {out}");
         assert!(
             std::fs::read(root.join("guide.pdf"))

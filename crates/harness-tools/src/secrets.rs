@@ -569,9 +569,12 @@ mod tool_integration_tests {
             .await
             .expect("a credential must not turn the write into an error");
 
-        assert!(out.starts_with("wrote "), "the normal result is preserved");
-        assert!(out.contains("possible credential"));
-        assert!(out.contains("AWS access key ID"));
+        assert!(
+            out.summary.starts_with("wrote "),
+            "the normal result is preserved"
+        );
+        assert!(out.summary.contains("possible credential"));
+        assert!(out.summary.contains("AWS access key ID"));
         // And the file really was written -- warning, not blocking.
         assert!(w.root.join("config.py").exists());
     }
@@ -585,7 +588,7 @@ mod tool_integration_tests {
             })))
             .await
             .unwrap();
-        assert!(!out.contains("credential"), "got {out:?}");
+        assert!(!out.summary.contains("credential"), "got {out:?}");
     }
 
     #[tokio::test]
@@ -600,7 +603,10 @@ mod tool_integration_tests {
             })))
             .await
             .unwrap();
-        assert!(out.contains("GitHub personal access token"), "got {out:?}");
+        assert!(
+            out.summary.contains("GitHub personal access token"),
+            "got {out:?}"
+        );
     }
 
     #[tokio::test]
@@ -620,6 +626,6 @@ mod tool_integration_tests {
             })))
             .await
             .unwrap();
-        assert!(!out.contains("credential"), "got {out:?}");
+        assert!(!out.summary.contains("credential"), "got {out:?}");
     }
 }

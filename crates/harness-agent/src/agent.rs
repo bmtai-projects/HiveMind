@@ -84,6 +84,12 @@ pub struct Agent {
     /// fresh chance to be told, and `run()` resets it alongside the other
     /// escalation state.
     nudged_this_run: bool,
+    /// Whether any tool call in the last dispatched turn reported a failing
+    /// `ToolStatus`. Carried here because a `Message` only holds the summary
+    /// text -- the status cannot be recovered from the transcript after the
+    /// fact, and re-deriving it by string-matching is exactly the misreading
+    /// this replaced.
+    last_turn_had_failure: bool,
     workspace: Workspace,
     checkpoints: Vec<Checkpoint>,
     hooks: Vec<HookSpec>,
@@ -139,6 +145,7 @@ impl Agent {
             repeat_count: 0,
             last_call_signature: None,
             nudged_this_run: false,
+            last_turn_had_failure: false,
             workspace,
             checkpoints: Vec::new(),
             hooks: resolved.hooks,
@@ -593,38 +600,43 @@ impl Agent {
         }
 
         let results = self.tools.dispatch_many(allowed).await;
+        self.last_turn_had_failure = results.iter().any(|(_, r)| r.status.is_failure());
         for (call, result) in results {
-            let is_error = result.starts_with("ERROR:");
-            self.ui.tool_end(&call.name, &result, is_error);
+            // Reported by the tool that ran, not guessed from the text. The
+            // previous `result.starts_with("ERROR:")` misread any output that
+            // merely *contained* the marker -- a log, a source file, our own
+            // docs -- and that answer feeds the escalation counter below.
+            let is_error = result.status.is_failure();
+            self.ui.tool_end(&call.name, &result.summary, is_error);
             if !self.hooks.is_empty() {
-                hooks::run_post_tool_use(&self.hooks, &call, &result, &workspace_root).await;
+                hooks::run_post_tool_use(&self.hooks, &call, &result.summary, &workspace_root)
+                    .await;
                 forget_if_a_hook_may_have_rewritten_it(&self.workspace, &call);
             }
+            // Only `summary` reaches the transcript, so the wire format,
+            // the session files, and every existing host are unaffected.
             self.messages
-                .push(Message::tool_result(call.id, call.name, result));
+                .push(Message::tool_result(call.id, call.name, result.summary));
         }
     }
 
     /// Signature of the most recent assistant turn's tool calls, and
-    /// whether any of that turn's results were errors — used to detect a
-    /// model stuck repeating itself.
+    /// whether any of that turn's results failed — used to detect a model
+    /// stuck repeating itself.
+    ///
+    /// The failure half is taken from `last_turn_had_failure`, which
+    /// `dispatch_and_record` sets from each tool's reported `ToolStatus`.
+    /// It used to be re-derived here by string-matching the transcript,
+    /// which misread ordinary successes -- reading a log, a source file that
+    /// formats an error, or this repo's own docs -- as failed calls, and fed
+    /// that straight into the escalation counter below. A `Message` only
+    /// carries the summary text, so the status cannot be recovered from it
+    /// after the fact; it has to be carried forward from dispatch.
     fn messages_tail_signature(&self) -> (String, bool) {
         let mut signature_parts = Vec::new();
-        let mut any_error = false;
-        // Walk backward from the end: the tool results just pushed, then
-        // the assistant message that requested them.
         for m in self.messages.iter().rev() {
             match m.role {
-                Role::Tool => {
-                    // Not `starts_with("ERROR:")`: a shell command that
-                    // exits non-zero or times out comes back as Ok(...) and
-                    // never carried that prefix, so the whole cascade of
-                    // failing commands used to register as "no problems".
-                    // See `harness_tools::looks_like_failure`.
-                    if harness_tools::looks_like_failure(&m.content) {
-                        any_error = true;
-                    }
-                }
+                Role::Tool => {}
                 Role::Assistant => {
                     for tc in &m.tool_calls {
                         signature_parts.push(format!("{}:{}", tc.name, tc.args.get()));
@@ -635,7 +647,7 @@ impl Agent {
             }
         }
         signature_parts.sort();
-        (signature_parts.join("|"), any_error)
+        (signature_parts.join("|"), self.last_turn_had_failure)
     }
 
     /// React to a turn that made no progress: first by telling the model so,

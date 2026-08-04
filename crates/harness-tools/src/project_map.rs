@@ -39,7 +39,7 @@ use serde_json::value::RawValue;
 
 use crate::error::ToolError;
 use crate::fs::Workspace;
-use crate::tool::{Tool, obj_schema};
+use crate::tool::{Tool, ToolResult, obj_schema};
 use crate::walk::walk_files;
 
 /// Files scanned before the map stops growing. Well past any repo where a
@@ -444,7 +444,7 @@ impl Tool for ProjectMap {
         )
     }
 
-    async fn execute(&self, args: &RawValue) -> Result<String, ToolError> {
+    async fn execute(&self, args: &RawValue) -> Result<ToolResult, ToolError> {
         let a: MapArgs = serde_json::from_str(args.get())?;
         let requested = a
             .path
@@ -491,7 +491,7 @@ impl Tool for ProjectMap {
         .await
         .map_err(|e| ToolError::Message(format!("project_map task failed: {e}")))?;
 
-        Ok(output)
+        Ok(ToolResult::ok(output))
     }
 }
 
@@ -764,7 +764,8 @@ mod tests {
         let out = ProjectMap(w.clone())
             .execute(&args(serde_json::json!({})))
             .await
-            .unwrap();
+            .unwrap()
+            .summary;
 
         assert!(out.contains("lib.rs"), "{out}");
         assert!(out.contains("pub struct Engine"), "{out}");
@@ -791,7 +792,8 @@ mod tests {
         let out = ProjectMap(w.clone())
             .execute(&args(serde_json::json!({"path": "src"})))
             .await
-            .unwrap();
+            .unwrap()
+            .summary;
         assert!(out.contains("wanted"), "{out}");
         assert!(!out.contains("unwanted"), "scope leaked:\n{out}");
     }
@@ -810,7 +812,8 @@ mod tests {
         let out = ProjectMap(w.clone())
             .execute(&args(serde_json::json!({})))
             .await
-            .unwrap();
+            .unwrap()
+            .summary;
         assert!(out.contains("real"), "{out}");
         assert!(!out.contains("dep"), "node_modules leaked:\n{out}");
         assert!(!out.contains("generated"), "target/ leaked:\n{out}");
@@ -852,7 +855,8 @@ mod tests {
         let out = ProjectMap(w)
             .execute(&args(serde_json::json!({})))
             .await
-            .unwrap();
+            .unwrap()
+            .summary;
 
         assert!(
             out.contains("enum Command"),
@@ -883,7 +887,8 @@ mod tests {
         let out = ProjectMap(w)
             .execute(&args(serde_json::json!({})))
             .await
-            .unwrap();
+            .unwrap()
+            .summary;
 
         assert_eq!(
             out.matches("more definitions").count(),
@@ -908,7 +913,8 @@ mod tests {
         let out = ProjectMap(w.clone())
             .execute(&args(serde_json::json!({})))
             .await
-            .unwrap();
+            .unwrap()
+            .summary;
         assert!(out.contains("many.rs"));
         assert!(
             out.contains("more definitions"),
@@ -930,7 +936,8 @@ mod tests {
         let out = ProjectMap(w.clone())
             .execute(&args(serde_json::json!({})))
             .await
-            .unwrap();
+            .unwrap()
+            .summary;
         assert!(
             out.len() <= MAX_OUTPUT_CHARS + 500,
             "output was {} chars",
@@ -962,7 +969,8 @@ mod tests {
         let out = ProjectMap(w.clone())
             .execute(&args(serde_json::json!({})))
             .await
-            .unwrap();
+            .unwrap()
+            .summary;
 
         assert!(out.len() <= MAX_OUTPUT_CHARS + 500, "{} chars", out.len());
         assert!(
@@ -996,7 +1004,8 @@ mod tests {
         let out = ProjectMap(w.clone())
             .execute(&args(serde_json::json!({})))
             .await
-            .unwrap();
+            .unwrap()
+            .summary;
 
         assert!(out.len() <= MAX_OUTPUT_CHARS + 500, "{} chars", out.len());
         assert!(
@@ -1036,7 +1045,8 @@ mod tests {
         let out = ProjectMap(w.clone())
             .execute(&args(serde_json::json!({})))
             .await
-            .unwrap();
+            .unwrap()
+            .summary;
         assert!(out.contains("no files found"), "{out}");
     }
 
@@ -1061,7 +1071,8 @@ mod tests {
         let out = ProjectMap(w.clone())
             .execute(&args(serde_json::json!({})))
             .await
-            .unwrap();
+            .unwrap()
+            .summary;
         assert!(
             out.contains("fine"),
             "a bad file must not break the map:\n{out}"
@@ -1080,11 +1091,13 @@ mod tests {
         let first = ProjectMap(w.clone())
             .execute(&args(serde_json::json!({})))
             .await
-            .unwrap();
+            .unwrap()
+            .summary;
         let second = ProjectMap(w.clone())
             .execute(&args(serde_json::json!({})))
             .await
-            .unwrap();
+            .unwrap()
+            .summary;
         assert_eq!(first, second);
     }
 }

@@ -16,7 +16,7 @@ async fn top_hits(tool: &SemanticSearch, query: &str, scope: Option<&str>, k: us
         obj["path"] = serde_json::json!(s);
     }
     let args = RawValue::from_string(obj.to_string()).unwrap();
-    tool.execute(&args).await.unwrap()
+    tool.execute(&args).await.unwrap().summary
 }
 
 #[tokio::test]

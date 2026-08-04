@@ -11,7 +11,7 @@ use serde::Deserialize;
 use serde_json::value::RawValue;
 
 use crate::error::ToolError;
-use crate::tool::{Tool, obj_schema};
+use crate::tool::{Tool, ToolResult, obj_schema};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -68,7 +68,7 @@ impl Tool for TodoWrite {
             &["todos"],
         )
     }
-    async fn execute(&self, args: &RawValue) -> Result<String, ToolError> {
+    async fn execute(&self, args: &RawValue) -> Result<ToolResult, ToolError> {
         let parsed: TodoArgs = serde_json::from_str(args.get())?;
         if parsed.todos.is_empty() {
             return Err(ToolError::Message(
@@ -86,7 +86,7 @@ impl Tool for TodoWrite {
                  park the current one before starting another"
             )));
         }
-        Ok(render(&parsed.todos))
+        Ok(ToolResult::ok(render(&parsed.todos)))
     }
 }
 
@@ -125,7 +125,8 @@ mod tests {
                 ]
             })))
             .await
-            .unwrap();
+            .unwrap()
+            .summary;
         assert_eq!(
             result,
             "[x] Scaffold backend\n[~] Scaffold frontend\n[ ] Wire the two together"

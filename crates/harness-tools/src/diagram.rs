@@ -47,7 +47,7 @@ use tokio::io::AsyncReadExt;
 use crate::bash::{kill_process_group, own_process_group, shell_command, shell_quote_path};
 use crate::error::ToolError;
 use crate::fs::Workspace;
-use crate::tool::{Tool, obj_schema};
+use crate::tool::{Tool, ToolResult, obj_schema};
 
 /// Upper bound on accepted diagram source. Generous for anything
 /// hand-authored or model-generated; exists so a pathological input can't
@@ -171,7 +171,7 @@ impl Tool for CreateDiagram {
         )
     }
 
-    async fn execute(&self, args: &RawValue) -> Result<String, ToolError> {
+    async fn execute(&self, args: &RawValue) -> Result<ToolResult, ToolError> {
         let a: DiagramArgs = serde_json::from_str(args.get())?;
         if a.path.is_empty() {
             return Err(ToolError::Message("path is required".into()));
@@ -208,12 +208,12 @@ impl Tool for CreateDiagram {
         if kind == OutputKind::SourceOnly {
             tokio::fs::write(&output_path, &a.diagram).await?;
             self.0.read_set.record(&output_path, &a.diagram);
-            return Ok(format!(
+            return Ok(ToolResult::ok(format!(
                 "wrote {} ({} bytes){}",
                 a.path,
                 a.diagram.len(),
                 advisory.unwrap_or_default()
-            ));
+            )));
         }
 
         // The source is written *before* attempting to render, and its
@@ -226,24 +226,24 @@ impl Tool for CreateDiagram {
         let source_label = display_relative(&a.path, "mmd");
 
         match render_via_mmdc(&source_path, &output_path).await {
-            RenderOutcome::Rendered => Ok(format!(
+            RenderOutcome::Rendered => Ok(ToolResult::ok(format!(
                 "wrote {source_label} (source) and rendered {}{}",
                 a.path,
                 advisory.unwrap_or_default()
-            )),
-            RenderOutcome::ToolMissing => Ok(format!(
+            ))),
+            RenderOutcome::ToolMissing => Ok(ToolResult::ok(format!(
                 "wrote {source_label} -- mmdc (mermaid-cli) isn't installed, so no image was \
                  rendered. Install it with `npm install -g @mermaid-js/mermaid-cli` and try again, \
                  or view/render the source as-is at https://mermaid.live, or in an editor with \
                  Mermaid preview (e.g. VS Code's Markdown preview).{}",
                 advisory.unwrap_or_default()
-            )),
-            RenderOutcome::Failed(reason) => Ok(format!(
+            ))),
+            RenderOutcome::Failed(reason) => Ok(ToolResult::ok(format!(
                 "wrote {source_label} -- mmdc failed to render it: {reason}. This usually means a \
                  syntax error in the diagram; fix it and try again, or paste the source at \
                  https://mermaid.live to see the parser's own error.{}",
                 advisory.unwrap_or_default()
-            )),
+            ))),
         }
     }
 }
@@ -711,7 +711,8 @@ mod tests {
                 "path": "flow.mmd", "diagram": "flowchart LR\nA-->B"
             })))
             .await
-            .unwrap();
+            .unwrap()
+            .summary;
         assert!(out.contains("wrote flow.mmd"));
         assert_eq!(
             std::fs::read_to_string(w.root.join("flow.mmd")).unwrap(),
@@ -746,7 +747,8 @@ mod tests {
                 "path": "weird.mmd", "diagram": "not mermaid at all"
             })))
             .await
-            .unwrap();
+            .unwrap()
+            .summary;
         assert!(out.contains("diagram type"));
         assert!(w.root.join("weird.mmd").exists());
     }
