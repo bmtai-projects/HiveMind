@@ -39,7 +39,8 @@ async fn a_valid_flowchart_renders_to_a_real_svg() {
             "diagram": "flowchart LR\n  A[Start] --> B{Decide}\n  B -->|Yes| C[Do it]\n  B -->|No| D[Skip]"
         })))
         .await
-        .expect("tool call itself must succeed");
+        .expect("tool call itself must succeed")
+        .summary;
 
     assert!(out.contains("rendered"), "got {out:?}");
     assert!(!out.contains("mmdc failed"), "got {out:?}");
@@ -74,7 +75,8 @@ async fn a_valid_flowchart_renders_to_a_real_png() {
             "diagram": "flowchart LR\nA-->B"
         })))
         .await
-        .expect("tool call itself must succeed");
+        .expect("tool call itself must succeed")
+        .summary;
 
     assert!(out.contains("rendered"), "got {out:?}");
     let png_path = w.root.join("flow.png");
@@ -118,7 +120,8 @@ async fn different_diagram_types_all_render() {
                 serde_json::json!({"path": *name, "diagram": *diagram}),
             ))
             .await
-            .unwrap_or_else(|e| panic!("{name} failed: {e}"));
+            .unwrap_or_else(|e| panic!("{name} failed: {e}"))
+            .summary;
         assert!(out.contains("rendered"), "{name}: got {out:?}");
         assert!(w.root.join(name).exists(), "{name}: image missing");
     }
@@ -139,11 +142,11 @@ async fn a_syntactically_broken_diagram_degrades_gracefully_instead_of_failing_t
         .expect("a render failure must not make the whole tool call fail");
 
     assert!(
-        out.contains("wrote"),
+        out.summary.contains("wrote"),
         "the .mmd source must still be reported written: {out:?}"
     );
     assert!(
-        out.contains("mmdc failed") || out.contains("syntax error"),
+        out.summary.contains("mmdc failed") || out.summary.contains("syntax error"),
         "should explain the render failed: {out:?}"
     );
     assert!(
@@ -169,7 +172,8 @@ async fn a_diagram_with_a_space_in_its_output_path_still_renders() {
             "diagram": "flowchart LR\nA-->B"
         })))
         .await
-        .expect("tool call must succeed");
+        .expect("tool call must succeed")
+        .summary;
     assert!(out.contains("rendered"), "got {out:?}");
     assert!(w.root.join("my diagrams/flow chart.svg").exists());
     assert!(w.root.join("my diagrams/flow chart.mmd").exists());

@@ -22,7 +22,7 @@ use serde_json::value::RawValue;
 
 use crate::error::ToolError;
 use crate::fs::Workspace;
-use crate::tool::{Tool, obj_schema};
+use crate::tool::{FileChangeKind, Tool, ToolResult, obj_schema};
 
 #[derive(Deserialize)]
 struct EditArgs {
@@ -79,7 +79,7 @@ impl Tool for EditFile {
             &["path", "old_string", "new_string"],
         )
     }
-    async fn execute(&self, args: &RawValue) -> Result<String, ToolError> {
+    async fn execute(&self, args: &RawValue) -> Result<ToolResult, ToolError> {
         let a: EditArgs = serde_json::from_str(args.get())?;
         if a.old_string.is_empty() {
             return Err(ToolError::Message(
@@ -156,7 +156,10 @@ impl Tool for EditFile {
         if let Some(note) = crate::secrets::warning(&crate::secrets::scan(&a.new_string)) {
             out.push_str(&note);
         }
-        Ok(out)
+        // `edit_file` only ever touches a file that already existed -- it
+        // errors out above when the path is missing -- so this is always a
+        // modification, never a creation.
+        Ok(ToolResult::ok(out).with_changed_file(&a.path, FileChangeKind::Modified))
     }
 }
 
@@ -189,7 +192,7 @@ mod tests {
             })))
             .await
             .unwrap();
-        assert!(out.contains("1 replacement"), "got {out:?}");
+        assert!(out.summary.contains("1 replacement"), "got {out:?}");
         assert_eq!(
             std::fs::read_to_string(w.root.join("a.txt")).unwrap(),
             "hello there"
@@ -224,7 +227,7 @@ mod tests {
             })))
             .await
             .unwrap();
-        assert!(out.contains("3 replacements"), "got {out:?}");
+        assert!(out.summary.contains("3 replacements"), "got {out:?}");
         assert_eq!(
             std::fs::read_to_string(w.root.join("a.txt")).unwrap(),
             "y y y"
@@ -330,6 +333,8 @@ mod staleness_tests {
         RawValue::from_string(json.to_string()).unwrap()
     }
 
+    /// Read for the side effect only -- this is what puts the file in the
+    /// read-set so a following `edit_file` isn't rejected as stale.
     async fn read(w: &Workspace, path: &str) {
         ReadFile(w.clone())
             .execute(&args(serde_json::json!({ "path": path })))
@@ -343,6 +348,7 @@ mod staleness_tests {
                 "path": path, "old_string": old, "new_string": new
             })))
             .await
+            .map(|r| r.summary)
     }
 
     #[tokio::test]

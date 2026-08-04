@@ -21,7 +21,7 @@ use serde_json::value::RawValue;
 
 use crate::error::ToolError;
 use crate::fs::Workspace;
-use crate::tool::{Tool, obj_schema};
+use crate::tool::{Tool, ToolResult, obj_schema};
 use crate::walk::walk_files;
 
 const DEFAULT_MAX_RESULTS: usize = 50;
@@ -73,7 +73,7 @@ impl Tool for Search {
             &["query"],
         )
     }
-    async fn execute(&self, args: &RawValue) -> Result<String, ToolError> {
+    async fn execute(&self, args: &RawValue) -> Result<ToolResult, ToolError> {
         let a: SearchArgs = serde_json::from_str(args.get())?;
         if a.query.is_empty() {
             return Err(ToolError::Message("query is required".into()));
@@ -100,9 +100,9 @@ impl Tool for Search {
         .map_err(|e| ToolError::Message(format!("search task failed: {e}")))?;
 
         if hits.is_empty() {
-            return Ok(format!("no matches for {:?}", a.query));
+            return Ok(ToolResult::ok(format!("no matches for {:?}", a.query)));
         }
-        Ok(hits.join("\n"))
+        Ok(ToolResult::ok(hits.join("\n")))
     }
 }
 
@@ -168,7 +168,8 @@ mod tests {
         let out = Search(w.clone())
             .execute(&args(serde_json::json!({"query": "foo"})))
             .await
-            .unwrap();
+            .unwrap()
+            .summary;
         assert!(out.contains("a.rs:2:"), "got {out:?}");
         assert!(out.contains("foo"), "got {out:?}");
     }
@@ -180,7 +181,8 @@ mod tests {
         let out = Search(w.clone())
             .execute(&args(serde_json::json!({"query": "zzz"})))
             .await
-            .unwrap();
+            .unwrap()
+            .summary;
         assert!(out.contains("no matches"), "got {out:?}");
     }
 
@@ -193,7 +195,8 @@ mod tests {
         let out = Search(w.clone())
             .execute(&args(serde_json::json!({"query": "needle"})))
             .await
-            .unwrap();
+            .unwrap()
+            .summary;
         assert!(out.contains("keep.rs"), "got {out:?}");
         assert!(!out.contains("target"), "ignored dir leaked: {out:?}");
     }
@@ -205,7 +208,8 @@ mod tests {
         let out = Search(w.clone())
             .execute(&args(serde_json::json!({"query": "hit", "max_results": 3})))
             .await
-            .unwrap();
+            .unwrap()
+            .summary;
         assert!(out.contains("stopped at 3"), "got {out:?}");
     }
 
@@ -220,7 +224,8 @@ mod tests {
                 serde_json::json!({"query": "target_symbol", "path": "src"}),
             ))
             .await
-            .unwrap();
+            .unwrap()
+            .summary;
         assert!(out.contains("src/lib.rs"), "got {out:?}");
         assert!(!out.contains("top.rs"), "search escaped its scope: {out:?}");
     }

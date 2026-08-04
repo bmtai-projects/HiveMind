@@ -37,7 +37,7 @@ use serde_json::value::RawValue;
 use crate::embed_cache::EmbedCache;
 use crate::error::ToolError;
 use crate::fs::Workspace;
-use crate::tool::{Tool, obj_schema};
+use crate::tool::{Tool, ToolResult, obj_schema};
 use crate::walk::walk_files;
 
 const EMBED_DIM: usize = 512;
@@ -531,7 +531,7 @@ impl Tool for SemanticSearch {
             &["query"],
         )
     }
-    async fn execute(&self, args: &RawValue) -> Result<String, ToolError> {
+    async fn execute(&self, args: &RawValue) -> Result<ToolResult, ToolError> {
         let a: SemanticArgs = serde_json::from_str(args.get())?;
         if a.query.trim().is_empty() {
             return Err(ToolError::Message("query is required".into()));
@@ -638,7 +638,7 @@ impl Tool for SemanticSearch {
         .await
         .map_err(|e| ToolError::Message(format!("semantic search task failed: {e}")))?;
 
-        Ok(output)
+        Ok(ToolResult::ok(output))
     }
 }
 
@@ -834,7 +834,8 @@ mod tests {
                 serde_json::json!({"query": "read a file from disk", "top_k": 1}),
             ))
             .await
-            .unwrap();
+            .unwrap()
+            .summary;
         assert!(
             out.contains("reader.rs"),
             "expected reader.rs first, got:\n{out}"
@@ -865,7 +866,8 @@ mod tests {
                 serde_json::json!({"query": "login with token", "path": "src"}),
             ))
             .await
-            .unwrap();
+            .unwrap()
+            .summary;
         assert!(out.contains("src/auth.rs"), "got:\n{out}");
         assert!(!out.contains("notes.rs"), "scope leaked, got:\n{out}");
     }
@@ -879,7 +881,8 @@ mod tests {
                 serde_json::json!({"query": "zzqqxx_nonexistent_symbol_9000"}),
             ))
             .await
-            .unwrap();
+            .unwrap()
+            .summary;
         assert!(out.contains("no relevant code"), "got:\n{out}");
     }
 }

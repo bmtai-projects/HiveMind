@@ -6,7 +6,7 @@ use serde_json::value::RawValue;
 
 use crate::error::ToolError;
 use crate::readset::ReadSet;
-use crate::tool::{Tool, obj_schema};
+use crate::tool::{FileChangeKind, Tool, ToolResult, obj_schema};
 
 /// Confines file tools to a root directory. All paths are resolved relative
 /// to `root` and may not escape it.
@@ -235,7 +235,7 @@ impl Tool for ReadFile {
             &["path"],
         )
     }
-    async fn execute(&self, args: &RawValue) -> Result<String, ToolError> {
+    async fn execute(&self, args: &RawValue) -> Result<ToolResult, ToolError> {
         let a: ReadArgs = serde_json::from_str(args.get())?;
         let p = self.0.resolve(&a.path)?;
         let bytes = tokio::fs::read(&p).await?;
@@ -245,7 +245,7 @@ impl Tool for ReadFile {
         // looked at it", which a slice can't answer. That the model saw only
         // part of it is a separate matter, unaffected either way.
         self.0.read_set.record(&p, &text);
-        Ok(slice_file(&text, a.offset, a.limit))
+        Ok(ToolResult::ok(slice_file(&text, a.offset, a.limit)))
     }
 }
 
@@ -283,7 +283,7 @@ impl Tool for WriteFile {
             &["path", "content"],
         )
     }
-    async fn execute(&self, args: &RawValue) -> Result<String, ToolError> {
+    async fn execute(&self, args: &RawValue) -> Result<ToolResult, ToolError> {
         let a: WriteArgs = serde_json::from_str(args.get())?;
         if a.path.is_empty() {
             return Err(ToolError::Message("path is required".into()));
@@ -299,6 +299,8 @@ impl Tool for WriteFile {
         }
         // Re-resolve now that the parent exists, to enforce the workspace boundary.
         let p = self.0.resolve(&a.path)?;
+        // Checked before the write, because afterwards everything exists.
+        let existed = tokio::fs::try_exists(&p).await.unwrap_or(false);
         tokio::fs::write(&p, &a.content).await?;
         // A tool that just wrote the file knows exactly what's in it, so
         // this counts as having seen it -- otherwise a write-then-edit
@@ -312,7 +314,14 @@ impl Tool for WriteFile {
         if let Some(note) = crate::secrets::warning(&crate::secrets::scan(&a.content)) {
             out.push_str(&note);
         }
-        Ok(out)
+        Ok(ToolResult::ok(out).with_changed_file(
+            &a.path,
+            if existed {
+                FileChangeKind::Modified
+            } else {
+                FileChangeKind::Created
+            },
+        ))
     }
 }
 
@@ -335,7 +344,7 @@ impl Tool for ListDir {
             &["path"],
         )
     }
-    async fn execute(&self, args: &RawValue) -> Result<String, ToolError> {
+    async fn execute(&self, args: &RawValue) -> Result<ToolResult, ToolError> {
         let mut a: PathArgs = serde_json::from_str(args.get())?;
         if a.path.is_empty() {
             a.path = ".".to_string();
@@ -352,15 +361,16 @@ impl Tool for ListDir {
         }
         names.sort();
         if names.is_empty() {
-            return Ok("(empty)".to_string());
+            return Ok(ToolResult::ok("(empty)".to_string()));
         }
-        Ok(names.join("\n"))
+        Ok(ToolResult::ok(names.join("\n")))
     }
 }
 
 #[cfg(test)]
 mod read_slice_tests {
     use super::*;
+    use crate::tool::ToolStatus;
 
     fn numbered(n: usize) -> String {
         (1..=n)
@@ -499,6 +509,48 @@ mod read_slice_tests {
     }
 
     #[tokio::test]
+    async fn write_file_reports_creation_and_modification_distinctly() {
+        // The distinction is the point: a checkpoint has to delete a file
+        // the agent created but restore one it modified. Deriving that from
+        // the arguments after the fact is impossible -- by then the file
+        // exists either way.
+        let w = ws("changed_files");
+        let out = WriteFile(w.clone())
+            .execute(&args(
+                serde_json::json!({"path": "new.txt", "content": "hello"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(out.changed_files.len(), 1);
+        assert_eq!(out.changed_files[0].path, "new.txt");
+        assert_eq!(out.changed_files[0].kind, FileChangeKind::Created);
+
+        let out = WriteFile(w.clone())
+            .execute(&args(
+                serde_json::json!({"path": "new.txt", "content": "goodbye"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            out.changed_files[0].kind,
+            FileChangeKind::Modified,
+            "the same path a second time is a modification, not a creation"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_read_reports_no_file_changes() {
+        let w = ws("no_changes");
+        std::fs::write(w.root.join("f.txt"), "x").unwrap();
+        let out = ReadFile(w.clone())
+            .execute(&args(serde_json::json!({"path": "f.txt"})))
+            .await
+            .unwrap();
+        assert!(out.changed_files.is_empty(), "reading changes nothing");
+        assert_eq!(out.status, ToolStatus::Ok);
+    }
+
+    #[tokio::test]
     async fn the_tool_itself_honours_offset_and_limit_from_json_args() {
         // slice_file is covered above; this pins the seam in between --
         // that the new fields actually deserialize off the wire rather
@@ -511,7 +563,8 @@ mod read_slice_tests {
                 "path": "f.txt", "offset": 100, "limit": 2
             })))
             .await
-            .unwrap();
+            .unwrap()
+            .summary;
 
         assert!(out.starts_with("line 100\nline 101"), "{out}");
         assert!(
@@ -531,7 +584,8 @@ mod read_slice_tests {
         let out = ReadFile(w.clone())
             .execute(&args(serde_json::json!({"path": "f.txt"})))
             .await
-            .unwrap();
+            .unwrap()
+            .summary;
 
         assert_eq!(
             out, body,

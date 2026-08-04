@@ -484,6 +484,63 @@ mod tests {
         assert_eq!(derive_title(&[]), "");
     }
 
+    /// V4 from the M1 plan: a session written before the ToolResult
+    /// envelope existed must still load and resume.
+    ///
+    /// The JSON below is the exact shape a 1.9.2 binary wrote -- captured
+    /// from a real file in the session store, not reconstructed. It is
+    /// frozen here so the guarantee does not depend on whichever sessions
+    /// happen to be on the machine running the tests.
+    ///
+    /// This holds because a `ToolResult` never reaches a `SessionRecord`:
+    /// only its `summary` becomes a `Message`. The test exists to keep that
+    /// true, since a later field added to `Message` would break every saved
+    /// session silently and only on someone's `--continue`.
+    #[test]
+    fn a_session_written_before_the_tool_result_envelope_still_loads() {
+        let s = store("pre_m1");
+        std::fs::create_dir_all(s.dir()).unwrap();
+        let pre_m1 = r#"{
+          "id": "1785318157-719035",
+          "workspace": "/ws/one",
+          "model": "hivemind",
+          "reasoning_effort": null,
+          "budget_usd": null,
+          "session_cost_usd": 3e-06,
+          "created_at": 1785318157,
+          "updated_at": 1785318200,
+          "title": "list the files",
+          "messages": [
+            {"role": "system", "content": "you are an agent"},
+            {"role": "user", "content": "list the files"},
+            {"role": "assistant", "content": "", "tool_calls": [
+              {"id": "c1", "name": "project_map", "args": {}}
+            ]},
+            {"role": "tool", "content": "(no files found)", "tool_call_id": "c1", "name": "project_map"},
+            {"role": "assistant", "content": "The directory is empty."}
+          ]
+        }"#;
+        std::fs::write(s.dir().join("1785318157-719035.json"), pre_m1).unwrap();
+
+        let loaded = s
+            .load("1785318157-719035")
+            .expect("a pre-M1 session must still load");
+
+        assert_eq!(loaded.messages.len(), 5);
+        assert_eq!(loaded.turn_count(), 1);
+        // The tool result is still plain text, with no status alongside it --
+        // which is exactly why nothing had to migrate.
+        let tool_msg = loaded
+            .messages
+            .iter()
+            .find(|m| m.role == harness_types::Role::Tool)
+            .expect("the tool message survives the round trip");
+        assert_eq!(tool_msg.content, "(no files found)");
+        // Spend carries over, so resuming under a budget cannot hand out a
+        // fresh allowance.
+        assert!((loaded.session_cost_usd - 3e-06).abs() < 1e-12);
+    }
+
     #[cfg(unix)]
     #[test]
     fn saved_sessions_are_owner_only() {

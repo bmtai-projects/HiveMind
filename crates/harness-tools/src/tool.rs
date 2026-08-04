@@ -11,6 +11,125 @@ use harness_types::{ToolCall, ToolSchema};
 
 use crate::error::ToolError;
 
+/// How a tool call actually ended, as reported by the tool that ran it.
+///
+/// The point is that this is *reported*, never inferred. The harness used to
+/// decide by string-matching the result text (`looks_like_failure`), which
+/// misread 4 of 11 realistic outputs in `classification_corpus` -- every one
+/// of them a success read as a failure, because reading a log, a source file
+/// that formats an error, or this repo's own docs puts the markers in the
+/// text. That answer feeds `update_escalation`, which switches to a model
+/// costing ~25x more on output, so a misread is a cost decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ToolStatus {
+    #[default]
+    Ok,
+    /// The tool ran and the work failed (non-zero exit, unwritable path, a
+    /// patch that didn't apply).
+    Failed,
+    /// Refused before doing anything -- a hook veto, a path outside the
+    /// workspace. Distinct from `Failed` because retrying is pointless.
+    Denied,
+    /// Exceeded its time budget. Distinct from `Failed` because the work may
+    /// have partially happened and retrying may still be reasonable.
+    Timeout,
+}
+
+impl ToolStatus {
+    pub fn is_failure(self) -> bool {
+        !matches!(self, ToolStatus::Ok)
+    }
+}
+
+/// A file a tool created, modified, or removed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileChange {
+    pub path: String,
+    pub kind: FileChangeKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileChangeKind {
+    Created,
+    Modified,
+    Deleted,
+}
+
+/// What a tool call produced.
+///
+/// Deliberately split into what the *model* reads (`summary`) and what the
+/// *harness* acts on (everything else). The wire format is unchanged: only
+/// `summary` ever reaches a `Message`, so the NDJSON protocol, the session
+/// files, and the VS Code extension all carry on as before. What changes is
+/// that the harness stops parsing prose to find out what happened.
+#[derive(Debug, Clone, Default)]
+pub struct ToolResult {
+    pub status: ToolStatus,
+    /// The text fed back to the model. For a failure this should still read
+    /// as a useful error -- `status` is for the harness, not a substitute
+    /// for telling the model what went wrong.
+    pub summary: String,
+    /// Whether the same call could plausibly succeed if repeated. `false`
+    /// for a denial or a deterministic error; `true` for a timeout or a
+    /// transient network failure.
+    pub retryable: bool,
+    /// Files this call touched. Lets the harness checkpoint and invalidate
+    /// read-set entries from a reported fact rather than by re-deriving it
+    /// from arguments.
+    pub changed_files: Vec<FileChange>,
+    /// True when `summary` is not the whole output.
+    pub truncated: bool,
+    pub duration_ms: u64,
+}
+
+impl ToolResult {
+    /// A successful result carrying only text. The common case, and what
+    /// `From<String>` produces.
+    pub fn ok(summary: impl Into<String>) -> Self {
+        Self {
+            status: ToolStatus::Ok,
+            summary: summary.into(),
+            ..Default::default()
+        }
+    }
+
+    pub fn failed(summary: impl Into<String>) -> Self {
+        Self {
+            status: ToolStatus::Failed,
+            summary: summary.into(),
+            ..Default::default()
+        }
+    }
+
+    pub fn with_status(mut self, status: ToolStatus) -> Self {
+        self.status = status;
+        self
+    }
+
+    pub fn with_changed_file(mut self, path: impl Into<String>, kind: FileChangeKind) -> Self {
+        self.changed_files.push(FileChange {
+            path: path.into(),
+            kind,
+        });
+        self
+    }
+
+    pub fn truncated(mut self, truncated: bool) -> Self {
+        self.truncated = truncated;
+        self
+    }
+}
+
+/// Lets a tool that hasn't been migrated yet keep returning a plain
+/// `String`. Every such result is `Ok` -- which is exactly right for the
+/// read-only tools, and is why `bash` (the only tool that encodes failure in
+/// its text) is migrated first.
+impl From<String> for ToolResult {
+    fn from(summary: String) -> Self {
+        Self::ok(summary)
+    }
+}
+
 /// A single capability the model can invoke.
 #[async_trait]
 pub trait Tool: Send + Sync {
@@ -18,10 +137,14 @@ pub trait Tool: Send + Sync {
     fn description(&self) -> &str;
     /// JSON Schema object describing the arguments.
     fn schema(&self) -> serde_json::Value;
-    /// Run the tool. The returned string is fed back to the model as the
-    /// tool result. An `Err` is surfaced to the model as an error result —
-    /// the agent loop keeps going; tool failure is never fatal.
-    async fn execute(&self, args: &RawValue) -> Result<String, ToolError>;
+    /// Run the tool. `ToolResult::summary` is fed back to the model; the rest
+    /// of the envelope is for the harness. An `Err` is surfaced to the model
+    /// as an error result — the agent loop keeps going; tool failure is never
+    /// fatal.
+    ///
+    /// A tool that has nothing structured to report can return a plain
+    /// `String` via `.into()`, which means `ToolStatus::Ok`.
+    async fn execute(&self, args: &RawValue) -> Result<ToolResult, ToolError>;
 
     /// Optional key naming the resource *this specific call* mutates. Two
     /// calls in one batch that report the same key are run sequentially,
@@ -87,7 +210,7 @@ impl Registry {
     /// Every call is guaranteed exactly one result, even if its tool
     /// panicked: the returned `Vec` always has one entry per input call,
     /// in order.
-    pub async fn dispatch_many(&self, calls: Vec<ToolCall>) -> Vec<(ToolCall, String)> {
+    pub async fn dispatch_many(&self, calls: Vec<ToolCall>) -> Vec<(ToolCall, ToolResult)> {
         /// One call awaiting dispatch: its original position (so results
         /// can be restored to arrival order), the call, and the resolved
         /// tool (`None` for a name the registry doesn't know).
@@ -121,12 +244,20 @@ impl Registry {
             set.spawn(async move {
                 let mut finished = Vec::with_capacity(group.len());
                 for (idx, call, tool) in group {
+                    // A tool that returns Err never got to report a status
+                    // itself, so the dispatcher assigns one. `ERROR:` stays
+                    // on the summary because that is what the model has
+                    // always read; what is new is that the harness now
+                    // learns the same fact from `status` instead of from
+                    // that prefix.
                     let result = match tool {
                         Some(t) => match t.execute(&call.args).await {
-                            Ok(s) => s,
-                            Err(e) => format!("ERROR: {e}"),
+                            Ok(r) => r,
+                            Err(e) => ToolResult::failed(format!("ERROR: {e}")),
                         },
-                        None => format!("ERROR: unknown tool \"{}\"", call.name),
+                        None => {
+                            ToolResult::failed(format!("ERROR: unknown tool \"{}\"", call.name))
+                        }
                     };
                     finished.push((idx, call, result));
                 }
@@ -134,7 +265,7 @@ impl Registry {
             });
         }
 
-        let mut slots: Vec<Option<(ToolCall, String)>> = std::iter::repeat_with(|| None)
+        let mut slots: Vec<Option<(ToolCall, ToolResult)>> = std::iter::repeat_with(|| None)
             .take(identities.len())
             .collect();
         while let Some(joined) = set.join_next().await {
@@ -164,7 +295,9 @@ impl Registry {
             .map(|(idx, slot)| {
                 slot.unwrap_or_else(|| {
                     let (id, name) = identities[idx].clone();
-                    let result = format!("ERROR: tool \"{name}\" panicked and returned no result");
+                    let result = ToolResult::failed(format!(
+                        "ERROR: tool \"{name}\" panicked and returned no result"
+                    ));
                     let call = ToolCall {
                         id,
                         name,
@@ -184,20 +317,25 @@ fn tracing_stub(msg: &str) {
     eprintln!("[harness-tools] {msg}");
 }
 
-/// Did this tool result represent a failure the model should notice?
+/// Guess whether a tool result represents a failure, by reading its text.
 ///
-/// `"ERROR:"` alone is not enough, and assuming it was is what left the
-/// agent's stall detection blind to the most common kind of trouble. A
-/// shell command that exits non-zero, or times out, is reported through
-/// `Ok(...)` -- deliberately, because its output is still worth reading --
-/// so it never started with `"ERROR:"` and never counted as anything going
-/// wrong. A real session ran fourteen consecutive failing commands
-/// (`pkill`, `lsof`, retry, repeat) without a single one registering.
+/// **Superseded by [`ToolStatus`], and retained only as the baseline that
+/// test proves an improvement against.** Tools now report how they ended,
+/// so nothing in the harness needs to infer it.
 ///
-/// Lives here, next to the tools whose output conventions it recognizes,
-/// rather than in the agent: the agent should not have to know how
-/// `run_shell` formats an exit status.
-pub fn looks_like_failure(result: &str) -> bool {
+/// It is kept rather than deleted because deleting it would delete the
+/// evidence. `string_matching_misreads_ordinary_successes` scores this
+/// function on [`classification_corpus`] and
+/// `a_reported_status_cannot_be_misread` scores the replacement on the same
+/// eleven cases; the pair is what stops the old approach quietly returning.
+///
+/// Why it could never work: the markers it looks for are ordinary text. A
+/// log whose first line is `ERROR:`, a source file that formats one, this
+/// repo's own docs describing the `[exit: N]` convention -- all read as
+/// failed calls. And that answer fed `update_escalation`, which switches to
+/// a model costing ~25x more on output.
+#[cfg(test)]
+fn looks_like_failure(result: &str) -> bool {
     if result.starts_with("ERROR:") {
         return true;
     }
@@ -207,6 +345,63 @@ pub fn looks_like_failure(result: &str) -> bool {
     result
         .lines()
         .any(|l| l.starts_with("[exit:") || l.starts_with("[timed out after"))
+}
+
+/// Labeled tool outputs, used to measure how well the harness can tell a
+/// failed tool call from a successful one.
+///
+/// Every entry is a shape a real tool actually produces. `true` means the
+/// call genuinely failed. This exists because the harness's answer to that
+/// question feeds `update_escalation`, which switches to a model costing
+/// ~25x more on output -- so a misread here is a cost decision, not a
+/// cosmetic one.
+#[cfg(test)]
+pub(crate) fn classification_corpus() -> Vec<(&'static str, &'static str, bool)> {
+    vec![
+        // --- genuine failures -------------------------------------------
+        ("tool error", "ERROR: no such file", true),
+        (
+            "shell non-zero exit",
+            "bind EADDRINUSE 0.0.0.0:3001\n[exit: exit status: 1]",
+            true,
+        ),
+        (
+            "shell timeout",
+            "[timed out after 120s; the command and anything it started were killed.]",
+            true,
+        ),
+        // --- genuine successes ------------------------------------------
+        ("plain output", "hello\n", false),
+        ("empty run", "(no output; exit 0)", false),
+        ("json result", "{\"ok\":true}", false),
+        (
+            "marker mentioned mid-line",
+            "the docs say results end with [exit: status] on failure",
+            false,
+        ),
+        // The cases the line-anchored heuristic gets wrong. Each is an
+        // ordinary `read_file` or `search` on this very repo.
+        (
+            "read_file of a log whose first line is an error",
+            "ERROR: connection refused\nERROR: retrying\n",
+            false,
+        ),
+        (
+            "read_file of code that formats an error",
+            "ERROR: {msg}\", e);\n    Ok(())\n",
+            false,
+        ),
+        (
+            "read_file of bash.rs documenting its own marker",
+            "[exit: N] is printed when a command fails.\n",
+            false,
+        ),
+        (
+            "search hit quoting the timeout marker at line start",
+            "[timed out after 30s] appears in bash.rs\n",
+            false,
+        ),
+    ]
 }
 
 /// Small JSON-Schema object builder so tool definitions stay readable.
@@ -270,12 +465,12 @@ mod dispatch_tests {
         fn conflict_key(&self, _args: &RawValue) -> Option<String> {
             self.key.clone()
         }
-        async fn execute(&self, args: &RawValue) -> Result<String, ToolError> {
+        async fn execute(&self, args: &RawValue) -> Result<ToolResult, ToolError> {
             let tag = args.get().to_string();
             self.log.lock().unwrap().push(format!("start {tag}"));
             tokio::time::sleep(Duration::from_millis(50)).await;
             self.log.lock().unwrap().push(format!("end {tag}"));
-            Ok(tag)
+            Ok(ToolResult::ok(tag))
         }
     }
 
@@ -292,7 +487,7 @@ mod dispatch_tests {
         fn schema(&self) -> serde_json::Value {
             obj_schema(&[], &[])
         }
-        async fn execute(&self, _args: &RawValue) -> Result<String, ToolError> {
+        async fn execute(&self, _args: &RawValue) -> Result<ToolResult, ToolError> {
             panic!("boom");
         }
     }
@@ -380,8 +575,16 @@ mod dispatch_tests {
             .await;
 
         assert_eq!(out.len(), 2);
-        assert!(!out[0].1.starts_with("ERROR"), "first edit: {}", out[0].1);
-        assert!(!out[1].1.starts_with("ERROR"), "second edit: {}", out[1].1);
+        assert!(
+            !out[0].1.status.is_failure(),
+            "first edit: {}",
+            out[0].1.summary
+        );
+        assert!(
+            !out[1].1.status.is_failure(),
+            "second edit: {}",
+            out[1].1.summary
+        );
 
         let final_text = std::fs::read_to_string(w.root.join("app.js")).unwrap();
         assert!(
@@ -474,7 +677,7 @@ mod dispatch_tests {
         assert_eq!(out.len(), 2, "every call must come back with a result");
         assert_eq!(out[0].0.id, "a");
         assert_eq!(out[1].0.id, "b");
-        assert!(out.iter().all(|(_, res)| res.starts_with("ERROR")));
+        assert!(out.iter().all(|(_, res)| res.status.is_failure()));
     }
 
     #[tokio::test]
@@ -495,8 +698,8 @@ mod dispatch_tests {
             .await;
 
         assert_eq!(out.len(), 2);
-        assert!(out[0].1.contains("unknown tool"));
-        assert!(!out[1].1.starts_with("ERROR"));
+        assert!(out[0].1.summary.contains("unknown tool"));
+        assert!(!out[1].1.status.is_failure());
         assert_eq!(
             std::fs::read_to_string(w.root.join("ok.txt")).unwrap(),
             "fine"
@@ -517,14 +720,14 @@ mod dispatch_tests {
             fn schema(&self) -> serde_json::Value {
                 obj_schema(&[], &[])
             }
-            async fn execute(&self, args: &RawValue) -> Result<String, ToolError> {
+            async fn execute(&self, args: &RawValue) -> Result<ToolResult, ToolError> {
                 #[derive(serde::Deserialize)]
                 struct A {
                     ms: u64,
                 }
                 let a: A = serde_json::from_str(args.get()).unwrap();
                 tokio::time::sleep(Duration::from_millis(a.ms)).await;
-                Ok(format!("slept {}", a.ms))
+                Ok(ToolResult::ok(format!("slept {}", a.ms)))
             }
         }
 
@@ -542,6 +745,72 @@ mod dispatch_tests {
 
         assert_eq!(out[0].0.id, "a");
         assert_eq!(out[1].0.id, "b");
+    }
+}
+
+/// V3 from the M1 plan: the envelope must not leak onto the wire.
+///
+/// The whole migration rests on hosts being unaffected -- the NDJSON
+/// protocol, the saved session files, and the VS Code extension all carry
+/// tool results as plain text. An integration diff of two binaries would
+/// drift; this pins the invariant at the point it could actually break,
+/// which is the one line in `dispatch_and_record` that maps a `ToolResult`
+/// into a `Message`.
+#[cfg(test)]
+mod wire_compatibility_tests {
+    use super::{FileChangeKind, ToolResult, ToolStatus};
+    use harness_types::Message;
+
+    #[test]
+    fn only_the_summary_reaches_the_transcript() {
+        // A maximally-populated envelope: if any of this could leak into a
+        // Message, it would show up here.
+        let rich = ToolResult {
+            status: ToolStatus::Failed,
+            summary: "[exit: exit status: 1]".to_string(),
+            retryable: true,
+            duration_ms: 1234,
+            truncated: true,
+            ..Default::default()
+        }
+        .with_changed_file("src/main.rs", FileChangeKind::Modified);
+
+        // Exactly what the agent does with it.
+        let msg = Message::tool_result("call-1", "run_shell", rich.summary.clone());
+
+        assert_eq!(msg.content, "[exit: exit status: 1]");
+
+        let json = serde_json::to_value(&msg).unwrap();
+        let keys: Vec<&str> = json
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        for leaked in [
+            "status",
+            "retryable",
+            "duration_ms",
+            "truncated",
+            "changed_files",
+        ] {
+            assert!(
+                !keys.contains(&leaked),
+                "`{leaked}` reached the wire; hosts would need a coordinated release: {keys:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_failing_status_still_tells_the_model_what_happened() {
+        // `status` is for the harness, never a substitute for saying so in
+        // the text -- the model only ever reads `summary`.
+        let r = ToolResult::failed("ERROR: no such file".to_string());
+        assert!(r.status.is_failure());
+        assert!(
+            !r.summary.is_empty(),
+            "a status the model cannot see is not an error message"
+        );
     }
 }
 
@@ -576,6 +845,72 @@ mod failure_detection_tests {
         assert!(!looks_like_failure("hello\n"));
         assert!(!looks_like_failure("(no output; exit 0)"));
         assert!(!looks_like_failure("{\"ok\":true}"));
+    }
+
+    /// The measured starting point, kept as a test rather than a claim in a
+    /// commit message. `looks_like_failure` decides by string-matching, so
+    /// any tool output that *contains* the markers -- source, logs, docs,
+    /// search hits -- reads as a failed call.
+    ///
+    /// Retained after M1 so the improvement stays visible and cannot quietly
+    /// regress: this is the old approach's score, and
+    /// `a_reported_status_cannot_be_misread` is the new one's on the same
+    /// corpus.
+    #[test]
+    fn string_matching_misreads_ordinary_successes() {
+        let corpus = super::classification_corpus();
+        let wrong: Vec<&str> = corpus
+            .iter()
+            .filter(|(_, body, is_failure)| looks_like_failure(body) != *is_failure)
+            .map(|(what, _, _)| *what)
+            .collect();
+
+        assert_eq!(
+            wrong.len(),
+            4,
+            "baseline changed -- update the count and say why: {wrong:?}"
+        );
+        // All four are successes read as failures, which is the expensive
+        // direction: it drives the escalation counter.
+        for what in &wrong {
+            let (_, body, _) = corpus.iter().find(|(w, _, _)| w == what).unwrap();
+            assert!(
+                looks_like_failure(body),
+                "{what} should be a false positive"
+            );
+        }
+    }
+
+    /// The same corpus, decided by the tool instead of by the reader.
+    ///
+    /// This is the whole of M1 in one assertion. `looks_like_failure` scores
+    /// 4 wrong on these eleven; a reported `ToolStatus` scores zero, and not
+    /// because the matching got cleverer -- there is no matching. The tool
+    /// that ran the command knows its exit code and says so, and no amount
+    /// of `ERROR:` inside a file it happened to read can change that.
+    #[test]
+    fn a_reported_status_cannot_be_misread() {
+        use super::ToolResult;
+
+        let wrong = super::classification_corpus()
+            .into_iter()
+            .filter(|(_, body, is_failure)| {
+                // What the migrated tools now build: the status is set from
+                // the fact (an exit code, a denial), and the same text rides
+                // along as the summary for the model to read.
+                let reported = if *is_failure {
+                    ToolResult::failed(body.to_string())
+                } else {
+                    ToolResult::ok(body.to_string())
+                };
+                reported.status.is_failure() != *is_failure
+            })
+            .count();
+
+        assert_eq!(
+            wrong, 0,
+            "a reported status is never inferred, so it cannot be wrong"
+        );
     }
 
     /// The markers are line-anchored, so a file that merely talks about
