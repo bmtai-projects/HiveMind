@@ -1,7 +1,7 @@
 //! The unified `Tool` trait and its registry — analogue of grok-build's
 //! `xai-tool-runtime` `Tool` trait + `ToolBridge`.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -80,6 +80,10 @@ pub struct ToolResult {
     /// True when `summary` is not the whole output.
     pub truncated: bool,
     pub duration_ms: u64,
+    /// Exact charge reported by a metered tool's HiveMind endpoint. Local
+    /// tools leave this at zero. Kept outside `summary` so accounting never
+    /// depends on parsing model-visible prose.
+    pub cost_usd: f64,
 }
 
 impl ToolResult {
@@ -167,6 +171,7 @@ pub trait Tool: Send + Sync {
 #[derive(Clone, Default)]
 pub struct Registry {
     tools: BTreeMap<String, Arc<dyn Tool>>,
+    disabled: BTreeSet<String>,
 }
 
 impl Registry {
@@ -178,13 +183,48 @@ impl Registry {
         self.tools.insert(tool.name().to_string(), tool);
     }
 
+    /// Register a capability without advertising or dispatching it yet.
+    /// This is used for opt-in paid tools: toggling only changes this set,
+    /// while the underlying sorted registry and schemas stay deterministic.
+    pub fn register_disabled(&mut self, tool: Arc<dyn Tool>) {
+        let name = tool.name().to_string();
+        self.tools.insert(name.clone(), tool);
+        self.disabled.insert(name);
+    }
+
+    pub fn contains(&self, name: &str) -> bool {
+        self.tools.contains_key(name)
+    }
+
+    pub fn set_enabled(&mut self, name: &str, enabled: bool) -> bool {
+        if !self.tools.contains_key(name) {
+            return false;
+        }
+        if enabled {
+            self.disabled.remove(name);
+        } else {
+            self.disabled.insert(name.to_string());
+        }
+        true
+    }
+
+    pub fn is_enabled(&self, name: &str) -> bool {
+        self.tools.contains_key(name) && !self.disabled.contains(name)
+    }
+
     pub fn names(&self) -> Vec<&str> {
-        self.tools.keys().map(String::as_str).collect()
+        self.tools
+            .keys()
+            .filter(|name| !self.disabled.contains(*name))
+            .map(String::as_str)
+            .collect()
     }
 
     pub fn schemas(&self) -> Vec<ToolSchema> {
         self.tools
-            .values()
+            .iter()
+            .filter(|(name, _)| !self.disabled.contains(*name))
+            .map(|(_, t)| t)
             .map(|t| ToolSchema {
                 name: t.name().to_string(),
                 description: t.description().to_string(),
@@ -226,7 +266,11 @@ impl Registry {
 
         for (idx, call) in calls.into_iter().enumerate() {
             identities.push((call.id.clone(), call.name.clone()));
-            let tool = self.tools.get(&call.name).cloned();
+            let tool = self
+                .tools
+                .get(&call.name)
+                .filter(|_| !self.disabled.contains(&call.name))
+                .cloned();
             match tool.as_ref().and_then(|t| t.conflict_key(&call.args)) {
                 Some(key) => match group_of_key.get(&key) {
                     Some(&g) => groups[g].push((idx, call, tool)),
@@ -707,6 +751,52 @@ mod dispatch_tests {
     }
 
     #[tokio::test]
+    async fn a_disabled_tool_is_absent_from_manifest_and_cannot_dispatch() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut r = Registry::new();
+        r.register_disabled(Arc::new(Recorder {
+            log: log.clone(),
+            key: None,
+        }));
+
+        assert!(
+            r.contains("recorder"),
+            "the hosted capability stays registered"
+        );
+        assert!(!r.is_enabled("recorder"));
+        assert!(r.names().is_empty());
+        assert!(r.schemas().is_empty());
+
+        let denied = r
+            .dispatch_many(vec![call("off", "recorder", serde_json::json!({}))])
+            .await;
+        assert!(denied[0].1.status.is_failure());
+        assert!(denied[0].1.summary.contains("unknown tool"));
+        assert!(
+            log.lock().unwrap().is_empty(),
+            "disabled means it did not run"
+        );
+
+        assert!(r.set_enabled("recorder", true));
+        assert!(r.is_enabled("recorder"));
+        assert_eq!(r.names(), vec!["recorder"]);
+        assert_eq!(r.schemas().len(), 1);
+
+        let allowed = r
+            .dispatch_many(vec![call("on", "recorder", serde_json::json!({}))])
+            .await;
+        assert!(!allowed[0].1.status.is_failure());
+        assert!(
+            !log.lock().unwrap().is_empty(),
+            "enabling makes it dispatchable"
+        );
+
+        assert!(r.set_enabled("recorder", false));
+        assert!(r.names().is_empty());
+        assert!(!r.set_enabled("missing", true));
+    }
+
+    #[tokio::test]
     async fn results_keep_arrival_order_regardless_of_completion_order() {
         struct SlowFirst;
         #[async_trait]
@@ -771,6 +861,7 @@ mod wire_compatibility_tests {
             retryable: true,
             duration_ms: 1234,
             truncated: true,
+            cost_usd: 0.125,
             ..Default::default()
         }
         .with_changed_file("src/main.rs", FileChangeKind::Modified);
@@ -793,6 +884,7 @@ mod wire_compatibility_tests {
             "duration_ms",
             "truncated",
             "changed_files",
+            "cost_usd",
         ] {
             assert!(
                 !keys.contains(&leaked),

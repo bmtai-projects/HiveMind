@@ -31,7 +31,16 @@ pub trait Ui: Send + Sync {
     fn tool_call_pending(&self, _name: &str) {}
 
     fn tool_start(&self, name: &str, args: &str);
-    fn tool_end(&self, name: &str, result: &str, is_error: bool);
+    /// `cost_usd` is non-zero only for a successful metered tool.
+    /// `session_cost_usd` is authoritative after that charge is applied.
+    fn tool_end(
+        &self,
+        name: &str,
+        result: &str,
+        is_error: bool,
+        cost_usd: f64,
+        session_cost_usd: f64,
+    );
 
     /// Fired after every sampled response, whether or not it called tools.
     /// `hosted` says whether `model_id` is billed through HiveMind's hosted

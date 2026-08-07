@@ -17,6 +17,7 @@ mod semantic;
 mod todo;
 mod tool;
 mod walk;
+mod web;
 mod xlsx;
 
 pub use bash::{ApproveFn, Bash, shell_command, strip_verbatim};
@@ -33,4 +34,5 @@ pub use search::Search;
 pub use semantic::{Embedder, HashingEmbedder, ProgressSink, SemanticSearch};
 pub use todo::TodoWrite;
 pub use tool::{FileChange, FileChangeKind, Registry, Tool, ToolResult, ToolStatus, obj_schema};
+pub use web::{HostedWebClient, WebFetch, WebSearch};
 pub use xlsx::CreateSpreadsheet;

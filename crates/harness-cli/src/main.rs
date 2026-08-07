@@ -32,12 +32,13 @@ use std::sync::Arc;
 use clap::{Args, Parser, Subcommand};
 use reedline::Signal;
 
-use commands::{BudgetArg, ModelArg, ReasoningArg, SlashCommand, UndoArg};
+use commands::{BudgetArg, ModelArg, ReasoningArg, SlashCommand, UndoArg, WebArg};
 use harness_agent::{Agent, Ui};
 use harness_config::CliOverrides;
 use harness_tools::{
-    Bash, CreateDiagram, CreatePdf, CreateSpreadsheet, EditFile, ListDir, ProjectMap, ReadFile,
-    Registry, Search, SemanticSearch, TodoWrite, Workspace, WriteFile,
+    Bash, CreateDiagram, CreatePdf, CreateSpreadsheet, EditFile, HostedWebClient, ListDir,
+    ProjectMap, ReadFile, Registry, Search, SemanticSearch, TodoWrite, WebFetch, WebSearch,
+    Workspace, WriteFile,
 };
 use input::HivePrompt;
 use json_ui::JsonUi;
@@ -381,6 +382,11 @@ struct ActivateArgs {
     #[arg(long)]
     mode: Option<String>,
 
+    /// Enable hosted public web search for this session. Off by default and
+    /// available only with `hivemind auth login` credentials.
+    #[arg(long)]
+    web: bool,
+
     /// Resume the most recent session for this workspace. Restores the
     /// conversation, model, and accumulated spend -- but not `/undo`
     /// history, which is deliberately never carried across processes (the
@@ -593,6 +599,9 @@ async fn run(args: ActivateArgs) -> anyhow::Result<()> {
         &harness_config::default_credentials_path(),
         overrides,
     )?;
+    if args.web && !resolved.hosted {
+        anyhow::bail!("--web requires HiveMind hosted sign-in; run `hivemind auth login`");
+    }
 
     let workdir = args
         .workdir
@@ -623,6 +632,14 @@ async fn run(args: ActivateArgs) -> anyhow::Result<()> {
     registry.register(Arc::new(ListDir(ws.clone())));
     registry.register(Arc::new(ProjectMap(ws.clone())));
     registry.register(Arc::new(Search(ws.clone())));
+    if resolved.hosted
+        && let Some(web_client) =
+            HostedWebClient::new(&resolved.endpoint.base_url, &resolved.endpoint.api_key)
+    {
+        let web_client = Arc::new(web_client);
+        registry.register_disabled(Arc::new(WebSearch(web_client.clone())));
+        registry.register_disabled(Arc::new(WebFetch(web_client)));
+    }
     // Pro mode swaps semantic_search onto hosted embeddings. Standard mode
     // -- and any Pro session that can't reach them -- keeps the local
     // embedder, which is also retained inside SemanticSearch as the runtime
@@ -706,6 +723,9 @@ async fn run(args: ActivateArgs) -> anyhow::Result<()> {
             false,
             project_conventions.as_deref(),
         )?;
+        if args.web {
+            agent.set_web_enabled(true).map_err(anyhow::Error::msg)?;
+        }
         return run_json_protocol(&mut agent, ws, json_ui).await;
     }
 
@@ -722,6 +742,9 @@ async fn run(args: ActivateArgs) -> anyhow::Result<()> {
     if let Some(prompt) = &args.prompt {
         // A one-shot `-p` run has nothing worth resuming later, so it stays
         // unpersisted -- no session file, no clutter in `hivemind sessions`.
+        if args.web {
+            agent.set_web_enabled(true).map_err(anyhow::Error::msg)?;
+        }
         let expanded = mentions::expand_mentions(prompt, &ws);
         agent.run(&expanded).await?;
         return Ok(());
@@ -735,6 +758,9 @@ async fn run(args: ActivateArgs) -> anyhow::Result<()> {
         true,
         project_conventions.as_deref(),
     )?;
+    if args.web {
+        agent.set_web_enabled(true).map_err(anyhow::Error::msg)?;
+    }
 
     repl(&mut agent, ws, ui, args.yolo, update_check, resolved.mode).await
 }
@@ -823,7 +849,11 @@ async fn run_json_protocol(
 ) -> anyhow::Result<()> {
     use tokio::io::AsyncBufReadExt;
 
-    ui.emit_ready(agent.session_id());
+    ui.emit_ready(
+        agent.session_id(),
+        agent.web_available(),
+        agent.web_enabled(),
+    );
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<json_ui::Command>();
     let reader_ui = ui.clone();
@@ -898,6 +928,13 @@ async fn run_json_protocol(
             }
             json_ui::Command::SetBudget { budget_usd } => {
                 agent.set_budget_usd(budget_usd);
+                ui.emit_turn_done();
+            }
+            json_ui::Command::SetWebEnabled { enabled } => {
+                if let Err(message) = agent.set_web_enabled(enabled) {
+                    ui.emit_error(message);
+                }
+                ui.emit_web_mode(agent.web_available(), agent.web_enabled());
                 ui.emit_turn_done();
             }
             json_ui::Command::Undo { n } => {
@@ -1047,6 +1084,20 @@ async fn repl(
                 SlashCommand::Budget(BudgetArg::Invalid(bad)) => {
                     println!(
                         "invalid budget {bad:?} — expected a number, e.g. /budget 0.50, or /budget off"
+                    );
+                }
+                SlashCommand::Web(WebArg::Show) => print_web_status(agent),
+                SlashCommand::Web(WebArg::On) => match agent.set_web_enabled(true) {
+                    Ok(()) => println!("web: on (up to 3 search/fetch operations per request)"),
+                    Err(message) => println!("{message}"),
+                },
+                SlashCommand::Web(WebArg::Off) => {
+                    let _ = agent.set_web_enabled(false);
+                    println!("web: off");
+                }
+                SlashCommand::Web(WebArg::Invalid(bad)) => {
+                    println!(
+                        "invalid web mode {bad:?} — expected /web on, /web off, or /web status"
                     );
                 }
                 SlashCommand::Cost => {
@@ -1200,6 +1251,16 @@ fn print_status(agent: &Agent, mode: harness_config::Mode) {
         "\x1b[1mreasoning\x1b[0m  {}",
         agent.reasoning_effort().unwrap_or("off")
     );
+    println!(
+        "\x1b[1mweb\x1b[0m        {}",
+        if !agent.web_available() {
+            "unavailable (hosted sign-in required)"
+        } else if agent.web_enabled() {
+            "on (3 operations per request)"
+        } else {
+            "off"
+        }
+    );
     match agent.budget_usd() {
         Some(b) => println!(
             "\x1b[1mcost\x1b[0m       ${:.6} of ${b:.2} budget",
@@ -1239,6 +1300,16 @@ fn print_status(agent: &Agent, mode: harness_config::Mode) {
         );
     }
     println!("\x1b[90m  run_shell changes are not tracked; /diff shows the detail\x1b[0m");
+}
+
+fn print_web_status(agent: &Agent) {
+    if !agent.web_available() {
+        println!("web: unavailable — run `hivemind auth login` to use hosted web search");
+    } else if agent.web_enabled() {
+        println!("web: on (up to 3 search/fetch operations per request)");
+    } else {
+        println!("web: off (enable with /web on)");
+    }
 }
 
 /// `/context` — the numbers that decide when trimming, compaction, and the
