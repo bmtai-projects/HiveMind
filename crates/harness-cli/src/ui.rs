@@ -126,9 +126,21 @@ impl Ui for TermUi {
         println!("\x1b[36m⚙ {name}\x1b[0m {}", one_line(args, 140));
     }
 
-    fn tool_end(&self, name: &str, result: &str, is_error: bool) {
+    fn tool_end(
+        &self,
+        name: &str,
+        result: &str,
+        is_error: bool,
+        cost_usd: f64,
+        session_cost_usd: f64,
+    ) {
+        let cost = if cost_usd > 0.0 {
+            format!(" · ${cost_usd:.6} / ${session_cost_usd:.6} session")
+        } else {
+            String::new()
+        };
         if is_error {
-            println!("\x1b[31m  ✗ {name}\x1b[0m {}", one_line(result, 160));
+            println!("\x1b[31m  ✗ {name}\x1b[0m {}{cost}", one_line(result, 160));
             return;
         }
         // todo_write's result is a multi-line checklist -- one_line() would
@@ -142,7 +154,7 @@ impl Ui for TermUi {
             }
             return;
         }
-        println!("\x1b[32m  ✓ {name}\x1b[0m {}", one_line(result, 160));
+        println!("\x1b[32m  ✓ {name}\x1b[0m {}{cost}", one_line(result, 160));
     }
 
     fn usage(&self, usage: &Usage, model_id: &str, hosted: bool, session_cost_usd: f64) {

@@ -11,6 +11,7 @@ pub const COMMAND_NAMES: &[&str] = &[
     "/model",
     "/reasoning",
     "/budget",
+    "/web",
     "/cost",
     "/undo",
     "/exit",
@@ -27,6 +28,7 @@ Commands:
   /model [id]        show available models, or switch the active one
   /reasoning [level]  show/set reasoning effort for the active model, or `off`
   /budget [amount]   show/set a session USD spend cap, or `off` (default: unbounded)
+  /web [on|off]      show or toggle hosted web search (off by default)
   /cost              show session cost so far
   /undo [n]          undo the last n turns (default 1): restores edited/written
                      files and truncates the conversation back to before them
@@ -63,6 +65,13 @@ pub enum UndoArg {
     Invalid(String),
 }
 
+pub enum WebArg {
+    Show,
+    On,
+    Off,
+    Invalid(String),
+}
+
 pub enum SlashCommand {
     Help,
     Status,
@@ -76,6 +85,7 @@ pub enum SlashCommand {
     Model(ModelArg),
     Reasoning(ReasoningArg),
     Budget(BudgetArg),
+    Web(WebArg),
     Cost,
     Undo(UndoArg),
     Exit,
@@ -113,6 +123,12 @@ pub fn parse(line: &str) -> Option<SlashCommand> {
                 .parse::<f64>()
                 .map(BudgetArg::Set)
                 .unwrap_or_else(|_| BudgetArg::Invalid(a.to_string())),
+        }),
+        "web" => SlashCommand::Web(match arg {
+            None | Some("status") => WebArg::Show,
+            Some("on") => WebArg::On,
+            Some("off") => WebArg::Off,
+            Some(other) => WebArg::Invalid(other.to_string()),
         }),
         "cost" | "usage" => SlashCommand::Cost,
         "undo" => SlashCommand::Undo(match arg {
@@ -261,6 +277,30 @@ mod tests {
             Some(SlashCommand::Budget(BudgetArg::Invalid(s))) => assert_eq!(s, "lots"),
             other => panic!("expected Invalid(\"lots\"), got {}", other.is_some()),
         }
+    }
+
+    #[test]
+    fn web_supports_status_on_and_off() {
+        assert!(matches!(
+            parse("/web"),
+            Some(SlashCommand::Web(WebArg::Show))
+        ));
+        assert!(matches!(
+            parse("/web status"),
+            Some(SlashCommand::Web(WebArg::Show))
+        ));
+        assert!(matches!(
+            parse("/web on"),
+            Some(SlashCommand::Web(WebArg::On))
+        ));
+        assert!(matches!(
+            parse("/web off"),
+            Some(SlashCommand::Web(WebArg::Off))
+        ));
+        assert!(matches!(
+            parse("/web maybe"),
+            Some(SlashCommand::Web(WebArg::Invalid(_)))
+        ));
     }
 
     #[test]
