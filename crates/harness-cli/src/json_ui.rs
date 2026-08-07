@@ -46,6 +46,9 @@ pub enum Command {
         #[serde(default)]
         budget_usd: Option<f64>,
     },
+    SetWebEnabled {
+        enabled: bool,
+    },
     Undo {
         n: usize,
     },
@@ -109,7 +112,7 @@ impl JsonUi {
     /// workspace" races as soon as two sessions start at once. `None` when
     /// persistence is off, which a host must treat as "this conversation
     /// will not be resumable" rather than as an error.
-    pub fn emit_ready(&self, session_id: Option<&str>) {
+    pub fn emit_ready(&self, session_id: Option<&str>, web_available: bool, web_enabled: bool) {
         let models: Vec<_> = harness_config::KNOWN_MODELS
             .iter()
             .map(|m| {
@@ -127,6 +130,16 @@ impl JsonUi {
             "type": "ready",
             "models": models,
             "session_id": session_id,
+            "web_available": web_available,
+            "web_enabled": web_enabled,
+        }));
+    }
+
+    pub fn emit_web_mode(&self, available: bool, enabled: bool) {
+        self.emit(json!({
+            "type": "web_mode",
+            "available": available,
+            "enabled": enabled,
         }));
     }
 
@@ -231,13 +244,26 @@ impl Ui for JsonUi {
         self.emit(json!({"type": "tool_start", "name": name, "args": args}));
     }
 
-    fn tool_end(&self, name: &str, result: &str, is_error: bool) {
-        self.emit(json!({
+    fn tool_end(
+        &self,
+        name: &str,
+        result: &str,
+        is_error: bool,
+        cost_usd: f64,
+        session_cost_usd: f64,
+    ) {
+        let mut event = json!({
             "type": "tool_end",
             "name": name,
             "result": result,
             "is_error": is_error,
-        }));
+        });
+        if cost_usd > 0.0 {
+            let object = event.as_object_mut().expect("tool_end is an object");
+            object.insert("cost_usd".into(), json!(cost_usd));
+            object.insert("session_cost_usd".into(), json!(session_cost_usd));
+        }
+        self.emit(event);
     }
 
     fn usage(&self, usage: &Usage, model_id: &str, hosted: bool, session_cost_usd: f64) {
