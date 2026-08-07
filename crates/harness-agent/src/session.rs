@@ -43,6 +43,10 @@ pub struct SessionRecord {
     pub budget_usd: Option<f64>,
     #[serde(default)]
     pub session_cost_usd: f64,
+    /// Opt-in hosted capability. Default keeps every pre-web-mode session
+    /// readable and off unless the user explicitly enabled it.
+    #[serde(default)]
+    pub web_enabled: bool,
     pub messages: Vec<Message>,
     /// Unix seconds. Stored as plain integers to keep this crate free of a
     /// date-time dependency; formatting for humans is the host's business.
@@ -355,6 +359,7 @@ mod tests {
             reasoning_effort: None,
             budget_usd: None,
             session_cost_usd: 0.0,
+            web_enabled: false,
             messages: vec![Message::system("sys"), Message::user("build a thing")],
             created_at: 100,
             updated_at: 100,
@@ -368,12 +373,14 @@ mod tests {
         let mut rec = record("abc", "/ws/one");
         rec.session_cost_usd = 0.0421;
         rec.reasoning_effort = Some("high".into());
+        rec.web_enabled = true;
         s.save(&rec).unwrap();
 
         let loaded = s.load("abc").unwrap();
         assert_eq!(loaded.id, "abc");
         assert_eq!(loaded.messages.len(), 2);
         assert_eq!(loaded.reasoning_effort.as_deref(), Some("high"));
+        assert!(loaded.web_enabled);
         // Cost must survive: resuming under a budget can't silently hand out
         // a fresh allowance.
         assert!((loaded.session_cost_usd - 0.0421).abs() < 1e-9);
@@ -539,6 +546,10 @@ mod tests {
         // Spend carries over, so resuming under a budget cannot hand out a
         // fresh allowance.
         assert!((loaded.session_cost_usd - 3e-06).abs() < 1e-12);
+        assert!(
+            !loaded.web_enabled,
+            "pre-web sessions must restore with web off"
+        );
     }
 
     #[cfg(unix)]
