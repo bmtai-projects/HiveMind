@@ -7,7 +7,9 @@ use std::sync::Arc;
 
 use harness_config::{AgentPolicy, HookSpec, Resolved};
 use harness_provider::DeepSeekClient;
-use harness_tools::{Registry, Workspace};
+use harness_tools::{
+    ArtifactStore, DEFAULT_ARTIFACT_THRESHOLD_BYTES, Registry, ToolResult, Workspace,
+};
 use harness_types::{ChatRequest, Message, Role, StreamEvent, ToolCall};
 
 use crate::checkpoint::{self, Checkpoint, UndoReport};
@@ -107,6 +109,20 @@ pub struct Agent {
     hooks: Vec<HookSpec>,
     interjections: InterjectionQueue,
     persistence: Option<Persistence>,
+    /// Where oversized tool results are offloaded. `None` disables the
+    /// feature outright and every result is inlined exactly as before --
+    /// which is what keeps `Agent::new` unchanged and every existing caller,
+    /// test, and embedder working without knowing artifacts exist.
+    artifacts: Option<ArtifactStore>,
+    artifact_threshold_bytes: usize,
+    /// Namespace for this process's artifacts when the conversation isn't
+    /// being persisted. A one-shot `-p` run deliberately writes no session
+    /// file, but it is exactly the case where one `cargo test` can blow up
+    /// the context inside a single run -- keying artifacts on the session id
+    /// alone would switch the feature off precisely where it earns most.
+    /// Swept by `ArtifactStore::prune_orphans`, since no session record will
+    /// ever refer to it.
+    ephemeral_artifact_id: String,
 }
 
 /// Bookkeeping for a session that's being written to disk.
@@ -169,7 +185,23 @@ impl Agent {
             hooks: resolved.hooks,
             interjections: InterjectionQueue::new(),
             persistence: None,
+            artifacts: None,
+            artifact_threshold_bytes: DEFAULT_ARTIFACT_THRESHOLD_BYTES,
+            ephemeral_artifact_id: format!("tmp-{}-{}", std::process::id(), unix_now()),
         }
+    }
+
+    /// Offload tool results at or above `threshold_bytes` to `store`,
+    /// replacing them in the conversation with a preview plus a handle.
+    ///
+    /// Opt-in rather than always-on: this writes new user data to disk and
+    /// changes what the model reads, so a host that hasn't asked for it gets
+    /// exactly the previous behaviour. Requires persistence to be enabled --
+    /// handles are namespaced by session id, and a result that outlives the
+    /// process it was produced in is the whole point.
+    pub fn enable_artifacts(&mut self, store: ArtifactStore, threshold_bytes: usize) {
+        self.artifacts = Some(store);
+        self.artifact_threshold_bytes = threshold_bytes;
     }
 
     /// Handle for delivering mid-turn messages. Clone it and hand it to
@@ -710,8 +742,49 @@ impl Agent {
             }
             // Only `summary` reaches the transcript, so the wire format,
             // the session files, and every existing host are unaffected.
+            // When artifacts are on, an oversized summary is swapped for a
+            // preview here -- after `tool_end` above, so what a host renders
+            // is still the full result the tool produced.
+            let summary = self
+                .offload_if_large(&call.id, &result)
+                .unwrap_or(result.summary);
             self.messages
-                .push(Message::tool_result(call.id, call.name, result.summary));
+                .push(Message::tool_result(call.id, call.name, summary));
+        }
+    }
+
+    /// Write an oversized result to the artifact store and return the
+    /// preview that should stand in for it, or `None` to inline it as-is.
+    ///
+    /// Never fails a turn. A store that can't be written to (full disk, bad
+    /// permissions) falls back to the old inline behaviour, because losing
+    /// the saving is a far smaller problem than losing the tool call.
+    fn offload_if_large(&self, call_id: &str, result: &ToolResult) -> Option<String> {
+        let store = self.artifacts.as_ref()?;
+        // A persisted session owns its artifacts and prunes them with the
+        // conversation; an unpersisted run falls back to a per-process id so
+        // the feature still works there. Handles are absolute either way, so
+        // one that was minted before persistence turned on still resolves.
+        let namespace = self
+            .session_id()
+            .unwrap_or(&self.ephemeral_artifact_id)
+            .to_string();
+        // The policy itself lives in harness_tools so it can be tested as a
+        // pure function -- including the case that matters most, where the
+        // tool already clamped its own output and `summary.len()` would
+        // wrongly look small.
+        let full = harness_tools::text_to_offload(result, self.artifact_threshold_bytes)?;
+        match store.store(&namespace, call_id, "output", full) {
+            Ok(handle) => Some(harness_tools::preview(full, &handle)),
+            Err(e) => {
+                // Same posture as a failed `persist`: say so on stderr, then
+                // carry on. stdout is the NDJSON protocol channel and must
+                // not be touched.
+                eprintln!(
+                    "\x1b[33mwarning: could not store a large result as an artifact: {e}\x1b[0m"
+                );
+                None
+            }
         }
     }
 
