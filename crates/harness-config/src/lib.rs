@@ -226,6 +226,14 @@ pub struct AgentPolicy {
     pub auto_escalate: bool,
     pub escalate_to_model: String,
     pub escalate_after_repeats: u32,
+    /// Tool results at or above this many bytes are written to the artifact
+    /// store and replaced in context by a preview plus a handle.
+    ///
+    /// Configurable because the right value depends on what a project's
+    /// tools actually emit: the default leaves the measured median result
+    /// (4,772 bytes) inline while capturing the handful that hold most of
+    /// the transcript's bytes. `0` turns offloading off entirely.
+    pub artifact_threshold_bytes: usize,
 }
 
 impl Default for AgentPolicy {
@@ -236,6 +244,11 @@ impl Default for AgentPolicy {
             auto_escalate: true,
             escalate_to_model: "claude-sonnet-5".to_string(),
             escalate_after_repeats: 2,
+            // Kept in step with harness_tools::DEFAULT_ARTIFACT_THRESHOLD_BYTES,
+            // which this crate cannot import without depending on the tool
+            // layer. harness-agent depends on both and asserts they agree
+            // (`the_artifact_threshold_default_matches_the_tool_layer`).
+            artifact_threshold_bytes: 10_000,
         }
     }
 }
@@ -392,6 +405,7 @@ struct AgentSection {
     escalate_to_model: Option<String>,
     escalate_after_repeats: Option<u32>,
     budget_usd: Option<f64>,
+    artifact_threshold_bytes: Option<usize>,
 }
 
 #[derive(Debug, Error)]
@@ -545,6 +559,9 @@ pub fn resolve(
     if let Some(v) = file.agent.escalate_to_model {
         policy.escalate_to_model = v;
     }
+    if let Some(v) = file.agent.artifact_threshold_bytes {
+        policy.artifact_threshold_bytes = v;
+    }
     if let Some(v) = file.agent.escalate_after_repeats {
         policy.escalate_after_repeats = v;
     }
@@ -602,6 +619,19 @@ pub fn default_embeddings_cache_dir() -> PathBuf {
         return home.join(".config").join("hivemind").join("embeddings");
     }
     PathBuf::from("hivemind-embeddings")
+}
+
+/// Default artifact-store location: `~/.config/hivemind/artifacts/`.
+///
+/// A sibling of the session store rather than a directory inside it, so
+/// each stays what it is: a flat directory of files a human can read, diff,
+/// or `rm`. Artifacts are pruned with the session that produced them — see
+/// `harness_tools::ArtifactStore::remove_sessions`.
+pub fn default_artifacts_dir() -> PathBuf {
+    if let Some(home) = dirs_home() {
+        return home.join(".config").join("hivemind").join("artifacts");
+    }
+    PathBuf::from("hivemind-artifacts")
 }
 
 /// Default session-store location: `~/.config/hivemind/sessions/`. One JSON

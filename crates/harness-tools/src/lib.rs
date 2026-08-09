@@ -1,6 +1,7 @@
 //! The `Tool` trait, registry, and builtin tools — analogue of grok-build's
 //! `xai-tool-runtime` + the file/shell tools in `xai-grok-tools`.
 
+mod artifact;
 mod bash;
 mod diagram;
 mod edit;
@@ -20,6 +21,10 @@ mod walk;
 mod web;
 mod xlsx;
 
+pub use artifact::{
+    ArtifactHandle, ArtifactStore, DEFAULT_ARTIFACT_THRESHOLD_BYTES, ReadArtifact, preview,
+    text_to_offload,
+};
 pub use bash::{ApproveFn, Bash, shell_command, strip_verbatim};
 pub use diagram::CreateDiagram;
 pub use edit::EditFile;

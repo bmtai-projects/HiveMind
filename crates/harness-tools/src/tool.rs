@@ -79,6 +79,19 @@ pub struct ToolResult {
     pub changed_files: Vec<FileChange>,
     /// True when `summary` is not the whole output.
     pub truncated: bool,
+    /// The complete output, when the tool had to clamp what it put in
+    /// `summary` to keep it sane.
+    ///
+    /// Exists because the artifact layer runs *after* the tool returns, so
+    /// anything a tool discards internally is gone before it can ever be
+    /// archived. `run_shell` caps each stream at 60 KB, which is precisely
+    /// the case artifacts are for -- a 40,000-line test run whose failures
+    /// sit in the elided middle. Without this channel the artifact would
+    /// faithfully preserve the same truncated text and save nothing.
+    ///
+    /// `None` means `summary` is already whole; no tool is obliged to set
+    /// this, and leaving it unset is the correct default.
+    pub full_output: Option<String>,
     pub duration_ms: u64,
     /// Exact charge reported by a metered tool's HiveMind endpoint. Local
     /// tools leave this at zero. Kept outside `summary` so accounting never
@@ -861,6 +874,7 @@ mod wire_compatibility_tests {
             retryable: true,
             duration_ms: 1234,
             truncated: true,
+            full_output: Some("the whole 2 MB of it".to_string()),
             cost_usd: 0.125,
             ..Default::default()
         }
@@ -883,6 +897,7 @@ mod wire_compatibility_tests {
             "retryable",
             "duration_ms",
             "truncated",
+            "full_output",
             "changed_files",
             "cost_usd",
         ] {

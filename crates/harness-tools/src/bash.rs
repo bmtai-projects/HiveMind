@@ -348,14 +348,18 @@ impl Tool for Bash {
             // Timeout is its own status: unlike a plain failure, the work may
             // have partly happened, and a retry (or `background: true`) can
             // still be the right move.
+            let note = format!(
+                "[timed out after {}s; the command and anything it started were killed. \
+                 If this was a server or watcher, re-run it with `background: true` instead.]",
+                self.timeout.as_secs()
+            );
+            let (summary, full) = format_output_with_full(&stdout, &stderr, None);
             return Ok(ToolResult {
                 status: ToolStatus::Timeout,
-                summary: format!(
-                    "[timed out after {}s; the command and anything it started were killed. \
-                     If this was a server or watcher, re-run it with `background: true` instead.]\n{}",
-                    self.timeout.as_secs(),
-                    format_output(&stdout, &stderr, None)
-                ),
+                summary: format!("{note}\n{summary}"),
+                // A run killed part-way through is exactly when the output
+                // that did arrive matters most, so it is archived too.
+                full_output: full.map(|f| format!("{note}\n{f}")),
                 retryable: true,
                 ..Default::default()
             });
@@ -366,13 +370,20 @@ impl Tool for Bash {
         // downstream by looking for "[exit:" in the text. Any tool output
         // that merely contains that marker -- a log, our own source, a
         // search hit -- used to read as a failed command.
+        let (summary, full_output) = format_output_with_full(&stdout, &stderr, Some(status));
+        let truncated = full_output.is_some();
         Ok(ToolResult {
             status: if status.success() {
                 ToolStatus::Ok
             } else {
                 ToolStatus::Failed
             },
-            summary: format_output(&stdout, &stderr, Some(status)),
+            summary,
+            // Set only when the streams overran MAX_OUTPUT_BYTES -- the case
+            // artifacts exist for. A `cargo test` run whose failures sit in
+            // the elided middle is otherwise unrecoverable from here on.
+            full_output,
+            truncated,
             retryable: false,
             ..Default::default()
         })
@@ -455,24 +466,51 @@ pub fn strip_verbatim(path: &Path) -> PathBuf {
     }
 }
 
+/// The model-facing output, plus the complete text when anything had to be
+/// clamped to produce it.
+///
+/// The second half exists for the artifact layer. Truncating here used to be
+/// the end of the story: 2 MB of `cargo test` became 60 KB and the rest was
+/// unrecoverable, so an artifact written downstream would have preserved the
+/// same truncated text and saved nothing. Returning both lets the caller
+/// keep the clamped form in context and archive the whole thing.
+///
+/// `None` when nothing was clamped, so the overwhelmingly common case
+/// allocates no second copy.
+///
 /// `status` is `None` when the command timed out and never produced one --
 /// the caller reports that itself, so no exit line is appended here.
-fn format_output(stdout: &[u8], stderr: &[u8], status: Option<std::process::ExitStatus>) -> String {
-    let mut stdout = String::from_utf8_lossy(stdout).into_owned();
-    let mut stderr = String::from_utf8_lossy(stderr).into_owned();
-    truncate_in_place(&mut stdout);
-    truncate_in_place(&mut stderr);
+fn format_output_with_full(
+    stdout: &[u8],
+    stderr: &[u8],
+    status: Option<std::process::ExitStatus>,
+) -> (String, Option<String>) {
+    let out_full = String::from_utf8_lossy(stdout).into_owned();
+    let err_full = String::from_utf8_lossy(stderr).into_owned();
+    let clamped = out_full.len() > MAX_OUTPUT_BYTES || err_full.len() > MAX_OUTPUT_BYTES;
 
+    let mut out_clamped = out_full.clone();
+    let mut err_clamped = err_full.clone();
+    truncate_in_place(&mut out_clamped);
+    truncate_in_place(&mut err_clamped);
+
+    (
+        assemble(&out_clamped, &err_clamped, status),
+        clamped.then(|| assemble(&out_full, &err_full, status)),
+    )
+}
+
+fn assemble(stdout: &str, stderr: &str, status: Option<std::process::ExitStatus>) -> String {
     let mut out = String::new();
     if !stdout.is_empty() {
-        out.push_str(&stdout);
+        out.push_str(stdout);
     }
     if !stderr.is_empty() {
         if !out.is_empty() {
             out.push('\n');
         }
         out.push_str("[stderr]\n");
-        out.push_str(&stderr);
+        out.push_str(stderr);
     }
     if let Some(status) = status
         && !status.success()

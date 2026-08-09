@@ -470,6 +470,17 @@ fn list_sessions(args: SessionsArgs) -> anyhow::Result<()> {
             // Re-adding a kept id is not possible after the fact, so the
             // filter has to happen inside the store, not on its result.
             pruned = store.prune_older_than_except(max_age, &args.keep);
+            // A pruned session's artifacts must go with it. Left behind they
+            // would accumulate forever with nothing referencing them -- a
+            // worse bug than the token cost artifacts exist to fix.
+            let artifacts =
+                harness_tools::ArtifactStore::new(harness_config::default_artifacts_dir());
+            artifacts.remove_sessions(&pruned);
+            // And sweep what no session will ever claim: unpersisted `-p`
+            // runs store under a per-process id, and a crash can orphan a
+            // directory the same way.
+            let live: Vec<String> = store.list_all().into_iter().map(|s| s.id).collect();
+            artifacts.prune_orphans(max_age, &live);
         }
     }
 
@@ -626,6 +637,9 @@ async fn run(args: ActivateArgs) -> anyhow::Result<()> {
 
     let mut registry = Registry::new();
     let ws = Workspace::new(workdir.clone());
+    let artifact_store = Arc::new(harness_tools::ArtifactStore::new(
+        harness_config::default_artifacts_dir(),
+    ));
     registry.register(Arc::new(ReadFile(ws.clone())));
     registry.register(Arc::new(WriteFile(ws.clone())));
     registry.register(Arc::new(EditFile(ws.clone())));
@@ -676,6 +690,12 @@ async fn run(args: ActivateArgs) -> anyhow::Result<()> {
             }
         },
     ));
+    // Registered unconditionally: a resumed session can carry handles from
+    // an earlier run, so the tool has to exist even before this process
+    // stores anything of its own.
+    registry.register(Arc::new(harness_tools::ReadArtifact(
+        artifact_store.clone(),
+    )));
     registry.register(Arc::new(TodoWrite));
     registry.register(Arc::new(CreatePdf(ws.clone())));
     registry.register(Arc::new(CreateSpreadsheet(ws.clone())));
@@ -713,6 +733,14 @@ async fn run(args: ActivateArgs) -> anyhow::Result<()> {
             system_prompt(project_conventions.as_deref()),
         );
         agent.warm_connection();
+        // Off when the threshold is 0, which is how a user turns offloading
+        // off entirely without the harness needing a second switch.
+        if resolved.policy.artifact_threshold_bytes > 0 {
+            agent.enable_artifacts(
+                (*artifact_store).clone(),
+                resolved.policy.artifact_threshold_bytes,
+            );
+        }
         // Protocol mode persists too: an editor window reloading is exactly
         // the kind of ordinary interruption a session must survive.
         attach_or_restore_session(
@@ -738,6 +766,14 @@ async fn run(args: ActivateArgs) -> anyhow::Result<()> {
         system_prompt(project_conventions.as_deref()),
     );
     agent.warm_connection();
+    // Off when the threshold is 0, which is how a user turns offloading
+    // off entirely without the harness needing a second switch.
+    if resolved.policy.artifact_threshold_bytes > 0 {
+        agent.enable_artifacts(
+            (*artifact_store).clone(),
+            resolved.policy.artifact_threshold_bytes,
+        );
+    }
 
     if let Some(prompt) = &args.prompt {
         // A one-shot `-p` run has nothing worth resuming later, so it stays
