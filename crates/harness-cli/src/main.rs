@@ -824,25 +824,7 @@ fn attach_or_restore_session(
     Ok(())
 }
 
-/// Headless dispatch loop for `--protocol json`: emits `ready`, then reads
-/// ndjson commands from stdin and drives the same `Agent` the terminal REPL
-/// uses, dispatching to the exact same public methods (`run`, `set_model`,
-/// `set_reasoning_effort`, `set_budget_usd`, `undo`, `force_compact`) the
-/// REPL's slash-command match arms already call. Exits with `Ok(())`
-/// (process code 0) on stdin EOF.
-///
-/// Split into two concurrent halves, not one straight-line loop, because
-/// shell-command approval genuinely needs it: `agent.run()` can block deep
-/// inside `spawn_blocking` (see `harness_tools::bash::Bash::approved`)
-/// waiting on an `approve` reply for a request it just emitted. If reading
-/// stdin and calling `agent.run()` happened in the same loop iteration,
-/// that `.await` would starve the very stdin read that could unblock it --
-/// a real deadlock (caught by this implementation's own smoke test, not
-/// just a theoretical concern). So a dedicated reader task owns stdin for
-/// the whole process lifetime and resolves `approve` replies immediately,
-/// off to the side; every other command is forwarded over a channel to
-/// this function's main loop, which is the sole owner of `&mut Agent` and
-/// processes them strictly one at a time, in arrival order.
+
 async fn run_json_protocol(
     agent: &mut Agent,
     ws: Workspace,

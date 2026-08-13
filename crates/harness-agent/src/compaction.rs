@@ -85,17 +85,7 @@ pub async fn maybe_compact(
     })
 }
 
-/// The index the kept (verbatim) tail should start at: the most recent
-/// `keep_recent` messages — but snapped backward so the tail never *begins*
-/// on a `tool` message whose requesting assistant turn is in the older span
-/// about to be folded into the summary.
-///
-/// A `tool` message with no immediately preceding `tool_calls` is a hard 400
-/// from the (OpenAI-compatible) API, so without this snap a compaction pass
-/// can crash the very session it was meant to keep alive — whenever the
-/// `keep_recent` boundary happens to fall in the middle of an assistant's
-/// tool-call/tool-result group. Pulling the boundary back to include the
-/// owning assistant message keeps every kept `tool` message paired.
+
 fn compacted_tail_start(messages: &[Message], keep_recent: usize) -> usize {
     // Clamp into `[1, len-1]` so the system prompt at [0] is always kept and
     // the index below can't run off the end (defensive against keep_recent 0).
