@@ -30,6 +30,42 @@ const MAX_RESULTS_CAP: usize = 200;
 /// result (which is re-sent as input on every later turn until compaction).
 const MAX_LINE_CHARS: usize = 240;
 
+/// One typed search match. Keeping this structured inside the tools crate
+/// lets composite read-only tools follow a hit without parsing the
+/// human-facing `path:line: text` rendering returned by `search`.
+#[derive(Debug, Clone)]
+pub(crate) struct SearchHit {
+    pub path: String,
+    pub line: usize,
+    pub text: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SearchOutput {
+    pub hits: Vec<SearchHit>,
+    pub truncated: bool,
+}
+
+impl SearchOutput {
+    pub(crate) fn summary(&self, query: &str, limit: usize) -> String {
+        if self.hits.is_empty() {
+            return format!("no matches for {query:?}");
+        }
+
+        let mut lines: Vec<String> = self
+            .hits
+            .iter()
+            .map(|hit| format!("{}:{}: {}", hit.path, hit.line, hit.text))
+            .collect();
+        if self.truncated {
+            lines.push(format!(
+                "[stopped at {limit} matches — narrow the query or path]"
+            ));
+        }
+        lines.join("\n")
+    }
+}
+
 #[derive(Deserialize)]
 struct SearchArgs {
     query: String,
@@ -83,53 +119,60 @@ impl Tool for Search {
             .unwrap_or(DEFAULT_MAX_RESULTS)
             .clamp(1, MAX_RESULTS_CAP);
 
-        let search_root = match &a.path {
-            Some(p) if !p.is_empty() => self.0.resolve(p)?,
-            _ => self.0.resolve(".")?,
-        };
-        let strip_base = self.0.resolve(".")?;
-        let query = a.query.clone();
-
-        // Walking the tree and reading files is blocking work; keep it off the
-        // async reactor. The closure owns all its inputs, so a plain blocking
-        // task is the clean fit.
-        let hits = tokio::task::spawn_blocking(move || {
-            search_tree(&search_root, &strip_base, &query, limit)
-        })
-        .await
-        .map_err(|e| ToolError::Message(format!("search task failed: {e}")))?;
-
-        if hits.is_empty() {
-            return Ok(ToolResult::ok(format!("no matches for {:?}", a.query)));
-        }
-        Ok(ToolResult::ok(hits.join("\n")))
+        let output = search_workspace(&self.0, &a.query, a.path.as_deref(), limit).await?;
+        Ok(ToolResult::ok(output.summary(&a.query, limit)))
     }
+}
+
+/// Run the same workspace-confined search used by the public tool, while
+/// retaining typed hits for safe in-process follow-up reads.
+pub(crate) async fn search_workspace(
+    workspace: &Workspace,
+    query: &str,
+    path: Option<&str>,
+    limit: usize,
+) -> Result<SearchOutput, ToolError> {
+    let search_root = match path {
+        Some(path) if !path.is_empty() => workspace.resolve(path)?,
+        _ => workspace.resolve(".")?,
+    };
+    let strip_base = workspace.resolve(".")?;
+    let query = query.to_string();
+
+    tokio::task::spawn_blocking(move || search_tree(&search_root, &strip_base, &query, limit))
+        .await
+        .map_err(|e| ToolError::Message(format!("search task failed: {e}")))
 }
 
 /// Walk `root`, collecting up to `limit` `relpath:line: text` matches for
 /// `query`. Paths are reported relative to `strip_base` (the workspace root).
-fn search_tree(root: &Path, strip_base: &Path, query: &str, limit: usize) -> Vec<String> {
+fn search_tree(root: &Path, strip_base: &Path, query: &str, limit: usize) -> SearchOutput {
     let mut hits = Vec::new();
     'files: for path in walk_files(root) {
         // Non-UTF-8 (binary) files fail here and are simply skipped.
         let Ok(contents) = std::fs::read_to_string(&path) else {
             continue;
         };
-        let rel = path.strip_prefix(strip_base).unwrap_or(&path);
-        let rel = rel.display();
+        let rel = path
+            .strip_prefix(strip_base)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .replace('\\', "/");
         for (i, line) in contents.lines().enumerate() {
             if line.contains(query) {
-                hits.push(format!("{rel}:{}: {}", i + 1, truncate_line(line)));
+                hits.push(SearchHit {
+                    path: rel.clone(),
+                    line: i + 1,
+                    text: truncate_line(line),
+                });
                 if hits.len() >= limit {
-                    hits.push(format!(
-                        "[stopped at {limit} matches — narrow the query or path]"
-                    ));
                     break 'files;
                 }
             }
         }
     }
-    hits
+    let truncated = hits.len() >= limit;
+    SearchOutput { hits, truncated }
 }
 
 fn truncate_line(line: &str) -> String {
