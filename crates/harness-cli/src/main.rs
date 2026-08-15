@@ -890,6 +890,11 @@ async fn run_json_protocol(
         agent.web_available(),
         agent.web_enabled(),
     );
+    // A fresh session's history is exactly the one system message;
+    // emit_history treats that as "nothing to replay" and stays silent, so
+    // this is safe to call unconditionally rather than threading a
+    // "was this actually resumed" flag through from `attach_or_restore_session`.
+    ui.emit_history(agent.history());
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<json_ui::Command>();
     let reader_ui = ui.clone();

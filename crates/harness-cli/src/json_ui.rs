@@ -143,6 +143,36 @@ impl JsonUi {
         }));
     }
 
+    /// Emitted once, right after `ready`, only when a `--resume`d/`--continue`d
+    /// session actually has prior conversation in it (a fresh session's
+    /// `history()` is exactly the one system message, which produces `[]`
+    /// here and is skipped entirely rather than emitted empty).
+    ///
+    /// Without this, a resumed session's history exists only inside the
+    /// agent's own in-memory context for its *next* model call -- nothing
+    /// ever told a host what was actually said before, so the CLI resumed
+    /// correctly while the UI showed a blank transcript for it.
+    ///
+    /// Deliberately the flat message list, not pre-grouped into UI turns:
+    /// grouping (which raw `Assistant`/`Tool` messages belong to one logical
+    /// reply, spanning however many internal tool round-trips the model
+    /// took) is exactly what the live event stream already does, turn by
+    /// turn, on the host side -- see `HiveMind-vscode/src/sessionState.ts`'s
+    /// `currentAssistantTurn()`. Re-deriving the same grouping here would be
+    /// a second implementation of that logic that can drift from the first.
+    ///
+    /// `is_error` on a historical tool call is never included: `ToolStatus`
+    /// is harness-internal by design (see `ToolResult`'s own docs -- only
+    /// `summary` ever reaches a `Message`) and was never persisted to disk.
+    /// Guessing it back from the result text is exactly the failure mode M1
+    /// replaced; a host must render historical tool results as neutral, not
+    /// guess pass/fail from prose.
+    pub fn emit_history(&self, messages: &[harness_types::Message]) {
+        if let Some(wire) = history_wire_messages(messages) {
+            self.emit(json!({"type": "history", "messages": wire}));
+        }
+    }
+
     /// Emitted after every incoming command settles — both a
     /// `user_message`'s `agent.run()` call (success or error) and every
     /// other command (`set_model`, `undo`, ...). The spec leaves the exact
@@ -361,5 +391,186 @@ impl Ui for JsonUi {
             "tool": tool,
             "message": message,
         }));
+    }
+}
+
+/// The pure half of [`JsonUi::emit_history`], split out so the shape can be
+/// asserted directly without capturing real process stdout -- `emit()`
+/// writes to `io::stdout()` unconditionally, with no injectable sink, so
+/// nothing in this file was unit-testable before this existed.
+///
+/// `None` means "nothing worth emitting": either the session is fresh (just
+/// the system message) or, defensively, empty outright.
+fn history_wire_messages(messages: &[harness_types::Message]) -> Option<Vec<serde_json::Value>> {
+    use harness_types::Role;
+
+    let rest = match messages.first() {
+        Some(m) if m.role == Role::System => &messages[1..],
+        _ => messages,
+    };
+    if rest.is_empty() {
+        return None;
+    }
+
+    Some(
+        rest.iter()
+            .map(|m| match m.role {
+                Role::User => json!({"role": "user", "content": m.content}),
+                Role::Assistant => {
+                    let mut obj = json!({"role": "assistant", "content": m.content});
+                    let map = obj.as_object_mut().expect("assistant is an object");
+                    if !m.reasoning.is_empty() {
+                        map.insert("reasoning".into(), json!(m.reasoning));
+                    }
+                    if !m.tool_calls.is_empty() {
+                        let calls: Vec<_> = m
+                            .tool_calls
+                            .iter()
+                            .map(|c| json!({"id": c.id, "name": c.name, "args": c.args.get()}))
+                            .collect();
+                        map.insert("tool_calls".into(), json!(calls));
+                    }
+                    obj
+                }
+                Role::Tool => json!({
+                    "role": "tool",
+                    "tool_call_id": m.tool_call_id,
+                    "name": m.name,
+                    "content": m.content,
+                }),
+                // A system message can only appear at index 0, already
+                // skipped above -- `Agent::restore` guarantees this (see its
+                // own doc comment), so this arm is unreachable in practice
+                // rather than a real case needing its own wire shape.
+                Role::System => json!({"role": "system", "content": m.content}),
+            })
+            .collect(),
+    )
+}
+
+#[cfg(test)]
+mod history_tests {
+    use super::*;
+    use harness_types::{Message, ToolCall};
+    use serde_json::value::RawValue;
+
+    fn tool_call(id: &str, name: &str, args: &str) -> ToolCall {
+        ToolCall {
+            id: id.to_string(),
+            name: name.to_string(),
+            args: RawValue::from_string(args.to_string()).unwrap(),
+        }
+    }
+
+    #[test]
+    fn a_fresh_session_is_just_the_system_message_and_emits_nothing() {
+        let messages = vec![Message::system("you are HiveMind")];
+        assert!(history_wire_messages(&messages).is_none());
+    }
+
+    #[test]
+    fn an_empty_slice_emits_nothing() {
+        assert!(history_wire_messages(&[]).is_none());
+    }
+
+    #[test]
+    fn the_system_message_is_stripped_but_everything_after_it_is_kept() {
+        let messages = vec![
+            Message::system("sys"),
+            Message::user("hello"),
+            Message::assistant("hi there"),
+        ];
+        let wire = history_wire_messages(&messages).expect("should emit");
+        assert_eq!(wire.len(), 2, "system message leaked through: {wire:?}");
+        assert_eq!(wire[0]["role"], "user");
+        assert_eq!(wire[0]["content"], "hello");
+        assert_eq!(wire[1]["role"], "assistant");
+        assert_eq!(wire[1]["content"], "hi there");
+    }
+
+    /// A real resumed conversation's actual shape: system, user, an
+    /// assistant message carrying a tool call with no visible text yet, the
+    /// matching tool result, then the assistant's final reply.
+    #[test]
+    fn a_realistic_tool_using_turn_round_trips_correctly() {
+        let mut assistant_step = Message::assistant("");
+        assistant_step.tool_calls = vec![tool_call("call_1", "read_file", r#"{"path":"a.rs"}"#)];
+
+        let messages = vec![
+            Message::system("sys"),
+            Message::user("what does a.rs do?"),
+            assistant_step,
+            Message::tool_result("call_1", "read_file", "fn main() {}"),
+            Message::assistant("a.rs just has an empty main()."),
+        ];
+        let wire = history_wire_messages(&messages).expect("should emit");
+        assert_eq!(wire.len(), 4);
+
+        assert_eq!(wire[1]["role"], "assistant");
+        assert_eq!(wire[1]["content"], "");
+        let calls = wire[1]["tool_calls"]
+            .as_array()
+            .expect("tool_calls present");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["id"], "call_1");
+        assert_eq!(calls[0]["name"], "read_file");
+        assert_eq!(calls[0]["args"], r#"{"path":"a.rs"}"#);
+
+        assert_eq!(wire[2]["role"], "tool");
+        assert_eq!(wire[2]["tool_call_id"], "call_1");
+        assert_eq!(wire[2]["name"], "read_file");
+        assert_eq!(wire[2]["content"], "fn main() {}");
+        // The one deliberate gap: whether this tool call succeeded is never
+        // on the wire here, because it was never persisted -- see this
+        // function's own doc comment for why guessing it back from the
+        // result text would repeat exactly the mistake M1 fixed.
+        assert!(
+            wire[2].get("is_error").is_none(),
+            "a historical tool result must never claim a status it doesn't have"
+        );
+
+        assert_eq!(wire[3]["role"], "assistant");
+        assert_eq!(wire[3]["content"], "a.rs just has an empty main().");
+    }
+
+    #[test]
+    fn empty_reasoning_and_tool_calls_are_omitted_not_sent_as_empty() {
+        let wire =
+            history_wire_messages(&[Message::system("s"), Message::assistant("plain reply")])
+                .expect("should emit");
+        let obj = wire[0].as_object().unwrap();
+        assert!(
+            !obj.contains_key("reasoning"),
+            "empty reasoning was sent anyway: {obj:?}"
+        );
+        assert!(
+            !obj.contains_key("tool_calls"),
+            "empty tool_calls was sent anyway: {obj:?}"
+        );
+    }
+
+    #[test]
+    fn non_empty_reasoning_is_included() {
+        let mut m = Message::assistant("the answer");
+        m.reasoning = "let me think about this".to_string();
+        let wire = history_wire_messages(&[Message::system("s"), m]).expect("should emit");
+        assert_eq!(wire[0]["reasoning"], "let me think about this");
+    }
+
+    /// Two tool calls in one assistant message (a batched turn) must both
+    /// survive, in order -- this is the common case for anything that reads
+    /// several files before acting.
+    #[test]
+    fn multiple_tool_calls_in_one_message_all_survive_in_order() {
+        let mut m = Message::assistant("");
+        m.tool_calls = vec![
+            tool_call("c1", "read_file", r#"{"path":"a.rs"}"#),
+            tool_call("c2", "read_file", r#"{"path":"b.rs"}"#),
+        ];
+        let wire = history_wire_messages(&[Message::system("s"), m]).expect("should emit");
+        let calls = wire[0]["tool_calls"].as_array().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0]["id"], "c1");
+        assert_eq!(calls[1]["id"], "c2");
     }
 }
