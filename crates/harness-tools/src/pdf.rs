@@ -1,18 +1,4 @@
-//! `create_pdf` — generate a simple, real PDF (headings, paragraphs, bullet
-//! lists, tables) with no external runtime dependency: no Python, no
-//! LibreOffice, nothing to install. Deliberately scoped to what a JSON tool
-//! schema can express well — a structured report/memo/invoice — not
-//! arbitrary pixel-perfect layout, charts, or images. For anything beyond
-//! this shape, the agent's own `run_shell` plus a scripting library (e.g.
-//! `reportlab`) is the right tool; growing this schema into a full
-//! page-layout language would be the wrong trade.
-//!
-//! Word-wrap uses an approximate average character width, not real glyph
-//! metrics — printpdf only exposes true glyph widths for parsed/embedded
-//! fonts, not the 14 built-in ones this tool uses (see `Cargo.toml` for why
-//! font embedding is deliberately out of scope). Same honest-approximation
-//! choice as `harness_agent::tokens`: "never overflows the page" is the bar,
-//! not "wraps at the exact column a real renderer would."
+
 
 use async_trait::async_trait;
 use printpdf::{
@@ -301,13 +287,7 @@ fn is_table_separator(cells: &[String]) -> bool {
             .all(|c| !c.is_empty() && c.chars().all(|ch| ch == '-' || ch == ':'))
 }
 
-/// Parse the Markdown subset that maps onto [`Block`]: ATX headings,
-/// blank-line-separated paragraphs, `-`/`*`/`1.` lists, and pipe tables.
-///
-/// Deliberately hand-rolled rather than a Markdown crate: the target is
-/// four block types with no inline styling, so a full CommonMark parse
-/// would produce a tree that is almost entirely discarded again. Anything
-/// unrecognized degrades to paragraph text rather than being dropped.
+
 fn parse_markdown(src: &str) -> Vec<Block> {
     let mut blocks = Vec::new();
     let mut para: Vec<String> = Vec::new();
@@ -530,10 +510,7 @@ fn draw_table_row(
     layout.cursor_y -= TABLE_ROW_HEIGHT_PT;
 }
 
-/// Pads a short row with empty cells, or truncates an over-long one, to
-/// exactly `col_count` -- a data row that doesn't match the header count
-/// (the model miscounted) still renders in the right columns instead of
-/// drifting or running off the page edge.
+
 fn row_cells(cells: &[String], col_count: usize) -> Vec<String> {
     let mut v: Vec<String> = cells.iter().take(col_count).cloned().collect();
     v.resize(col_count, String::new());

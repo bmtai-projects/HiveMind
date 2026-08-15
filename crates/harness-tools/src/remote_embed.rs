@@ -42,15 +42,7 @@ struct EmbedDatum {
 }
 
 impl RemoteEmbedder {
-    /// Build the hosted embedder for Pro mode, or `None` when it isn't
-    /// usable. `None` is never an error: the caller keeps the local
-    /// embedder, which is what Standard mode uses anyway.
-    ///
-    /// `enabled` comes from the resolved [`Mode`], not from an env var, so
-    /// the product decision lives in one place. The env vars below exist
-    /// only to point a build at a different deployment (testing,
-    /// self-hosting) and are not part of the normal user path.
-    ///
+
     ///   HIVEMIND_EMBEDDINGS_URL    override the service base (no `/v1`)
     ///   HIVEMIND_EMBEDDINGS_TOKEN  override the bearer token
     ///   HIVEMIND_EMBEDDINGS_MODEL  override the model id

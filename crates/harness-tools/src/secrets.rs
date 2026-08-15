@@ -1,34 +1,4 @@
-//! Flags credentials in content the agent is about to write.
-//!
-//! # Why warn instead of block
-//!
-//! Blocking would be wrong more often than it is right. Test fixtures,
-//! documentation, and example configs legitimately contain things that look
-//! exactly like credentials, and a tool that refuses to write them turns a
-//! safety feature into an obstacle the model has to work around — usually
-//! by doing something worse, like base64-ing the value to get past the
-//! check. A warning attached to the tool result puts the fact in front of
-//! both the model and the user without taking the decision away from them.
-//!
-//! Anyone who genuinely wants a hard stop now has one: a `PreToolUse` hook
-//! with `enforcement = true` can refuse the write outright.
-//!
-//! # Why hand-rolled instead of `regex`
-//!
-//! Every pattern here is a literal prefix followed by a run of characters
-//! from a fixed class, which is a few lines of `char` matching. Pulling in
-//! `regex` for that would add well over a megabyte to a binary this project
-//! cross-compiles to five targets and has already gone out of its way to
-//! keep lean (see `printpdf`'s `default-features = false` in Cargo.toml).
-//!
-//! # Precision over recall
-//!
-//! A warning that cries wolf gets ignored, and an ignored warning is worse
-//! than none because it also costs tokens. Every rule here is anchored on a
-//! vendor-specific prefix; the one general rule (`secret = "..."`) is gated
-//! behind both a length floor and a Shannon-entropy floor, and placeholder
-//! values are filtered explicitly. Missing a novel credential format is an
-//! accepted cost of not flagging `API_KEY=your_key_here`.
+
 
 /// One credential-shaped thing found in written content.
 #[derive(Debug, PartialEq, Eq)]

@@ -1,17 +1,4 @@
-//! Session persistence: the conversation survives the process.
-//!
-//! Context is a *purchased* asset here — every message in a long session was
-//! paid for at the token rate, and a compaction summary literally cost a
-//! model call to produce. Losing all of it because a terminal closed (or a
-//! VS Code window reloaded) throws away real money, so state is written at
-//! every turn boundary rather than only at a clean exit.
-//!
-//! Deliberately plain JSON files, not a database: the whole store is a
-//! directory of records that a human can read, diff, back up, or delete with
-//! `rm`. At the sizes compaction already bounds sessions to, indexing buys
-//! nothing.
-//!
-//! # What is *not* persisted
+
 //!
 //! `/undo` checkpoints stay in memory only. They hold pre-edit file
 //! snapshots, and restoring a file from a previous process — against a

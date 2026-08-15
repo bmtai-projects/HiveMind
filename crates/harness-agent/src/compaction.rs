@@ -122,12 +122,6 @@ fn render_for_summary(msgs: &[Message]) -> String {
     out
 }
 
-/// Keeps both ends of `s`, not just the head -- a head-only truncate
-/// systematically loses whatever comes later (a file path mentioned near
-/// the end of a long tool result, a conclusion after a long chain of
-/// reasoning), and the summarizer prompt explicitly asks it to preserve
-/// file paths, which this alone can't guarantee but at least stops
-/// reliably discarding.
 fn truncate(s: &str, max_chars: usize) -> String {
     let chars: Vec<char> = s.chars().collect();
     if chars.len() <= max_chars {
