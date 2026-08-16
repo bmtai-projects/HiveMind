@@ -22,6 +22,11 @@ use crate::ui::Ui;
 /// Most-recent messages (after the system prompt) a compaction pass keeps
 /// verbatim. Not user-configurable yet — a reasonable fixed default.
 const COMPACTION_KEEP_RECENT: usize = 8;
+/// Fraction of a session budget that must still be unspent for an automatic
+/// escalation to be worth making. Below this there is not enough left to
+/// finish the work on a model costing ~22x input / ~53x output, so the only
+/// thing the switch reliably buys is a faster trip to `stopped_for_budget`.
+const ESCALATION_BUDGET_HEADROOM: f64 = 0.5;
 const SEND_GUARD_PERCENT: u64 = 95;
 const WEB_OPERATIONS_PER_RUN: u8 = 3;
 const WEB_SYSTEM_INSTRUCTION: &str = "\
@@ -72,6 +77,63 @@ Do not resend the same call. Split the work instead:
 - Otherwise: make this call carry less content, and do it across several
   calls.";
 
+/// What one turn's stall counters have earned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StallAction {
+    Continue,
+    /// Tell the model it is going nowhere. Free, and the only thing here
+    /// that helps when the cause is environmental.
+    Nudge,
+    /// Already told, and still asking for the same failing calls. The one
+    /// condition where more capability is a plausible answer.
+    Escalate,
+}
+
+/// Advance both stall counters for one turn and say what it earns.
+///
+/// Pure, and separate from [`Agent`], because the tests that were supposed
+/// to cover this re-implemented the arithmetic inline and asserted it
+/// against itself -- so `repeated || any_error` was never actually
+/// exercised, and the escalation it caused went unnoticed until it showed up
+/// as 47% of a month's model spend across three days of use.
+fn stall_step(
+    repeat_count: &mut u32,
+    error_streak: &mut u32,
+    already_nudged: bool,
+    threshold: u32,
+    repeated: bool,
+    any_error: bool,
+) -> StallAction {
+    // Counted separately on purpose. "Asked for the same thing again" is
+    // going in circles. "Something failed" is usually the environment -- a
+    // wrong shell dialect, a missing binary, a busy port -- which a model
+    // costing ~22x input / ~53x output does not fix.
+    if repeated {
+        *repeat_count += 1;
+    } else {
+        *repeat_count = 0;
+    }
+    if any_error {
+        *error_streak += 1;
+    } else {
+        *error_streak = 0;
+    }
+
+    let looping = *repeat_count >= threshold;
+    let failing = *error_streak >= threshold;
+    if !looping && !failing {
+        return StallAction::Continue;
+    }
+    if !already_nudged {
+        return StallAction::Nudge;
+    }
+    if looping {
+        StallAction::Escalate
+    } else {
+        StallAction::Continue
+    }
+}
+
 pub struct Agent {
     client: DeepSeekClient,
     tools: Registry,
@@ -91,7 +153,22 @@ pub struct Agent {
     web_operations_remaining: u8,
     last_total_tokens: u64,
     context_window: u64,
+    /// Consecutive turns that asked for *the same tool calls again*. This is
+    /// the only thing that can buy a stronger model, because it is the only
+    /// thing that means "going in circles".
     repeat_count: u32,
+    /// Consecutive turns in which some tool failed, whatever it was. Drives
+    /// the nudge and nothing else.
+    ///
+    /// Kept apart from `repeat_count` deliberately. These used to be one
+    /// counter incremented by `repeated || any_error`, which made a run of
+    /// *different* failing commands -- a model exploring an unfamiliar
+    /// environment, which is the normal way a session starts -- look
+    /// identical to a model stuck in a loop, and escalate on that basis. A
+    /// measured session opened on Windows with POSIX commands, failed four
+    /// times in four different ways, escalated, and spent 35% of a month's
+    /// budget without completing a step.
+    error_streak: u32,
     last_call_signature: Option<String>,
     /// Whether this run has already spent its one free "you seem stuck"
     /// message. Per-run, not per-session: a fresh user request deserves a
@@ -177,6 +254,7 @@ impl Agent {
             last_total_tokens: 0,
             context_window,
             repeat_count: 0,
+            error_streak: 0,
             last_call_signature: None,
             nudged_this_run: false,
             last_turn_had_failure: false,
@@ -461,6 +539,7 @@ impl Agent {
     pub async fn run(&mut self, user_input: &str) -> anyhow::Result<()> {
         self.current_model = self.default_model.clone();
         self.repeat_count = 0;
+        self.error_streak = 0;
         self.last_call_signature = None;
         self.nudged_this_run = false;
         self.web_operations_remaining = WEB_OPERATIONS_PER_RUN;
@@ -835,38 +914,63 @@ impl Agent {
     fn update_escalation(&mut self, (signature, any_error): &(String, bool)) {
         if signature.is_empty() && !any_error {
             self.repeat_count = 0;
+            self.error_streak = 0;
             self.last_call_signature = None;
             return;
         }
+
         let repeated = self.last_call_signature.as_deref() == Some(signature.as_str());
-        if repeated || *any_error {
-            self.repeat_count += 1;
-        } else {
-            self.repeat_count = 0;
-        }
         self.last_call_signature = Some(signature.clone());
+        let threshold = self.policy.escalate_after_repeats;
+        let action = stall_step(
+            &mut self.repeat_count,
+            &mut self.error_streak,
+            self.nudged_this_run,
+            threshold,
+            repeated,
+            *any_error,
+        );
 
-        if self.repeat_count < self.policy.escalate_after_repeats {
+        match action {
+            StallAction::Continue => return,
+            StallAction::Nudge => {
+                self.nudged_this_run = true;
+                self.repeat_count = 0;
+                self.error_streak = 0;
+                self.messages.push(Message::user(STALL_NUDGE.to_string()));
+                self.ui.stalled(threshold);
+                return;
+            }
+            StallAction::Escalate => {}
+        }
+
+        if !self.policy.auto_escalate || self.current_model != self.default_model {
             return;
         }
 
-        if !self.nudged_this_run {
-            self.nudged_this_run = true;
-            self.repeat_count = 0;
-            self.messages.push(Message::user(STALL_NUDGE.to_string()));
-            self.ui.stalled(self.policy.escalate_after_repeats);
-            return;
-        }
-
-        if self.policy.auto_escalate && self.current_model == self.default_model {
-            self.ui.model_escalated(
-                &self.current_model,
+        if let Some(budget) = self.budget_usd
+            && self.session_cost_usd >= budget * ESCALATION_BUDGET_HEADROOM
+        {
+            // Switching now would spend what is left several times faster and
+            // hit `stopped_for_budget` within a turn or two -- paying the
+            // premium and delivering nothing, which is the worst of both.
+            // Say so, so the user can raise the budget or switch deliberately.
+            self.ui.escalation_declined(
                 &self.policy.escalate_to_model,
-                "still failing after being asked to reconsider",
+                self.session_cost_usd,
+                budget,
             );
-            self.current_model = self.policy.escalate_to_model.clone();
             self.repeat_count = 0;
+            return;
         }
+
+        self.ui.model_escalated(
+            &self.current_model,
+            &self.policy.escalate_to_model,
+            "still repeating the same failing calls after being asked to reconsider",
+        );
+        self.current_model = self.policy.escalate_to_model.clone();
+        self.repeat_count = 0;
     }
 
     /// Elide large, superseded tool results. Cheap and deterministic, so it
@@ -1084,59 +1188,140 @@ mod tests {
     // rather than standing up a whole Agent (client, registry, workspace, UI)
     // to exercise a counter.
 
-    /// One turn's worth of input to `update_escalation`.
-    fn turn(sig: &str, failed: bool) -> (String, bool) {
-        (sig.to_string(), failed)
+    /// Drive `stall_step` itself over a run of turns. The tests this
+    /// replaced re-implemented the counter arithmetic in the test body and
+    /// asserted it against itself, so they passed no matter what the real
+    /// function did -- which is how `repeated || any_error` shipped.
+    fn replay(turns: &[(&str, bool)], threshold: u32) -> Vec<StallAction> {
+        let (mut repeat, mut streak, mut nudged) = (0u32, 0u32, false);
+        let mut last: Option<String> = None;
+        let mut out = Vec::new();
+        for (sig, failed) in turns {
+            let repeated = last.as_deref() == Some(*sig);
+            last = Some((*sig).to_string());
+            let action = stall_step(
+                &mut repeat,
+                &mut streak,
+                nudged,
+                threshold,
+                repeated,
+                *failed,
+            );
+            if action == StallAction::Nudge {
+                nudged = true;
+                repeat = 0;
+                streak = 0;
+            }
+            out.push(action);
+        }
+        out
     }
 
-    /// Replays the shape of the real cascade that went unnoticed: fourteen
-    /// consecutive *failing* shell commands, each textually different from
-    /// the last (pkill -> pkill -9 -> lsof -> ...). Before failure detection
-    /// understood non-zero exits, every one of these scored "no error, not a
-    /// repeat" and the counter reset each time.
+    /// The measured regression. A session opened on Windows and failed four
+    /// times in four *different* ways (POSIX commands, then `where`, then
+    /// `winget`). Every signature differed, so nothing was repeating -- but
+    /// the old counter took `any_error` alone and escalated anyway, onto a
+    /// model ~22x/~53x the price, which then exhausted the budget without
+    /// completing a step.
     #[test]
-    fn a_cascade_of_different_failing_commands_is_recognised_as_a_stall() {
-        let cascade = [
-            "run_shell:{\"command\":\"pkill -f node\"}",
-            "run_shell:{\"command\":\"pkill -9 -f node\"}",
-            "run_shell:{\"command\":\"kill $(lsof -ti :3001)\"}",
-        ];
-        let mut count = 0u32;
-        let mut last: Option<String> = None;
-        for sig in cascade {
-            let (s, failed) = turn(sig, true);
-            let repeated = last.as_deref() == Some(s.as_str());
-            if repeated || failed {
-                count += 1
-            } else {
-                count = 0
-            }
-            last = Some(s);
-        }
-        assert_eq!(count, 3, "each failing turn must advance the counter");
+    fn different_failing_commands_are_nudged_but_never_bought_a_bigger_model() {
+        let actions = replay(
+            &[
+                ("run_shell:{\"command\":\"cd /home/user && ls\"}", true),
+                ("run_shell:{\"command\":\"pwd && ls -la\"}", true),
+                ("run_shell:{\"command\":\"where node\"}", true),
+                ("run_shell:{\"command\":\"winget install node\"}", true),
+                ("run_shell:{\"command\":\"npm --version\"}", true),
+            ],
+            2,
+        );
+        assert!(
+            actions.contains(&StallAction::Nudge),
+            "a failing streak must still earn the free advice: {actions:?}"
+        );
+        assert!(
+            !actions.contains(&StallAction::Escalate),
+            "failing differently every turn is exploring, not looping -- \
+             it must never buy a more expensive model: {actions:?}"
+        );
+    }
+
+    /// The case escalation is actually for: the same call, again, after
+    /// having been told to change approach.
+    #[test]
+    fn repeating_one_failing_call_still_escalates() {
+        let same = "run_shell:{\"command\":\"npm start\"}";
+        let actions = replay(
+            &[
+                (same, true),
+                (same, true),
+                (same, true),
+                (same, true),
+                (same, true),
+                (same, true),
+            ],
+            2,
+        );
+        assert!(
+            actions.contains(&StallAction::Nudge),
+            "the nudge still comes first: {actions:?}"
+        );
+        assert!(
+            actions.contains(&StallAction::Escalate),
+            "a genuine loop must still escalate: {actions:?}"
+        );
     }
 
     /// The complement: genuinely productive turns must never accumulate
     /// toward a stall, or every long task would get nudged.
     #[test]
     fn successful_varied_turns_never_accumulate() {
-        let mut count = 0u32;
-        let mut last: Option<String> = None;
-        for sig in [
-            "read_file:{\"path\":\"a\"}",
-            "read_file:{\"path\":\"b\"}",
-            "edit_file:{\"path\":\"a\"}",
-        ] {
-            let (s, failed) = turn(sig, false);
-            let repeated = last.as_deref() == Some(s.as_str());
-            if repeated || failed {
-                count += 1
-            } else {
-                count = 0
-            }
-            last = Some(s);
-        }
-        assert_eq!(count, 0);
+        let actions = replay(
+            &[
+                ("read_file:{\"path\":\"a\"}", false),
+                ("read_file:{\"path\":\"b\"}", false),
+                ("edit_file:{\"path\":\"a\"}", false),
+            ],
+            2,
+        );
+        assert!(actions.iter().all(|a| *a == StallAction::Continue));
+    }
+
+    /// One failure in the middle of real work must not creep toward a nudge.
+    #[test]
+    fn an_isolated_failure_between_successes_resets() {
+        let actions = replay(
+            &[
+                ("read_file:{\"path\":\"a\"}", true),
+                ("read_file:{\"path\":\"b\"}", false),
+                ("read_file:{\"path\":\"c\"}", true),
+                ("edit_file:{\"path\":\"a\"}", false),
+            ],
+            2,
+        );
+        assert!(
+            actions.iter().all(|a| *a == StallAction::Continue),
+            "{actions:?}"
+        );
+    }
+
+    #[test]
+    fn the_budget_headroom_leaves_room_to_finish() {
+        // Escalating with almost nothing left buys the premium and then hits
+        // the budget stop within a turn or two -- paying more and delivering
+        // nothing, which is the failure this constant exists to prevent.
+        const { assert!(ESCALATION_BUDGET_HEADROOM > 0.0 && ESCALATION_BUDGET_HEADROOM < 1.0) };
+        // The real numbers from the run this guard was built from: a $0.40
+        // budget, escalation offered once ~$0.28 was already gone.
+        let affordable = |spent: f64, budget: f64| spent < budget * ESCALATION_BUDGET_HEADROOM;
+        assert!(
+            affordable(0.13, 0.40),
+            "early in a session there is still room to escalate"
+        );
+        assert!(
+            !affordable(0.28, 0.40),
+            "the spend that blew the budget must not have been allowed to escalate"
+        );
     }
 
     #[test]

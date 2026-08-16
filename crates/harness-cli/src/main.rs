@@ -186,8 +186,30 @@ const READ_PROGRAM_PROMPT: &str =
 /// once per process. This string is the provider's context-cache prefix —
 /// re-reading `AGENTS.md` each turn would let one mid-session file save
 /// silently cost every remaining cache hit in the session.
+/// The two environment facts a shell-using agent cannot guess and must not
+/// assume.
+///
+/// POSIX is the training-data default, so a model told only "you work from
+/// the terminal" opens a Windows session with `cd /home/user && ls` and
+/// every call fails until it works out why. The harness has always known
+/// which platform it is on -- `harness_tools::shell_command` picks
+/// `cmd /C` or `bash -lc` from `#[cfg(windows)]` -- it just never told the
+/// model. Stated once, in the cached prefix, so it costs nothing per turn.
+fn platform_note() -> &'static str {
+    if cfg!(windows) {
+        "Environment: Windows. `run_shell` executes through `cmd /C`, so use \
+         Windows commands (`dir`, `type`, `copy`, `where`) and backslash paths. \
+         POSIX tools and paths like /home or /usr do not exist here."
+    } else if cfg!(target_os = "macos") {
+        "Environment: macOS. `run_shell` executes through `bash -lc`. BSD \
+         variants of `sed`, `find` and `date` differ from GNU ones."
+    } else {
+        "Environment: Linux. `run_shell` executes through `bash -lc`."
+    }
+}
+
 fn system_prompt(project: Option<&str>, read_program_available: bool) -> String {
-    let mut prompt = format!("{IDENTITY}\n\n{SYSTEM_PROMPT_BODY}");
+    let mut prompt = format!("{IDENTITY}\n\n{SYSTEM_PROMPT_BODY}\n\n{}", platform_note());
     if read_program_available {
         prompt.push_str("\n\n");
         prompt.push_str(READ_PROGRAM_PROMPT);
@@ -1495,8 +1517,26 @@ mod system_prompt_tests {
     fn a_workspace_with_no_conventions_changes_nothing() {
         assert_eq!(
             system_prompt(None, false),
-            format!("{IDENTITY}\n\n{SYSTEM_PROMPT_BODY}")
+            format!("{IDENTITY}\n\n{SYSTEM_PROMPT_BODY}\n\n{}", platform_note())
         );
+    }
+
+    #[test]
+    fn the_prompt_names_the_platform_and_the_shell_it_will_get() {
+        // A model that is not told this defaults to POSIX, and on Windows
+        // every shell call fails until it infers otherwise -- which is what
+        // fed the escalation counter that spent a month's budget in one
+        // task. The specific strings matter: "terminal" alone is what the
+        // prompt said before, and it is not enough.
+        let p = system_prompt(None, false);
+        assert!(p.contains("Environment: "), "{p}");
+        assert!(p.contains("run_shell` executes through"), "{p}");
+        if cfg!(windows) {
+            assert!(p.contains("cmd /C"));
+            assert!(p.contains("do not exist here"));
+        } else {
+            assert!(p.contains("bash -lc"));
+        }
     }
 
     #[test]

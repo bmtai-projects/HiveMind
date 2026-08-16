@@ -211,6 +211,14 @@ impl Ui for TermUi {
         );
     }
 
+    fn escalation_declined(&self, to: &str, spent: f64, budget: f64) {
+        self.clear_preview();
+        println!(
+            "\x1b[33m  ↯ staying on this model — switching to {to} would cost far more per token \
+             and ${spent:.4} of the ${budget:.2} budget is already spent\x1b[0m"
+        );
+    }
+
     fn output_limit_truncated(&self) {
         self.clear_preview();
         println!(
