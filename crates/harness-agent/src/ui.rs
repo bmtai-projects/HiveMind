@@ -74,6 +74,16 @@ pub trait Ui: Send + Sync {
     /// after repeated/failing tool calls on the current task.
     fn model_escalated(&self, from: &str, to: &str, reason: &str);
 
+    /// Fired when a stall would have escalated, but too much of the session
+    /// budget was already spent for the stronger model to finish anything.
+    /// The run continues on the current model.
+    ///
+    /// Reported rather than done silently: "it stopped getting better and I
+    /// don't know why" is a worse experience than being told the budget is
+    /// the binding constraint, which the user can act on by raising it or
+    /// switching model deliberately.
+    fn escalation_declined(&self, _to: &str, _spent: f64, _budget: f64) {}
+
     /// Fired when queued mid-turn messages were handed to the model at a
     /// turn boundary (see `crate::InterjectionQueue`). Worth surfacing
     /// because delivery is deliberately deferred: the user typed at some

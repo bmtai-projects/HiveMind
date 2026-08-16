@@ -341,6 +341,15 @@ impl Ui for JsonUi {
         }));
     }
 
+    fn escalation_declined(&self, to: &str, spent: f64, budget: f64) {
+        self.emit(json!({
+            "type": "escalation_declined",
+            "to": to,
+            "spent_usd": spent,
+            "budget_usd": budget,
+        }));
+    }
+
     fn interjected(&self, count: usize) {
         self.emit(json!({"type": "interjected", "count": count}));
     }

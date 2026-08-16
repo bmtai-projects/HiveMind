@@ -1,5 +1,3 @@
-
-
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -243,7 +241,6 @@ struct ModelSection {
     reasoning_effort: Option<String>,
 }
 
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Mode {
@@ -363,7 +360,6 @@ pub fn resolve(
         .or_else(|| file.model.base_url.clone())
         .or_else(|| file.deepseek.base_url.clone());
 
-  
     let (api_key, base_url, hosted) = match explicit_key {
         Some(key) => (
             key,
