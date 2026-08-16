@@ -37,8 +37,8 @@ use harness_agent::{Agent, Ui};
 use harness_config::CliOverrides;
 use harness_tools::{
     Bash, CreateDiagram, CreatePdf, CreateSpreadsheet, EditFile, HostedWebClient, ListDir,
-    ProjectMap, ReadFile, Registry, Search, SemanticSearch, TodoWrite, WebFetch, WebSearch,
-    Workspace, WriteFile,
+    ProjectMap, ReadFile, ReadProgram, Registry, Search, SemanticSearch, TodoWrite, WebFetch,
+    WebSearch, Workspace, WriteFile,
 };
 use input::HivePrompt;
 use json_ui::JsonUi;
@@ -165,6 +165,13 @@ steps:
 
 Be concise. Reference files by path.";
 
+const READ_PROGRAM_PROMPT: &str =
+    "- Use `read_program` when discovery needs either several independent read-only
+  operations or a bounded `search_then_read` that should search and fetch
+  context around its matches in one model round trip. Keep a single simple
+  read/search/list on its ordinary tool. `read_program` is read-only: never
+  use it for edits, shell commands, Git, or network work.";
+
 /// Identity first, then the working instructions, then whatever this
 /// particular repository asks for.
 ///
@@ -179,8 +186,12 @@ Be concise. Reference files by path.";
 /// once per process. This string is the provider's context-cache prefix —
 /// re-reading `AGENTS.md` each turn would let one mid-session file save
 /// silently cost every remaining cache hit in the session.
-fn system_prompt(project: Option<&str>) -> String {
+fn system_prompt(project: Option<&str>, read_program_available: bool) -> String {
     let mut prompt = format!("{IDENTITY}\n\n{SYSTEM_PROMPT_BODY}");
+    if read_program_available {
+        prompt.push_str("\n\n");
+        prompt.push_str(READ_PROGRAM_PROMPT);
+    }
     if let Some(project) = project {
         prompt.push_str("\n\n");
         prompt.push_str(project);
@@ -637,6 +648,12 @@ async fn run(args: ActivateArgs) -> anyhow::Result<()> {
 
     let mut registry = Registry::new();
     let ws = Workspace::new(workdir.clone());
+    // Hooks match concrete tool names. Until composite sub-operations can be
+    // surfaced to them individually, enabling read_program in a hooked
+    // session could bypass a policy targeting read_file/search/list_dir.
+    // Keeping the existing tools only preserves every configured hook's
+    // enforcement and observability semantics.
+    let read_program_available = resolved.hooks.is_empty();
     let artifact_store = Arc::new(harness_tools::ArtifactStore::new(
         harness_config::default_artifacts_dir(),
     ));
@@ -646,6 +663,9 @@ async fn run(args: ActivateArgs) -> anyhow::Result<()> {
     registry.register(Arc::new(ListDir(ws.clone())));
     registry.register(Arc::new(ProjectMap(ws.clone())));
     registry.register(Arc::new(Search(ws.clone())));
+    if read_program_available {
+        registry.register(Arc::new(ReadProgram::new(ws.clone())));
+    }
     if resolved.hosted
         && let Some(web_client) =
             HostedWebClient::new(&resolved.endpoint.base_url, &resolved.endpoint.api_key)
@@ -730,7 +750,7 @@ async fn run(args: ActivateArgs) -> anyhow::Result<()> {
             registry,
             ws.clone(),
             json_ui.clone(),
-            system_prompt(project_conventions.as_deref()),
+            system_prompt(project_conventions.as_deref(), read_program_available),
         );
         agent.warm_connection();
         // Off when the threshold is 0, which is how a user turns offloading
@@ -750,6 +770,7 @@ async fn run(args: ActivateArgs) -> anyhow::Result<()> {
             workspace,
             false,
             project_conventions.as_deref(),
+            read_program_available,
         )?;
         if args.web {
             agent.set_web_enabled(true).map_err(anyhow::Error::msg)?;
@@ -763,7 +784,7 @@ async fn run(args: ActivateArgs) -> anyhow::Result<()> {
         registry,
         ws.clone(),
         ui.clone(),
-        system_prompt(project_conventions.as_deref()),
+        system_prompt(project_conventions.as_deref(), read_program_available),
     );
     agent.warm_connection();
     // Off when the threshold is 0, which is how a user turns offloading
@@ -793,6 +814,7 @@ async fn run(args: ActivateArgs) -> anyhow::Result<()> {
         workspace,
         true,
         project_conventions.as_deref(),
+        read_program_available,
     )?;
     if args.web {
         agent.set_web_enabled(true).map_err(anyhow::Error::msg)?;
@@ -812,6 +834,7 @@ fn attach_or_restore_session(
     workspace: String,
     announce: bool,
     project_conventions: Option<&str>,
+    read_program_available: bool,
 ) -> anyhow::Result<()> {
     let restored = if let Some(id) = &args.resume {
         // An explicit id that doesn't exist is a real error: silently
@@ -839,7 +862,11 @@ fn attach_or_restore_session(
             let turns = record.turn_count();
             let title = record.title.clone();
             let cost = record.session_cost_usd;
-            agent.restore(record, store, system_prompt(project_conventions));
+            agent.restore(
+                record,
+                store,
+                system_prompt(project_conventions, read_program_available),
+            );
             if announce {
                 println!(
                     "\x1b[90m⟲ resumed session {} — {turns} turns, ${cost:.4} spent{}\x1b[0m",
@@ -1460,23 +1487,24 @@ mod system_prompt_tests {
 
     #[test]
     fn identity_leads_the_prompt() {
-        let p = system_prompt(None);
+        let p = system_prompt(None, false);
         assert!(p.starts_with("You are HiveMind, a coding agent built by bmtai."));
     }
 
     #[test]
     fn a_workspace_with_no_conventions_changes_nothing() {
         assert_eq!(
-            system_prompt(None),
+            system_prompt(None, false),
             format!("{IDENTITY}\n\n{SYSTEM_PROMPT_BODY}")
         );
     }
 
     #[test]
     fn project_conventions_land_last_so_they_win_ties() {
-        let p = system_prompt(Some(
-            "<project-instructions>use just</project-instructions>",
-        ));
+        let p = system_prompt(
+            Some("<project-instructions>use just</project-instructions>"),
+            false,
+        );
         assert!(p.contains("use just"));
         // Specializations have to sit *after* the general rules they
         // override, or the nearest-instruction-wins heuristic works against
@@ -1488,12 +1516,27 @@ mod system_prompt_tests {
 
     #[test]
     fn the_final_answer_contract_survives_in_the_prompt() {
-        let p = system_prompt(None);
+        let p = system_prompt(None, false);
         // The "did not verify" clause is the load-bearing half of the
         // contract -- a summary that only lists successes is the failure
         // mode this exists to prevent.
         assert!(p.contains("what you did NOT verify"));
         assert!(p.contains("Scale it to the work"));
+    }
+
+    #[test]
+    fn read_program_guidance_is_narrow_and_preserves_simple_tools() {
+        let p = system_prompt(None, true);
+        assert!(p.contains("bounded `search_then_read`"));
+        assert!(p.contains("Keep a single simple"));
+        assert!(p.contains("`read_program` is read-only"));
+    }
+
+    #[test]
+    fn hooked_sessions_do_not_advertise_the_composite_tool() {
+        let p = system_prompt(None, false);
+        assert!(!p.contains("`read_program`"));
+        assert!(!p.contains("`search_then_read`"));
     }
 }
 
