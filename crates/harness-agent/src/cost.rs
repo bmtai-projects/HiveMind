@@ -36,6 +36,23 @@ mod tests {
     }
 
     #[test]
+    fn the_quoted_markup_matches_the_one_the_server_actually_charges() {
+        // The same business number lives twice: here (what the CLI quotes in
+        // /cost, streams per turn, and enforces --budget against) and in
+        // HiveMind-server's src/config.ts MARKUP_MULTIPLIER (what decrements
+        // the balance). Nothing links them at build time -- different
+        // languages, different repositories -- so this test is the link.
+        // Changing one alone means hosted users are quoted a price they are
+        // not billed, and their budget stops at the wrong number. Update
+        // both, and the mirror test in HiveMind-server/test/cost.test.ts.
+        assert_eq!(
+            harness_config::HOSTED_MARKUP_MULTIPLIER,
+            1.35,
+            "server default is 1.35; reconcile toward the server, it is what moves money"
+        );
+    }
+
+    #[test]
     fn unknown_model_returns_none_not_zero() {
         assert_eq!(
             estimate_cost_usd(&usage(100, 10), "not-a-real-model", true),

@@ -22,7 +22,19 @@ pub struct ModelCatalogEntry {
     pub needs_explicit_cache_control: bool,
 }
 
-pub const HOSTED_MARKUP_MULTIPLIER: f64 = 1.45;
+/// What a hosted token costs the user, as a multiple of the wholesale rate
+/// in [`KNOWN_MODELS`]. Only applied when `hosted` — a BYOK user pays their
+/// own provider directly and sees the raw wholesale figure.
+///
+/// **Must equal `MARKUP_MULTIPLIER` in HiveMind-server's `src/config.ts`.**
+/// That one decrements the balance; this one is what the CLI quotes in
+/// `/cost`, streams in the per-turn readout, and enforces `--budget`
+/// against. They are the same number in two languages in two repositories,
+/// with nothing but this comment tying them together: if they drift, every
+/// figure a hosted user sees is wrong by the size of the gap, and the
+/// budget stops at the wrong point. The server is authoritative — it is
+/// what actually moves money — so reconcile toward it.
+pub const HOSTED_MARKUP_MULTIPLIER: f64 = 1.35;
 pub const KNOWN_MODELS: &[ModelCatalogEntry] = &[
     ModelCatalogEntry {
         id: "hivemind",
