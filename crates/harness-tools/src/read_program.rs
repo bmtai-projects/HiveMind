@@ -16,6 +16,7 @@ use serde_json::value::RawValue;
 use serde_json::{Value, json};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
+use tokio::time::Instant as Deadline;
 
 use crate::error::ToolError;
 use crate::fs::{ListDir, ReadFile, Workspace};
@@ -35,6 +36,14 @@ pub struct ReadProgramPolicy {
     pub max_parallelism: usize,
     /// Budget for string payloads in the aggregate result. Structural JSON
     /// metadata is intentionally not charged against this budget.
+    ///
+    /// Kept in the same order of magnitude as the primitives it aggregates:
+    /// `fs::MAX_READ_BYTES` caps one `read_file` at 60 KB, so this is two
+    /// whole-file reads' worth. Well above that the saving stops being real
+    /// — anything over `DEFAULT_ARTIFACT_THRESHOLD_BYTES` is offloaded and
+    /// the model sees a head/tail preview of pretty-printed JSON, which is
+    /// mostly punctuation, and has to spend the round trip this tool exists
+    /// to save fetching the artifact.
     pub max_total_bytes: usize,
     pub max_search_results: usize,
     pub max_map_iterations: usize,
@@ -46,10 +55,17 @@ impl Default for ReadProgramPolicy {
         Self {
             max_operations: 16,
             max_parallelism: 6,
-            max_total_bytes: 1_000_000,
+            max_total_bytes: 120_000,
             max_search_results: 50,
             max_map_iterations: 8,
-            execution_timeout_ms: 3_000,
+            // Per operation, not for the program as a whole. A repo-wide
+            // `search` walks and reads every file under the root, which on a
+            // large tree takes seconds — and the plain `search` tool it
+            // delegates to has no deadline at all, so a budget tight enough
+            // to trip on ordinary work would make this tool strictly worse
+            // than the primitives it replaces. Still far under `run_shell`'s
+            // 120s, because nothing here should ever run that long.
+            execution_timeout_ms: 30_000,
         }
     }
 }
@@ -75,9 +91,50 @@ impl ReadProgram {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
-struct ReadProgramArgs {
-    operations: Vec<ReadOperation>,
+#[derive(Deserialize)]
+struct RawProgramArgs<'a> {
+    #[serde(borrow)]
+    operations: Vec<&'a RawValue>,
+}
+
+/// Deserialize each operation on its own so a rejected one names itself.
+///
+/// A malformed operation still rejects the whole program — an argument the
+/// executor cannot understand means the model's plan is not the plan that
+/// would run, and half-running it is worse than saying so. What this adds is
+/// *which* operation: serde's own message ("unknown field `max_results`")
+/// is accurate but leaves the model guessing which of sixteen entries it
+/// belongs to.
+fn parse_operations(args: &RawValue) -> Result<Vec<ReadOperation>, ToolError> {
+    let raw: RawProgramArgs = serde_json::from_str(args.get())?;
+    raw.operations
+        .iter()
+        .enumerate()
+        .map(|(index, item)| {
+            serde_json::from_str::<ReadOperation>(item.get()).map_err(|error| {
+                ToolError::Message(format!(
+                    "read_program operation {index}{}: {error}",
+                    operation_label(item)
+                ))
+            })
+        })
+        .collect()
+}
+
+/// Best-effort `id`/`op` for an operation that failed to deserialize. Either
+/// field may be missing or the wrong type — this is only ever used to make an
+/// error message easier to act on, so anything unusable is simply omitted.
+fn operation_label(item: &RawValue) -> String {
+    let Ok(value) = serde_json::from_str::<Value>(item.get()) else {
+        return String::new();
+    };
+    let field = |name: &str| value.get(name).and_then(Value::as_str).map(str::to_owned);
+    match (field("id"), field("op")) {
+        (Some(id), Some(op)) => format!(" (id {id:?}, op {op:?})"),
+        (Some(id), None) => format!(" (id {id:?})"),
+        (None, Some(op)) => format!(" (op {op:?})"),
+        (None, None) => String::new(),
+    }
 }
 
 /// The closed AST. Adding a field cannot add a capability; adding a new
@@ -221,6 +278,9 @@ struct ExecutionMetrics {
 #[derive(Debug, Serialize)]
 struct ProgramResult {
     status: &'static str,
+    truncated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    note: Option<String>,
     operations: Vec<ProgramOperationResult>,
     execution: ExecutionMetrics,
 }
@@ -239,7 +299,21 @@ impl Tool for ReadProgram {
          ordinary single reads on their existing tools."
     }
 
+    // One schema per operation rather than one flat object listing every
+    // field. The AST is an internally tagged enum with `deny_unknown_fields`,
+    // so `max_results` on a `read_file` is a hard rejection of the *whole*
+    // program -- and a flat schema is exactly what invites the model to send
+    // it, since it advertises every field as legal on every operation.
     fn schema(&self) -> Value {
+        let id = json!({"type": "string", "description": "short unique result name"});
+        let query = json!({"type": "string", "description": "literal case-sensitive search text"});
+        let search_path = json!({
+            "type": "string",
+            "description": "workspace-relative directory to search under; omit for the whole workspace",
+        });
+        let max_results = json!({
+            "type": "integer", "minimum": 1, "maximum": self.policy.max_search_results,
+        });
         json!({
             "type": "object",
             "properties": {
@@ -247,22 +321,63 @@ impl Tool for ReadProgram {
                     "type": "array",
                     "minItems": 1,
                     "maxItems": self.policy.max_operations,
-                    "description": "Read-only operations. Every id must be unique. Operation-specific fields are validated before anything runs.",
+                    "description": "Read-only operations, run concurrently. Every id must be unique. Send only the fields listed for the op you choose.",
                     "items": {
-                        "type": "object",
-                        "properties": {
-                            "id": {"type": "string", "description": "short unique result name"},
-                            "op": {"type": "string", "enum": ["read_file", "search", "list_dir", "search_then_read"]},
-                            "path": {"type": "string", "description": "workspace-relative path; optional for search operations"},
-                            "query": {"type": "string", "description": "literal case-sensitive search text"},
-                            "offset": {"type": "integer", "minimum": 1},
-                            "limit": {"type": "integer", "minimum": 1},
-                            "max_results": {"type": "integer", "minimum": 1, "maximum": self.policy.max_search_results},
-                            "max_reads": {"type": "integer", "minimum": 1, "maximum": self.policy.max_map_iterations},
-                            "context_lines": {"type": "integer", "minimum": 1, "maximum": MAX_CONTEXT_LINES}
-                        },
-                        "required": ["id", "op"],
-                        "additionalProperties": false
+                        "oneOf": [
+                            {
+                                "title": "read_file",
+                                "type": "object",
+                                "properties": {
+                                    "id": id,
+                                    "op": {"type": "string", "enum": ["read_file"]},
+                                    "path": {"type": "string", "description": "workspace-relative file path"},
+                                    "offset": {"type": "integer", "minimum": 1, "description": "1-indexed first line"},
+                                    "limit": {"type": "integer", "minimum": 1, "description": "line count from offset"}
+                                },
+                                "required": ["id", "op", "path"],
+                                "additionalProperties": false
+                            },
+                            {
+                                "title": "search",
+                                "type": "object",
+                                "properties": {
+                                    "id": id,
+                                    "op": {"type": "string", "enum": ["search"]},
+                                    "query": query,
+                                    "path": search_path,
+                                    "max_results": max_results
+                                },
+                                "required": ["id", "op", "query"],
+                                "additionalProperties": false
+                            },
+                            {
+                                "title": "list_dir",
+                                "type": "object",
+                                "properties": {
+                                    "id": id,
+                                    "op": {"type": "string", "enum": ["list_dir"]},
+                                    "path": {"type": "string", "description": "workspace-relative directory path; '.' for the root"}
+                                },
+                                "required": ["id", "op", "path"],
+                                "additionalProperties": false
+                            },
+                            {
+                                "title": "search_then_read",
+                                "type": "object",
+                                "description": "Search, then read bounded context around the first matches, in one call.",
+                                "properties": {
+                                    "id": id,
+                                    "op": {"type": "string", "enum": ["search_then_read"]},
+                                    "query": query,
+                                    "path": search_path,
+                                    "max_results": max_results,
+                                    "max_reads": {"type": "integer", "minimum": 1, "maximum": self.policy.max_map_iterations, "description": "how many matches to read around"},
+                                    "context_lines": {"type": "integer", "minimum": 1, "maximum": MAX_CONTEXT_LINES, "description": "lines of context each side of a match"}
+                                },
+                                "required": ["id", "op", "query"],
+                                "additionalProperties": false
+                            }
+                        ]
                     }
                 }
             },
@@ -272,50 +387,30 @@ impl Tool for ReadProgram {
     }
 
     async fn execute(&self, args: &RawValue) -> Result<ToolResult, ToolError> {
-        let args: ReadProgramArgs = serde_json::from_str(args.get())?;
-        self.validate(&args)?;
+        let requested = parse_operations(args)?;
+        self.validate(&requested)?;
 
         let started = Instant::now();
-        let (unique, result_indices) = deduplicate(&args.operations);
+        let (unique, result_indices) = deduplicate(&requested);
         let unique_count = unique.len();
         let semaphore = Arc::new(Semaphore::new(self.policy.max_parallelism));
-        let run = execute_unique(unique, self.workspace.clone(), self.policy, semaphore);
-
-        let unique_results = match tokio::time::timeout(
-            Duration::from_millis(self.policy.execution_timeout_ms),
-            run,
+        // The deadline is applied per operation rather than to the program as
+        // a whole. Timing out the aggregate threw away every result that had
+        // already arrived, so one slow repo-wide search cost the model the
+        // five reads that finished in milliseconds beside it -- and told it
+        // nothing about which operation was the slow one.
+        let deadline = Deadline::now() + Duration::from_millis(self.policy.execution_timeout_ms);
+        let unique_results = execute_unique(
+            unique,
+            self.workspace.clone(),
+            self.policy,
+            semaphore,
+            deadline,
         )
-        .await
-        {
-            Ok(results) => results,
-            Err(_) => {
-                let wall_ms = elapsed_ms(started);
-                let summary = serde_json::to_string_pretty(&json!({
-                    "status": "timeout",
-                    "error": format!(
-                        "read program exceeded {} ms",
-                        self.policy.execution_timeout_ms
-                    ),
-                    "execution": {
-                        "requested_operations": args.operations.len(),
-                        "executed_operations": unique_count,
-                        "operations_deduplicated": args.operations.len() - unique_count,
-                        "max_parallelism": self.policy.max_parallelism,
-                        "wall_ms": wall_ms,
-                    }
-                }))?;
-                return Ok(ToolResult {
-                    status: ToolStatus::Timeout,
-                    summary,
-                    retryable: true,
-                    duration_ms: wall_ms,
-                    ..Default::default()
-                });
-            }
-        };
+        .await;
 
-        let mut operations = Vec::with_capacity(args.operations.len());
-        for (operation, result_index) in args.operations.iter().zip(result_indices) {
+        let mut operations = Vec::with_capacity(requested.len());
+        for (operation, result_index) in requested.iter().zip(result_indices) {
             let executed = &unique_results[result_index];
             operations.push(ProgramOperationResult {
                 id: operation.id().to_string(),
@@ -327,43 +422,69 @@ impl Tool for ReadProgram {
         }
 
         let mut remaining = self.policy.max_total_bytes;
+        let mut truncated = false;
         for operation in &mut operations {
             operation.truncated = cap_string_payloads(&mut operation.data, &mut remaining);
+            truncated |= operation.truncated;
         }
 
+        let any_timeout = unique_results
+            .iter()
+            .any(|result| result.status == ToolStatus::Timeout);
         let any_failure = unique_results
             .iter()
             .any(|result| result.status.is_failure());
         let any_success = unique_results
             .iter()
             .any(|result| !result.status.is_failure());
-        let status = match (any_failure, any_success) {
-            (false, _) => "success",
-            (true, true) => "partial",
-            (true, false) => "failed",
+        let status = match (any_failure, any_success, any_timeout) {
+            (false, _, _) => "success",
+            (true, true, _) => "partial",
+            (true, false, true) => "timeout",
+            (true, false, false) => "failed",
         };
         let wall_ms = elapsed_ms(started);
         let primitive_operations = unique_results.iter().map(|r| r.primitives).sum();
         let result = ProgramResult {
             status,
+            truncated,
+            // Said once, at the top, because a per-operation `truncated: true`
+            // on an emptied string looks exactly like an empty file. This is
+            // the same reason `fs::slice_file` labels a partial read.
+            note: truncated.then(|| {
+                format!(
+                    "the shared {}-byte result budget ran out; some values are cut short or \
+                     empty. Re-run with fewer operations, a narrower path, or read_file \
+                     offset/limit to see the rest.",
+                    self.policy.max_total_bytes
+                )
+            }),
             operations,
             execution: ExecutionMetrics {
-                requested_operations: args.operations.len(),
+                requested_operations: requested.len(),
                 executed_operations: unique_count,
                 primitive_operations,
-                operations_deduplicated: args.operations.len() - unique_count,
+                operations_deduplicated: requested.len() - unique_count,
                 max_parallelism: self.policy.max_parallelism,
                 wall_ms,
             },
         };
 
+        // A composite call that came back with usable results ended fine, even
+        // if one operation missed. Reporting `Failed` for a partial success
+        // feeds `last_turn_had_failure` into the agent's escalation counter,
+        // which buys an automatic jump to a model costing ~25x more -- for one
+        // guessed path that did not exist. The per-operation status in the
+        // payload is what tells the model what actually happened.
+        let tool_status = match (any_success, any_timeout) {
+            (true, _) => ToolStatus::Ok,
+            (false, true) => ToolStatus::Timeout,
+            (false, false) => ToolStatus::Failed,
+        };
         Ok(ToolResult {
-            status: if any_failure {
-                ToolStatus::Failed
-            } else {
-                ToolStatus::Ok
-            },
+            status: tool_status,
             summary: serde_json::to_string_pretty(&result)?,
+            retryable: tool_status == ToolStatus::Timeout,
             duration_ms: wall_ms,
             ..Default::default()
         })
@@ -371,7 +492,7 @@ impl Tool for ReadProgram {
 }
 
 impl ReadProgram {
-    fn validate(&self, args: &ReadProgramArgs) -> Result<(), ToolError> {
+    fn validate(&self, operations: &[ReadOperation]) -> Result<(), ToolError> {
         if self.policy.max_operations == 0
             || self.policy.max_parallelism == 0
             || self.policy.max_total_bytes == 0
@@ -383,7 +504,7 @@ impl ReadProgram {
                 "read_program policy limits must all be greater than zero".into(),
             ));
         }
-        if args.operations.is_empty() {
+        if operations.is_empty() {
             return Err(ToolError::Message(
                 "read_program requires at least one operation".into(),
             ));
@@ -391,7 +512,7 @@ impl ReadProgram {
 
         let mut ids = HashSet::new();
         let mut primitives = 0usize;
-        for operation in &args.operations {
+        for operation in operations {
             validate_id(operation.id())?;
             if !ids.insert(operation.id()) {
                 return Err(ToolError::Message(format!(
@@ -476,8 +597,23 @@ fn validate_id(id: &str) -> Result<(), ToolError> {
     }
 }
 
+/// Reject a path that escapes the workspace — nothing else.
+///
+/// A path that simply is not there yet resolves to an IO error, and failing
+/// the program on it made one mistyped filename discard every other
+/// operation's results. Worse, it did so inconsistently: a missing file in an
+/// existing directory already degraded to a per-operation failure, while a
+/// missing *directory* aborted everything with a bare "No such file or
+/// directory" that named neither the operation nor the path.
+///
+/// Deferring is safe because the tool that runs the operation resolves the
+/// path again and enforces the same boundary; this is orchestration, not a
+/// second security check.
 fn validate_path(workspace: &Workspace, path: &str) -> Result<(), ToolError> {
-    workspace.resolve(path).map(|_| ())
+    match workspace.resolve(path) {
+        Ok(_) | Err(ToolError::Io(_)) => Ok(()),
+        Err(escape) => Err(escape),
+    }
 }
 
 fn validate_positive(name: &str, value: Option<usize>) -> Result<(), ToolError> {
@@ -542,14 +678,30 @@ async fn execute_unique(
     workspace: Workspace,
     policy: ReadProgramPolicy,
     semaphore: Arc<Semaphore>,
+    deadline: Deadline,
 ) -> Vec<ExecutedOperation> {
     let count = operations.len();
     let mut set = JoinSet::new();
     for (index, operation) in operations.into_iter().enumerate() {
         let workspace = workspace.clone();
         let semaphore = semaphore.clone();
+        let name = operation.name();
         set.spawn(async move {
-            let result = execute_operation(operation, workspace, policy, semaphore).await;
+            let run = execute_operation(operation, workspace, policy, semaphore);
+            let result = match tokio::time::timeout_at(deadline, run).await {
+                Ok(result) => result,
+                Err(_) => ExecutedOperation {
+                    status: ToolStatus::Timeout,
+                    data: json!({
+                        "error": format!(
+                            "{name} exceeded the {} ms read_program time budget; \
+                             narrow the path or query and try again",
+                            policy.execution_timeout_ms
+                        )
+                    }),
+                    primitives: 0,
+                },
+            };
             (index, result)
         });
     }
@@ -787,7 +939,9 @@ fn search_data(query: &str, path: Option<&str>, hits: &[SearchHit], truncated: b
         .collect();
     json!({
         "query": query,
-        "path": path.unwrap_or("."),
+        // Normalized the same way `search_workspace` normalizes it, so the
+        // echo names the directory that was actually walked.
+        "path": path.filter(|p| !p.is_empty()).unwrap_or("."),
         "count": hits.len(),
         "truncated": truncated,
         "results": results,
@@ -1030,6 +1184,228 @@ mod tests {
                 .len()
                 <= 32
         );
+    }
+
+    #[test]
+    fn every_field_the_schema_advertises_is_one_the_ast_accepts() {
+        // The mismatch this pins is not theoretical: with a single flat item
+        // schema, `max_results` was advertised as legal on `read_file`, and
+        // sending it rejected the *whole* program with "unknown field".
+        let schema = ReadProgram::new(Workspace::new(std::env::temp_dir())).schema();
+        let variants = schema["properties"]["operations"]["items"]["oneOf"]
+            .as_array()
+            .expect("the item schema is a per-operation oneOf");
+        assert_eq!(variants.len(), 4, "one schema per operation");
+
+        for variant in variants {
+            let op = variant["title"].as_str().unwrap();
+            let mut probe = serde_json::Map::new();
+            for (field, spec) in variant["properties"].as_object().unwrap() {
+                let value = match (field.as_str(), spec["type"].as_str().unwrap()) {
+                    ("op", _) => json!(op),
+                    (_, "integer") => json!(1),
+                    _ => json!("probe"),
+                };
+                probe.insert(field.clone(), value);
+            }
+            let filled = Value::Object(probe).to_string();
+            let parsed = serde_json::from_str::<ReadOperation>(&filled);
+            assert!(
+                parsed.is_ok(),
+                "{op} advertises a field the AST rejects: {:?} in {filled}",
+                parsed.err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_rejected_operation_says_which_one_it_was() {
+        // serde's own message names the field but not the entry, which is no
+        // help when the model sent sixteen of them.
+        let workspace = ws("named_error");
+        let error = ReadProgram::new(workspace)
+            .execute(&args(json!({"operations": [
+                {"id": "ok", "op": "list_dir", "path": "."},
+                {"id": "muddled", "op": "read_file", "path": "a.txt", "max_results": 3}
+            ]})))
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("operation 1"), "{error}");
+        assert!(error.contains("muddled"), "{error}");
+        assert!(error.contains("max_results"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_path_that_is_not_there_fails_only_its_own_operation() {
+        // A missing file in an existing directory always degraded to a single
+        // failed operation; a missing *directory* aborted the whole program
+        // with a bare "No such file or directory". Same mistake, same blast
+        // radius -- one of the two was just louder about it.
+        let workspace = ws("missing_dir");
+        std::fs::write(workspace.root.join("real.txt"), "content\n").unwrap();
+
+        let result = ReadProgram::new(workspace)
+            .execute(&args(json!({"operations": [
+                {"id": "real", "op": "read_file", "path": "real.txt"},
+                {"id": "guessed", "op": "read_file", "path": "no/such/dir/file.rs"}
+            ]})))
+            .await
+            .unwrap();
+
+        let output: Value = serde_json::from_str(&result.summary).unwrap();
+        assert_eq!(output["status"], "partial");
+        assert_eq!(output["operations"][0]["status"], "ok");
+        assert_eq!(output["operations"][0]["data"]["content"], "content\n");
+        assert_eq!(output["operations"][1]["id"], "guessed");
+        assert_eq!(output["operations"][1]["status"], "failed");
+    }
+
+    #[tokio::test]
+    async fn one_missed_read_does_not_report_the_whole_call_as_failed() {
+        // `ToolStatus::Failed` is not cosmetic here: `Agent::update_escalation`
+        // counts it and can switch to a model costing ~25x more. A discovery
+        // program where one guessed path missed is not a failed tool call.
+        let workspace = ws("partial_status");
+        std::fs::write(workspace.root.join("real.txt"), "content\n").unwrap();
+
+        let result = ReadProgram::new(workspace)
+            .execute(&args(json!({"operations": [
+                {"id": "real", "op": "read_file", "path": "real.txt"},
+                {"id": "gone", "op": "read_file", "path": "gone.txt"}
+            ]})))
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, ToolStatus::Ok);
+        let output: Value = serde_json::from_str(&result.summary).unwrap();
+        assert_eq!(
+            output["status"], "partial",
+            "the model still has to be told, in the payload it reads"
+        );
+    }
+
+    #[tokio::test]
+    async fn every_operation_failing_is_still_a_failed_call() {
+        let workspace = ws("all_failed");
+        let result = ReadProgram::new(workspace)
+            .execute(&args(json!({"operations": [
+                {"id": "gone", "op": "read_file", "path": "gone.txt"}
+            ]})))
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, ToolStatus::Failed);
+        let output: Value = serde_json::from_str(&result.summary).unwrap();
+        assert_eq!(output["status"], "failed");
+    }
+
+    #[tokio::test]
+    async fn a_timeout_reports_per_operation_results_instead_of_discarding_them() {
+        // The whole program used to share one deadline, so a slow repo-wide
+        // search cost the model every read that had already finished beside
+        // it -- and the error named no operation, so it could not even retry
+        // the program without the slow part.
+        let workspace = ws("timeout");
+        for i in 0..800 {
+            std::fs::write(
+                workspace.root.join(format!("f{i}.txt")),
+                "filler line\n".repeat(400),
+            )
+            .unwrap();
+        }
+        let policy = ReadProgramPolicy {
+            execution_timeout_ms: 1,
+            ..ReadProgramPolicy::default()
+        };
+
+        let result = ReadProgram::new(workspace)
+            .with_policy(policy)
+            .execute(&args(json!({"operations": [
+                // A query with no match anywhere, so the walk cannot stop
+                // early at max_results after the first file.
+                {"id": "slow", "op": "search", "query": "no-such-token-anywhere"},
+                {"id": "quick", "op": "list_dir", "path": "."}
+            ]})))
+            .await
+            .unwrap();
+
+        let output: Value = serde_json::from_str(&result.summary).unwrap();
+        let operations = output["operations"].as_array().unwrap();
+        assert_eq!(operations.len(), 2, "both operations must be accounted for");
+        assert_eq!(operations[0]["id"], "slow");
+        assert_eq!(operations[0]["status"], "timeout");
+        assert!(
+            operations[0]["data"]["error"]
+                .as_str()
+                .unwrap()
+                .contains("search"),
+            "the timed-out operation must name itself: {}",
+            operations[0]["data"]["error"]
+        );
+        assert_eq!(operations[1]["id"], "quick");
+        assert_eq!(output["execution"]["requested_operations"], 2);
+    }
+
+    #[tokio::test]
+    async fn an_exhausted_budget_is_announced_once_at_the_top() {
+        // A per-operation `truncated: true` beside an emptied string reads
+        // exactly like an empty file -- the failure `fs::slice_file` already
+        // labels its partial reads to avoid.
+        let workspace = ws("budget_note");
+        std::fs::write(workspace.root.join("big.txt"), "x".repeat(1_000)).unwrap();
+        let policy = ReadProgramPolicy {
+            max_total_bytes: 32,
+            ..ReadProgramPolicy::default()
+        };
+
+        let result = ReadProgram::new(workspace)
+            .with_policy(policy)
+            .execute(&args(json!({"operations": [
+                {"id": "big", "op": "read_file", "path": "big.txt"}
+            ]})))
+            .await
+            .unwrap();
+
+        let output: Value = serde_json::from_str(&result.summary).unwrap();
+        assert_eq!(output["truncated"], true);
+        assert!(
+            output["note"].as_str().unwrap().contains("32-byte"),
+            "{}",
+            output["note"]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_whole_result_that_fits_carries_no_truncation_note() {
+        let workspace = ws("no_note");
+        std::fs::write(workspace.root.join("small.txt"), "hi\n").unwrap();
+        let result = ReadProgram::new(workspace)
+            .execute(&args(json!({"operations": [
+                {"id": "small", "op": "read_file", "path": "small.txt"}
+            ]})))
+            .await
+            .unwrap();
+
+        let output: Value = serde_json::from_str(&result.summary).unwrap();
+        assert_eq!(output["truncated"], false);
+        assert!(output.get("note").is_none(), "{output}");
+    }
+
+    #[tokio::test]
+    async fn an_empty_search_path_echoes_the_directory_actually_walked() {
+        let workspace = ws("echo_path");
+        std::fs::write(workspace.root.join("a.txt"), "needle\n").unwrap();
+        let result = ReadProgram::new(workspace)
+            .execute(&args(json!({"operations": [
+                {"id": "s", "op": "search", "query": "needle", "path": ""}
+            ]})))
+            .await
+            .unwrap();
+
+        let output: Value = serde_json::from_str(&result.summary).unwrap();
+        assert_eq!(output["operations"][0]["data"]["path"], ".");
     }
 
     #[tokio::test]
