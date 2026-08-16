@@ -1,30 +1,9 @@
-//! Config resolution: which model, and where the key comes from.
-//!
-//! Resolution order (highest wins): CLI flag > `config.toml` >
-//! `$HIVEMIND_API_KEY` environment variable > stored hosted credentials
-//! (`hivemind auth login`). This intentionally mirrors grok-build's own
-//! precedence (`SamplerConfig` construction in `xai-grok-sampler::config`),
-//! extended with the hosted fallback. `$DEEPSEEK_API_KEY` and the legacy
-//! `[deepseek]` config section are still accepted silently, underneath
-//! `$HIVEMIND_API_KEY`/`[model]`, so nothing set up before this rename
-//! breaks.
-//!
-//! Model selection is a flat id string (`--model`/`config.toml`'s `[model]
-//! model`), not a fixed set of tiers: hosted mode (resolved via stored
-//! credentials) proxies through `HiveMind-server` to OpenRouter and can
-//! reach any of `KNOWN_MODELS`; BYOK mode (an explicit key) talks to the
-//! upstream provider directly, so its model id has to be whatever that
-//! provider actually recognizes.
+
 
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-
-/// $/M-token wholesale pricing for one known model, used only for the live
-/// cost readout — never sent to the API. Mirrors
-/// `HiveMind-server/src/models.ts`'s `MODEL_ALLOWLIST` exactly (same
-/// numbers); update both together if OpenRouter's prices drift.
 #[derive(Debug, Clone, Copy)]
 pub struct Pricing {
     pub input_per_m: f64,
@@ -40,53 +19,12 @@ pub struct ModelCatalogEntry {
     pub id: &'static str,
     pub display_name: &'static str,
     pub context_window: u64,
-    /// Wholesale cost. A hosted request is actually billed this times
-    /// `HOSTED_MARKUP_MULTIPLIER`; a BYOK request pays this directly, with
-    /// no HiveMind margin.
     pub wholesale_pricing: Pricing,
-    /// Valid `reasoning_effort` values this model actually accepts, per
-    /// OpenRouter's own published per-model metadata (verified live against
-    /// https://openrouter.ai/api/v1/models on 2026-07-26) -- NOT a fixed
-    /// global enum, because it isn't one: e.g. "hivemind" only accepts
-    /// "high"/"xhigh", qwen3-coder-plus doesn't support this parameter at
-    /// all, and several models (grok-build, kimi-k2-code) reason
-    /// unconditionally but only expose OpenRouter's richer `reasoning:
-    /// {...}` object, not this string shorthand -- deliberately not
-    /// implemented here, so their list is empty even though they do
-    /// reason. Empty means "don't send reasoning_effort for this model."
     pub reasoning_efforts: &'static [&'static str],
-    /// Whether this model only caches the prompt prefix when the request
-    /// carries an explicit `cache_control` breakpoint.
-    ///
-    /// Most providers (DeepSeek, OpenAI, xAI, Qwen, Moonshot) cache
-    /// automatically once a prompt is long enough, and need nothing from
-    /// the client. Anthropic does not: with no breakpoint you pay full
-    /// price for the entire prefix on *every* turn -- and since the tool
-    /// manifest plus system prompt alone are ~3k tokens that never change,
-    /// that's the single most expensive thing to get wrong on the priciest
-    /// model in the catalog.
-    ///
-    /// `true` makes the wire layer send the system message as a content
-    /// part carrying `cache_control` (see `harness_provider`'s wire
-    /// module). Kept per-model rather than always-on because sending it to
-    /// a provider that doesn't expect it risks a hard 400 for no benefit.
     pub needs_explicit_cache_control: bool,
 }
 
-/// Must match `HiveMind-server`'s `config.ts` `MARKUP_MULTIPLIER` default.
-/// There's no API that reports the server's real-time margin back to the
-/// CLI, so the hosted-mode cost readout is a best-effort display estimate,
-/// not a billing guarantee — the server's own reserve/settle is what
-/// actually decides a user's balance.
 pub const HOSTED_MARKUP_MULTIPLIER: f64 = 1.45;
-
-/// The 6 third-party coding models HiveMind resells, plus "hivemind"
-/// itself — branded on purpose; it wire-resolves to DeepSeek V4 Flash
-/// server-side, but nothing client-side ever spells that out; see
-/// `HiveMind-server/src/models.ts` and `src/proxy/upstream.ts` for where
-/// the alias is actually enforced (the stream relay rewrites every
-/// chunk's `model` field back to the alias before it reaches a client, so
-/// even raw traffic inspection doesn't leak it).
 pub const KNOWN_MODELS: &[ModelCatalogEntry] = &[
     ModelCatalogEntry {
         id: "hivemind",
@@ -151,9 +89,7 @@ pub const KNOWN_MODELS: &[ModelCatalogEntry] = &[
             input_cache_read_per_m: 0.2,
             output_per_m: 2.0,
         },
-        // Reasons unconditionally, but only exposes OpenRouter's `reasoning:
-        // {...}` object, not the reasoning_effort string -- empty on
-        // purpose (see the field doc comment).
+        // Reasons unconditionally, but the model is cheap enough that
         reasoning_efforts: &[],
         needs_explicit_cache_control: false,
     },
@@ -204,25 +140,10 @@ pub struct Endpoint {
 /// Agent-loop policy knobs, all with sane defaults.
 #[derive(Debug, Clone)]
 pub struct AgentPolicy {
-    /// A turn is one sample-then-dispatch round, not one file -- a single
-    /// turn can batch many tool calls (`Registry::dispatch_many` runs a
-    /// whole turn's calls concurrently). 25 was tuned for small, focused
-    /// edits; a task that scaffolds multiple files, installs dependencies,
-    /// runs them, and fixes what's broken burns turns much faster and can
-    /// legitimately need this many. Configurable via `[agent] max_turns`
-    /// in config.toml if even this isn't enough for a given task.
     pub max_turns: u32,
     /// Compact the conversation once usage crosses this percent of the
     /// active model's context window.
     pub compaction_threshold_percent: u8,
-    /// Escalate away from "hivemind" for one retry after this many
-    /// consecutive identical tool calls (a doom-loop symptom) or tool
-    /// errors. Scoped to rescuing the cheap default only — unlike the old
-    /// Flash→Pro jump (a ~3x price difference within one provider),
-    /// silently moving a user off a model they explicitly picked among 7
-    /// very differently priced options risks a much bigger, more
-    /// surprising cost jump, so this never fires once a non-default model
-    /// is active.
     pub auto_escalate: bool,
     pub escalate_to_model: String,
     pub escalate_after_repeats: u32,
@@ -253,9 +174,6 @@ impl Default for AgentPolicy {
     }
 }
 
-/// Which moment a hook fires at. `PreToolUse` can veto a call before it
-/// runs; `PostToolUse` only observes what already happened — see
-/// `harness_agent::hooks` for why that asymmetry is deliberate, not a gap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HookEvent {
@@ -286,22 +204,6 @@ pub struct HookSpec {
     pub command: String,
     #[serde(default = "default_hook_timeout_ms")]
     pub timeout_ms: u64,
-    /// Whether this hook's *failure* is itself a denial.
-    ///
-    /// Off by default, which keeps the advisory behaviour every existing
-    /// config already relies on: a hook that can't spawn, times out, or
-    /// exits weirdly is ignored and the tool call proceeds. That's right
-    /// for linting, logging, and notifications — a broken formatter should
-    /// never wedge the agent.
-    ///
-    /// It is exactly wrong for a security control. "Block writes outside
-    /// the sandbox" that silently permits everything the moment the script
-    /// has a syntax error is not a control, it's a decoration. Setting
-    /// `enforcement = true` inverts every failure path to a denial, so the
-    /// only way past such a hook is for it to run and explicitly allow.
-    ///
-    /// Meaningful on `PreToolUse` only — a `PostToolUse` hook observes work
-    /// that has already happened, so there is nothing left for it to veto.
     #[serde(default)]
     pub enforcement: bool,
 }
@@ -311,26 +213,9 @@ pub struct HookSpec {
 pub struct Resolved {
     pub endpoint: Endpoint,
     pub default_model: String,
-    /// Product tier for this session. Precedence, highest first:
-    /// `--mode` flag > `$HIVEMIND_MODE` > `[agent] mode` > Standard.
     pub mode: Mode,
-    /// Whether `endpoint`/`default_model` came from stored hosted
-    /// credentials (`hivemind auth login`) rather than an explicit BYOK
-    /// key. Only consulted to decide whether the live cost readout should
-    /// apply `HOSTED_MARKUP_MULTIPLIER` — a BYOK key pays the upstream
-    /// provider directly, with no HiveMind margin.
     pub hosted: bool,
-    /// Off (`None`) unless the user opts in via `--reasoning-effort` or
-    /// `config.toml`'s `[model] reasoning_effort` -- not every model
-    /// supports this, and the ones that do bill more/run slower for it, so
-    /// it's never assumed on. Gated per-model at request time by
-    /// `harness_agent::Agent`, not here (the active model can change
-    /// mid-session via `/model`; this crate just carries the user's intent).
     pub reasoning_effort: Option<String>,
-    /// Hard cap on cumulative estimated USD spend for the session. `None`
-    /// (the default) means unbounded. Enforced by `harness_agent::Agent`,
-    /// not here -- this crate just carries the user's intent through from
-    /// `--budget` / `config.toml`'s `[agent] budget_usd`.
     pub budget_usd: Option<f64>,
     pub policy: AgentPolicy,
     pub hooks: Vec<HookSpec>,
@@ -342,9 +227,6 @@ pub struct Resolved {
 struct File {
     #[serde(default)]
     model: ModelSection,
-    // Legacy alias for `[model]`, from before the section was renamed.
-    // Still parsed, silently, so a config.toml written before this rename
-    // keeps working; never mentioned in anything user-facing going forward.
     #[serde(default)]
     deepseek: ModelSection,
     #[serde(default)]
@@ -361,10 +243,7 @@ struct ModelSection {
     reasoning_effort: Option<String>,
 }
 
-/// Product tier for a session. Deliberately a mode rather than a pile of
-/// individual toggles: a user should pick "how good do I want this to be",
-/// not learn which capabilities happen to be network-backed. Today it only
-/// selects the embedder; it is the place any later paid capability lands.
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Mode {
@@ -452,9 +331,6 @@ pub struct CliOverrides {
     pub mode: Option<Mode>,
 }
 
-/// A token minted by the hosted backend (`hivemind auth login`), paired
-/// with the API base it's valid against. Stored at
-/// `default_credentials_path()`, never sent anywhere except that backend.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HostedCredentials {
     pub api_base: String,
@@ -466,12 +342,6 @@ struct CredentialsFile {
     hosted: HostedCredentials,
 }
 
-/// Load and fully resolve configuration.
-///
-/// `config_path` is the config file location; `credentials_path` is where
-/// `hivemind auth login` would have stored hosted credentials. Neither
-/// existing is an error — config sections are all optional, and hosted
-/// credentials are only consulted as the last-resort key source.
 pub fn resolve(
     config_path: &Path,
     credentials_path: &Path,
@@ -493,9 +363,7 @@ pub fn resolve(
         .or_else(|| file.model.base_url.clone())
         .or_else(|| file.deepseek.base_url.clone());
 
-    // A hosted token is only ever paired with its own api_base — never the
-    // bare upstream default — unless an explicit override says otherwise
-    // (e.g. pointing a hosted token at a local mock for testing).
+  
     let (api_key, base_url, hosted) = match explicit_key {
         Some(key) => (
             key,
