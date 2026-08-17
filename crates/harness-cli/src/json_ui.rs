@@ -64,6 +64,14 @@ pub enum Command {
     Interject {
         text: String,
     },
+    /// Cancel the turn currently running. Like `Approve`/`Interject`, and
+    /// for the same reason, this is resolved immediately by the reader task
+    /// rather than queued behind `tx` -- queueing it behind the very run it
+    /// exists to interrupt would mean it's only ever seen after that run
+    /// finishes on its own, which is not an abort. A no-op if no turn is
+    /// running (the reader task cannot know that without racing the main
+    /// loop, so the main loop drops it silently if it arrives late).
+    Abort,
 }
 
 pub struct JsonUi {
@@ -182,6 +190,18 @@ impl JsonUi {
     /// equally whether what just finished was a message or a command.
     pub fn emit_turn_done(&self) {
         self.emit(json!({"type": "turn_done"}));
+    }
+
+    /// Sent instead of (never in addition to) `turn_done` when an
+    /// `abort` command actually cancelled a running turn -- so the
+    /// extension can render "stopped" rather than a turn that quietly
+    /// produced no new content. A `repaired` flag distinguishes a clean
+    /// stop between tool calls from one that landed mid-tool-call and had
+    /// to drop an incomplete call from the transcript, which is worth a
+    /// different message: the second case is the one place aborting can
+    /// visibly shorten what the model already did.
+    pub fn emit_aborted(&self, repaired: bool) {
+        self.emit(json!({"type": "aborted", "repaired": repaired}));
     }
 
     pub fn emit_error(&self, message: &str) {
