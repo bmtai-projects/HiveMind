@@ -620,6 +620,64 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Kill every backgrounded shell process the moment this process is asked
+/// to terminate, instead of leaving that to [`harness_tools::Bash`]'s own
+/// `Drop` impl.
+///
+/// `Drop` is not enough on its own: it only runs on ordinary unwinding, and
+/// the one way a host actually stops a running agent -- the VS Code
+/// extension's `child.kill()`, equally a `docker stop`, a supervisor, or a
+/// terminal's own SIGTERM -- does not unwind anything. Left alone, a `node
+/// server.js` the model backgrounded would keep running, bound to its port,
+/// for as long as the machine stays up, orphaned by the very shutdown that
+/// was supposed to end it. This does not replace `Drop`; a clean exit
+/// (stdin EOF, `/exit`, an unrecoverable error) still goes through it
+/// exactly as before -- this only covers the path `Drop` cannot reach.
+///
+/// Unix-only: Windows has no equivalent of a catchable termination signal
+/// for `TerminateProcess`/`taskkill`, which is how a host actually kills a
+/// child there (see `harness_tools::bash::kill_process_group`'s own note on
+/// the same platform gap). `Drop` remains the only cleanup path on Windows,
+/// unchanged from before this existed.
+///
+/// SIGTERM only, deliberately not SIGINT: `tokio::signal` fans one incoming
+/// signal out to *every* listener registered for it, and the interactive
+/// REPL's `run_steerable` already races `tokio::signal::ctrl_c()` (SIGINT)
+/// to offer "steer or abort" mid-turn. Racing SIGINT here too would answer
+/// that same signal by killing the whole process out from under it before
+/// the user's steer-or-abort prompt could even be read. SIGTERM has no such
+/// conflict -- nothing else in this codebase listens for it -- and it is
+/// what actually matters here: it's what Node's `child.kill()` sends by
+/// default, which is how the VS Code extension stops the CLI today.
+fn spawn_background_cleanup_on_kill(background: harness_tools::BackgroundProcesses) {
+    #[cfg(unix)]
+    {
+        tokio::spawn(async move {
+            let Ok(mut term) =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            else {
+                // Can only fail if SIGTERM were somehow invalid for this
+                // platform, which it never is on Unix -- but failing open
+                // (no extra cleanup, `Drop` still applies on a normal exit)
+                // is safer than panicking a background task over it.
+                return;
+            };
+            term.recv().await;
+            background.kill_all();
+            // Not a plain `return`: the rest of the process (the REPL loop,
+            // the JSON protocol loop, whatever else is running) does not
+            // otherwise learn that SIGTERM arrived at all, so nothing else
+            // would ever ask it to stop. 143 = 128 + SIGTERM, the
+            // conventional exit code for "terminated by this signal."
+            std::process::exit(143);
+        });
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = background;
+    }
+}
+
 async fn run(args: ActivateArgs) -> anyhow::Result<()> {
     // Fired before any of the startup I/O below so its round trip overlaps
     // config resolution, workspace canonicalization, and session loading
@@ -761,7 +819,12 @@ async fn run(args: ActivateArgs) -> anyhow::Result<()> {
     } else if !args.yolo && !headless {
         bash = bash.with_approval(Arc::new(ui::terminal_approve));
     }
+    // Captured before `bash` moves into the registry below, so it survives
+    // independently of whether `Bash::drop` ever actually runs -- see
+    // `spawn_background_cleanup_on_kill`.
+    let background_procs = bash.background_handle();
     registry.register(Arc::new(bash));
+    spawn_background_cleanup_on_kill(background_procs);
 
     let workspace = workdir.to_string_lossy().to_string();
     let store = harness_agent::SessionStore::new(harness_config::default_sessions_dir());
@@ -889,6 +952,17 @@ fn attach_or_restore_session(
                 store,
                 system_prompt(project_conventions, read_program_available),
             );
+            // `repair_after_interrupt` was previously only ever called from
+            // the interactive REPL's own Ctrl+C handler, immediately after
+            // the very interruption it was cleaning up from -- so a session
+            // that ended any other way (the JSON protocol has no live abort
+            // at all until now, and a hard kill/crash bypasses both) could
+            // carry a dangling tool-call group forward into every future
+            // resume, unrepaired, for as long as the session file existed.
+            // Calling it here instead means *any* interruption is caught
+            // the next time the session is opened, regardless of how the
+            // process actually ended -- including before this fix existed.
+            let repaired = agent.repair_after_interrupt();
             if announce {
                 println!(
                     "\x1b[90m⟲ resumed session {} — {turns} turns, ${cost:.4} spent{}\x1b[0m",
@@ -899,6 +973,11 @@ fn attach_or_restore_session(
                         format!(" · {title}")
                     }
                 );
+                if repaired {
+                    println!(
+                        "\x1b[90m  (last session ended mid-step; dropped its incomplete tool call)\x1b[0m"
+                    );
+                }
             }
         }
         None => {
@@ -948,6 +1027,17 @@ async fn run_json_protocol(
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<json_ui::Command>();
     let reader_ui = ui.clone();
     let reader_queue = agent.interjections();
+    // `Some` only while `UserMessage` below is actually awaiting `agent.run()`
+    // -- an `Abort` that arrives while idle must find nothing to cancel, not
+    // get stored and fire against whatever the *next* turn happens to be.
+    // `Notify` itself stores at most one wakeup permit, which is what makes
+    // an `Abort` racing the exact instant a turn starts safe either way:
+    // whichever of "the run future starts polling `notified()`" and "the
+    // reader task calls `notify_one()`" happens first, the other side still
+    // observes it.
+    let current_run_abort: Arc<std::sync::Mutex<Option<Arc<tokio::sync::Notify>>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let reader_abort = current_run_abort.clone();
     let reader = tokio::spawn(async move {
         let stdin = tokio::io::stdin();
         let mut lines = tokio::io::BufReader::new(stdin).lines();
@@ -972,17 +1062,26 @@ async fn run_json_protocol(
                 }
             };
             match cmd {
-                // Both of these are resolved right here rather than
-                // forwarded: they are the commands that exist *because* a
-                // turn is already in flight, so queueing them behind the
-                // main loop -- which is busy awaiting that very turn --
-                // would deadlock the one thing they're for.
+                // All three are resolved right here rather than forwarded:
+                // they are the commands that exist *because* a turn is
+                // already in flight, so queueing them behind the main loop
+                // -- which is busy awaiting that very turn -- would
+                // deadlock the one thing they're for.
                 json_ui::Command::Approve {
                     request_id,
                     approved,
                 } => reader_ui.resolve_approval(&request_id, approved),
                 json_ui::Command::Interject { text } => {
                     reader_queue.push(text);
+                }
+                json_ui::Command::Abort => {
+                    if let Some(notify) = reader_abort
+                        .lock()
+                        .expect("abort-handle mutex poisoned")
+                        .as_ref()
+                    {
+                        notify.notify_one();
+                    }
                 }
                 other => {
                     if tx.send(other).is_err() {
@@ -1000,13 +1099,45 @@ async fn run_json_protocol(
         match cmd {
             json_ui::Command::UserMessage { text } => {
                 let expanded = mentions::expand_mentions(&text, &ws);
-                if let Err(e) = agent.run(&expanded).await {
-                    ui.emit_error(&format!("{e:#}"));
+                let notify = Arc::new(tokio::sync::Notify::new());
+                *current_run_abort
+                    .lock()
+                    .expect("abort-handle mutex poisoned") = Some(notify.clone());
+
+                // Pinned and raced against the abort signal exactly the way
+                // the interactive terminal's `run_steerable` races
+                // `tokio::signal::ctrl_c()` -- dropping `running` on the
+                // abort branch cancels whatever it was doing (an in-flight
+                // model request, a running tool call's `.await`) the same
+                // way any dropped future does, with no extra plumbing.
+                let mut running = Box::pin(agent.run(&expanded));
+                tokio::select! {
+                    result = &mut running => {
+                        if let Err(e) = result {
+                            ui.emit_error(&format!("{e:#}"));
+                        }
+                        *current_run_abort.lock().expect("abort-handle mutex poisoned") = None;
+                        // Always emitted after a user_message's run()
+                        // settles, success or error -- signals the
+                        // extension may send the next line.
+                        ui.emit_turn_done();
+                    }
+                    _ = notify.notified() => {
+                        drop(running);
+                        *current_run_abort.lock().expect("abort-handle mutex poisoned") = None;
+                        // Mirrors the terminal path's `repair_after_interrupt`
+                        // call: a turn cancelled mid-tool-call can leave an
+                        // assistant message whose tool_calls have no
+                        // matching results, which the next request would
+                        // send to the model as-is. Dropped here so it never
+                        // reaches the wire, and reported so the extension
+                        // can say what actually happened -- a stop that
+                        // trimmed the transcript is worth a different
+                        // message than a stop that landed cleanly.
+                        let repaired = agent.repair_after_interrupt();
+                        ui.emit_aborted(repaired);
+                    }
                 }
-                // Always emitted after a user_message's run() settles,
-                // success or error -- signals the extension may send the
-                // next line.
-                ui.emit_turn_done();
             }
             json_ui::Command::SetModel { model } => {
                 agent.set_model(model);
@@ -1038,7 +1169,9 @@ async fn run_json_protocol(
                 agent.force_compact().await;
                 ui.emit_turn_done();
             }
-            json_ui::Command::Approve { .. } | json_ui::Command::Interject { .. } => {
+            json_ui::Command::Approve { .. }
+            | json_ui::Command::Interject { .. }
+            | json_ui::Command::Abort => {
                 unreachable!("filtered out and resolved directly by the reader task above")
             }
         }

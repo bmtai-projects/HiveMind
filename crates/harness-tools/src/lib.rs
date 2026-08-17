@@ -26,7 +26,7 @@ pub use artifact::{
     ArtifactHandle, ArtifactStore, DEFAULT_ARTIFACT_THRESHOLD_BYTES, ReadArtifact, preview,
     text_to_offload,
 };
-pub use bash::{ApproveFn, Bash, shell_command, strip_verbatim};
+pub use bash::{ApproveFn, BackgroundProcesses, Bash, shell_command, strip_verbatim};
 pub use diagram::CreateDiagram;
 pub use edit::EditFile;
 pub use embed_cache::EmbedCache;
