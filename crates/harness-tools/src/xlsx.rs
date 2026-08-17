@@ -75,7 +75,23 @@ impl Tool for CreateSpreadsheet {
                             "properties": {
                                 "name": {"type": "string"},
                                 "headers": {"type": "array", "items": {"type": "string"}},
-                                "rows": {"type": "array", "items": {"type": "array"}},
+                                // The inner array's own `items` has to be a
+                                // real (if maximally permissive) schema
+                                // object, not omitted: Gemini's function-
+                                // calling schema validator -- stricter here
+                                // than OpenAI/Anthropic/DeepSeek's, which
+                                // all accepted the old array-with-no-items
+                                // form silently -- rejects EVERY request
+                                // that includes this tool's schema with
+                                // "properties[rows].items.items: missing
+                                // field" otherwise. `{}` (no constraints)
+                                // is the right shape for a cell that's
+                                // genuinely a number-or-string union (see
+                                // `Cell` below); OpenAPI 3.0's Schema
+                                // Object -- what Gemini's dialect is based
+                                // on -- has no `type` union syntax to
+                                // express that more precisely.
+                                "rows": {"type": "array", "items": {"type": "array", "items": {}}},
                             },
                             "required": ["name"],
                         },
@@ -180,6 +196,42 @@ mod tests {
 
     fn args(json: serde_json::Value) -> Box<RawValue> {
         RawValue::from_string(json.to_string()).unwrap()
+    }
+
+    /// Every `array`-typed schema node must declare its own `items`, all
+    /// the way down. Gemini's function-calling schema validator enforces
+    /// this and OpenAI/Anthropic/DeepSeek's do not, which is exactly how
+    /// `rows: {type: array, items: {type: array}}` (no items on the inner
+    /// array) shipped and passed every existing test while silently
+    /// breaking every single request to any Gemini model -- not just ones
+    /// that used this tool, since tool schemas are sent on every call
+    /// regardless of whether the model ends up invoking them. Recurses
+    /// through the whole schema tree rather than special-casing `rows`, so
+    /// the same mistake anywhere else in this tool (or a future field
+    /// added to it) fails a test instead of shipping quietly again.
+    fn assert_every_array_declares_items(schema: &serde_json::Value, path: &str) {
+        if let Some(obj) = schema.as_object() {
+            if obj.get("type").and_then(|t| t.as_str()) == Some("array") {
+                assert!(
+                    obj.contains_key("items"),
+                    "{path} is an array schema with no `items` -- Gemini rejects this"
+                );
+            }
+            for (key, value) in obj {
+                assert_every_array_declares_items(value, &format!("{path}.{key}"));
+            }
+        } else if let Some(arr) = schema.as_array() {
+            for (i, value) in arr.iter().enumerate() {
+                assert_every_array_declares_items(value, &format!("{path}[{i}]"));
+            }
+        }
+    }
+
+    #[test]
+    fn every_array_in_the_schema_declares_its_items_all_the_way_down() {
+        let w = ws("schema_shape");
+        let schema = CreateSpreadsheet(w).schema();
+        assert_every_array_declares_items(&schema, "schema");
     }
 
     #[tokio::test]

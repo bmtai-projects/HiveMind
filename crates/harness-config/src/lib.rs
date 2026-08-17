@@ -40,10 +40,15 @@ pub const KNOWN_MODELS: &[ModelCatalogEntry] = &[
         id: "hivemind",
         display_name: "HiveMind",
         context_window: 1_048_576,
+        // Re-checked live against https://openrouter.ai/api/v1/models on
+        // 2026-08-17 (wireId deepseek/deepseek-v4-flash, i.e. "DeepSeek V4
+        // Flash 0423" -- OpenRouter's own pricing had drifted about 13.5%
+        // below what this table said, which overestimated every BYOK cost
+        // readout and --budget check by the same margin.
         wholesale_pricing: Pricing {
-            input_per_m: 0.0938,
-            input_cache_read_per_m: 0.01876,
-            output_per_m: 0.1876,
+            input_per_m: 0.0826,
+            input_cache_read_per_m: 0.01652,
+            output_per_m: 0.1652,
         },
         reasoning_efforts: &["high", "xhigh"],
         needs_explicit_cache_control: false,
@@ -88,6 +93,23 @@ pub const KNOWN_MODELS: &[ModelCatalogEntry] = &[
         // this parameter) -- listing efforts still lets a user pick how
         // hard it thinks, just never lets them turn it off.
         reasoning_efforts: &["low", "medium", "high"],
+        needs_explicit_cache_control: false,
+    },
+    ModelCatalogEntry {
+        id: "gemini-3.7-flash",
+        display_name: "Gemini 3.7 Flash",
+        context_window: 1_048_576,
+        wholesale_pricing: Pricing {
+            input_per_m: 0.375,
+            input_cache_read_per_m: 0.0375,
+            output_per_m: 1.875,
+        },
+        // Unlike gemini-3.1-pro above, reasoning is a genuine on/off
+        // toggle here -- Google's "hybrid" reasoning models support a
+        // zero thinking budget, unlike gemini-3.1-pro's always-on
+        // reasoning. "none" is how a user reaches that off state, the
+        // same convention gpt-5.3-codex already uses above.
+        reasoning_efforts: &["none", "low", "medium", "high"],
         needs_explicit_cache_control: false,
     },
     ModelCatalogEntry {

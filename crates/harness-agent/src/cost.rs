@@ -64,9 +64,9 @@ mod tests {
     fn hosted_applies_the_markup_byok_does_not() {
         let hosted = estimate_cost_usd(&usage(1_000_000, 0), "hivemind", true).unwrap();
         let byok = estimate_cost_usd(&usage(1_000_000, 0), "hivemind", false).unwrap();
-        // hivemind's wholesale input_per_m is 0.0938 -- 1M miss tokens costs
+        // hivemind's wholesale input_per_m is 0.0826 -- 1M miss tokens costs
         // exactly that wholesale, times the markup when hosted.
-        assert!((byok - 0.0938).abs() < 1e-9);
-        assert!((hosted - 0.0938 * harness_config::HOSTED_MARKUP_MULTIPLIER).abs() < 1e-9);
+        assert!((byok - 0.0826).abs() < 1e-9);
+        assert!((hosted - 0.0826 * harness_config::HOSTED_MARKUP_MULTIPLIER).abs() < 1e-9);
     }
 }
