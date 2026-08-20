@@ -175,6 +175,14 @@ pub struct Agent {
     /// fresh chance to be told, and `run()` resets it alongside the other
     /// escalation state.
     nudged_this_run: bool,
+    /// What this run has changed on disk, and whether anything has been run
+    /// to check it since. Drives the one validation nudge below.
+    run_ledger: crate::validation::RunLedger,
+    /// The validation nudge's own one-shot flag, kept separate from
+    /// `nudged_this_run` so the two guards can't spend each other's turn: a
+    /// run can genuinely both go in circles *and* finish without checking
+    /// its edits, and each observation is worth making once.
+    validation_nudged_this_run: bool,
     /// Whether any tool call in the last dispatched turn reported a failing
     /// `ToolStatus`. Carried here because a `Message` only holds the summary
     /// text -- the status cannot be recovered from the transcript after the
@@ -257,6 +265,8 @@ impl Agent {
             error_streak: 0,
             last_call_signature: None,
             nudged_this_run: false,
+            run_ledger: crate::validation::RunLedger::default(),
+            validation_nudged_this_run: false,
             last_turn_had_failure: false,
             workspace,
             checkpoints: Vec::new(),
@@ -542,6 +552,8 @@ impl Agent {
         self.error_streak = 0;
         self.last_call_signature = None;
         self.nudged_this_run = false;
+        self.run_ledger.clear();
+        self.validation_nudged_this_run = false;
         self.web_operations_remaining = WEB_OPERATIONS_PER_RUN;
         let mut checkpoint = Checkpoint::open(user_input, self.messages.len());
         self.messages.push(Message::user(user_input.to_string()));
@@ -668,6 +680,20 @@ impl Agent {
             }
 
             if !has_tool_calls {
+                // The one place a run can end. A model that rewrote files
+                // and stopped without checking them gets asked once, here,
+                // and is then let through on its next answer whatever it
+                // says -- see `validation.rs` for why this is a nudge and
+                // not a gate.
+                if let Some(changed) = self.run_ledger.nudge_now(self.validation_nudged_this_run) {
+                    self.validation_nudged_this_run = true;
+                    self.ui.validation_required(changed);
+                    self.messages.push(Message::user(
+                        crate::validation::VALIDATION_NUDGE.to_string(),
+                    ));
+                    self.persist();
+                    continue;
+                }
                 checkpoint::push(&mut self.checkpoints, checkpoint);
                 self.persist();
                 return Ok(());
@@ -806,6 +832,12 @@ impl Agent {
             // merely *contained* the marker -- a log, a source file, our own
             // docs -- and that answer feeds the escalation counter below.
             let is_error = result.status.is_failure();
+            // Recorded from the call that actually ran and its reported
+            // status, for the same reason `is_error` is: the transcript
+            // keeps only `summary`, so neither which file was written nor
+            // whether the write succeeded survives in a form worth
+            // re-deriving later.
+            self.run_ledger.record(&call.name, &call.args, is_error);
             self.session_cost_usd += result.cost_usd;
             self.ui.tool_end(
                 &call.name,
