@@ -13,6 +13,7 @@ mod session;
 mod tokens;
 mod trim;
 mod ui;
+mod validation;
 
 pub use agent::Agent;
 pub use checkpoint::{OriginalState, UndoReport};

@@ -211,6 +211,14 @@ impl Ui for TermUi {
         );
     }
 
+    fn validation_required(&self, changed_files: usize) {
+        self.clear_preview();
+        let s = if changed_files == 1 { "" } else { "s" };
+        println!(
+            "\x1b[33m  ↯ finished with {changed_files} changed file{s} and no check run — asked the model to verify\x1b[0m"
+        );
+    }
+
     fn escalation_declined(&self, to: &str, spent: f64, budget: f64) {
         self.clear_preview();
         println!(
