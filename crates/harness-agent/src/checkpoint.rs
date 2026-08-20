@@ -23,7 +23,7 @@ pub const MAX_CHECKPOINTS: usize = 20;
 /// The two tool names that participate in checkpointing. Matches
 /// grok-build's own scope exactly: shell-driven file changes aren't
 /// checkpointed there either — only the dedicated file-edit tools.
-const MUTATING_TOOLS: [&str; 2] = ["edit_file", "write_file"];
+pub(crate) const MUTATING_TOOLS: [&str; 2] = ["edit_file", "write_file"];
 
 #[derive(Deserialize)]
 struct PathOnly {
