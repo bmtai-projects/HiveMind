@@ -70,6 +70,16 @@ pub trait Ui: Send + Sync {
     /// Defaulted: a host that ignores it is still correct.
     fn output_limit_truncated(&self) {}
 
+    /// Fired when a run tried to finish after changing `changed_files`
+    /// files without running anything that checks them, and was asked once
+    /// to do so before ending.
+    ///
+    /// Worth surfacing for the same reason `stalled` is: without it the
+    /// user watches the model say "done", and then keep working, with
+    /// nothing on screen explaining why. Defaulted: a host that ignores it
+    /// is still correct.
+    fn validation_required(&self, _changed_files: usize) {}
+
     /// Fired when the agent bumps away from the cheap "hivemind" default
     /// after repeated/failing tool calls on the current task.
     fn model_escalated(&self, from: &str, to: &str, reason: &str);

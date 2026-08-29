@@ -1,43 +1,79 @@
-//! Aging out old tool results, so a long session stops re-sending the same
-//! huge blob on every turn.
+//! Aging out tool results from *earlier requests*, so a long session stops
+//! re-sending the same huge blob on every turn.
 //!
 //! Measured across real saved sessions, 92-96% of a transcript is tool
 //! results, and a single `project_map` was routinely 42% of the whole
-//! context -- one was 18,177 tokens, re-sent on ~5 later model calls for
-//! ~91k tokens billed. Nothing removed it: the only existing mechanism was
-//! compaction at 75% of the window, which is a *billed model call* and folds
-//! the conversation itself away too.
-//!
-//! This runs first and costs nothing: no model call, no summarization, just
-//! replacing the body of a large, old tool result with a line saying what it
-//! was and how to get it back. The message itself stays -- same role, same
+//! context. This runs before compaction and costs nothing: no model call, no
+//! summarization, just replacing the body of a large, old tool result with a
+//! line saying what it was. The message itself stays -- same role, same
 //! `tool_call_id` -- so the assistant/tool pairing every OpenAI-dialect API
 //! validates on is untouched.
+//!
+//! # Why the thresholds are what they are
+//!
+//! An earlier version of this module triggered at an *absolute* 25k tokens
+//! and trimmed down to 15k, on the reasoning that re-transmission is what
+//! costs money and the default model's 1,048,576-token window makes any
+//! percentage rule unreachable. Both halves of that were wrong, and together
+//! they starved the agent badly enough to fail whole tasks:
+//!
+//! - **15k is smaller than the working set of an ordinary task.** A single
+//!   `read_file` may return [`harness_tools::MAX_READ_BYTES`] (60,000 bytes,
+//!   ~15,000 tokens) -- the entire post-trim budget in one call. Reading
+//!   `agent.rs` (~14.7k tokens) and `main.rs` (~18.6k) together is ~33k,
+//!   above the old 25k trigger and more than double the old 15k target, so
+//!   the two files could not be held at once. A task needing both was
+//!   unsatisfiable by construction: read A, read B, A is evicted, re-read A,
+//!   B is evicted, forever. One observed session did this for 60 turns with
+//!   42 trim passes and produced nothing.
+//!
+//! - **Re-transmission is the cheap part.** Cached input costs ~5x less than
+//!   fresh (0.01652 vs 0.0826 per M on the default model), and a stable
+//!   prefix is almost entirely cache hits. Worse, trimming *rewrites the
+//!   oldest messages first*, which invalidates the cached prefix from that
+//!   point on -- so a trim pass converts cheap cached tokens into expensive
+//!   fresh ones, on top of the re-reads it causes. The ~91k tokens the old
+//!   rationale was built to avoid re-sending are worth about $0.0015 at the
+//!   cache-read rate.
+//!
+//! So: trim relative to the window with an absolute ceiling, and trim
+//! **rarely and deeply** rather than often and shallowly -- every pass costs
+//! a cache prefix, so the gap between trigger and target should buy many
+//! turns before the next one.
 
 use harness_types::{Message, Role};
 
-/// Absolute size above which aging kicks in, and the size it aims to get
-/// back down to.
+/// Share of the model's context window above which aging kicks in, and the
+/// share it aims to get back down to.
 ///
-/// Absolute, not a share of the context window, because the window is the
-/// wrong instrument here. The default model's window is 1,048,576 tokens,
-/// so *any* percentage trigger is unreachable in practice -- measured
-/// against real saved sessions, the largest transcript was ~43k tokens,
-/// under 5% of it. A window-relative rule looks reasonable and then simply
-/// never fires. (`compaction_threshold_percent`'s 75% has exactly this
-/// problem: 786k tokens on the default model.)
-///
-/// What actually costs money and latency is re-transmission: a 14k-token
-/// result is re-sent on every later turn no matter how much window is free.
-/// So the trigger is tied to transcript size, which is what drives that.
-const TRIM_ABOVE_TOKENS: u64 = 25_000;
-const TRIM_TARGET_TOKENS: u64 = 15_000;
-
-/// Secondary, window-relative trigger, kept for genuinely small-window
-/// models where the absolute figures above would be too permissive.
-/// Whichever limit is hit first wins.
-const TRIM_ABOVE_PERCENT: u64 = 45;
+/// Window-relative is the right instrument: what makes a transcript a
+/// problem is how close it is to the limit that would actually break the
+/// request, and that limit is the window. These sit below
+/// `compaction_threshold_percent` (75%) so the free mechanism always gets
+/// first refusal, and well below the 95% send guard.
+const TRIM_ABOVE_PERCENT: u64 = 50;
 const TRIM_TARGET_PERCENT: u64 = 30;
+
+/// Absolute ceilings, applied on top of the percentages -- whichever limit
+/// is hit first wins.
+///
+/// These exist because a percentage of 1,048,576 is a lot of tokens to
+/// re-send every turn even at cache-read prices, not because the percentage
+/// is unreachable. They are set at roughly 13x and 8x a single maximum
+/// `read_file`, so an ordinary multi-file task never touches this code at
+/// all -- which is the point. Checked against `harness_tools::MAX_READ_BYTES`
+/// by a test, so a later change to either constant cannot silently recreate
+/// the starvation this replaced.
+const TRIM_ABOVE_CEILING_TOKENS: u64 = 200_000;
+const TRIM_TARGET_CEILING_TOKENS: u64 = 120_000;
+
+/// The most a single tool result may contribute, as a share of the target.
+/// Nothing enforces this at runtime -- it is the invariant the ceilings are
+/// chosen to satisfy, pinned by a test: if one call's maximum output ever
+/// approaches the whole post-trim budget again, every second large read
+/// evicts the first and the agent thrashes.
+#[cfg(test)]
+const MAX_SINGLE_RESULT_SHARE_OF_TARGET: f64 = 0.25;
 
 /// Most recent messages never touched, whatever the pressure. The model is
 /// usually mid-thought about these, and eliding one it just received would
@@ -61,64 +97,108 @@ pub struct TrimReport {
 ///
 /// `messages[0]` (the system prompt) is never a tool result, so it is safe
 /// by construction rather than by special case.
+/// `current_request_start` is the index the in-flight user request's own
+/// messages begin at (`Agent::run`'s `messages.len()` before it pushed the
+/// user turn). Everything from there on is what the agent is working from
+/// *right now*; see [`elide_span`] for why that is trimmed only as a last
+/// resort.
 pub fn trim_old_tool_results(
     messages: &mut [Message],
     estimated_tokens: u64,
     context_window: u64,
+    current_request_start: usize,
 ) -> Option<TrimReport> {
     if estimated_tokens == 0 {
         return None;
     }
-    // Whichever limit bites first: the absolute one on a big-window model,
-    // the window-relative one on a small-window model.
+    // Whichever limit bites first: the ceiling on a big-window model, the
+    // window-relative share on a small-window one.
     let (trigger, target) = if context_window == 0 {
-        (TRIM_ABOVE_TOKENS, TRIM_TARGET_TOKENS)
+        (TRIM_ABOVE_CEILING_TOKENS, TRIM_TARGET_CEILING_TOKENS)
     } else {
         (
-            TRIM_ABOVE_TOKENS.min(context_window.saturating_mul(TRIM_ABOVE_PERCENT) / 100),
-            TRIM_TARGET_TOKENS.min(context_window.saturating_mul(TRIM_TARGET_PERCENT) / 100),
+            TRIM_ABOVE_CEILING_TOKENS.min(context_window.saturating_mul(TRIM_ABOVE_PERCENT) / 100),
+            TRIM_TARGET_CEILING_TOKENS
+                .min(context_window.saturating_mul(TRIM_TARGET_PERCENT) / 100),
         )
     };
     if estimated_tokens < trigger {
         return None;
     }
     let cutoff = messages.len().saturating_sub(KEEP_RECENT);
+    let boundary = current_request_start.min(cutoff);
 
-    let mut running = estimated_tokens;
-    let mut elided = 0usize;
-    let mut saved = 0u64;
+    let mut state = Elider {
+        running: estimated_tokens,
+        target,
+        elided: 0,
+        saved: 0,
+    };
 
-    // Oldest first: the earliest results are the ones most likely to have
-    // been superseded by later work.
-    for m in messages[..cutoff].iter_mut() {
-        if running <= target {
-            break;
-        }
-        if m.role != Role::Tool
-            || m.content.len() < MIN_TRIM_CHARS
-            || m.content.starts_with(ELIDED_PREFIX)
-        {
-            continue;
-        }
+    // Previous requests first. Their results are the ones most likely to
+    // have been superseded, and dropping them cannot pull the floor out
+    // from under the task in flight.
+    let (earlier, current) = messages[..cutoff].split_at_mut(boundary);
+    state.elide_span(earlier);
+    // Only if that was not enough. Trimming what the current request just
+    // read is what produced the read/evict/re-read spiral, so it happens
+    // only when there is nothing older left to give.
+    state.elide_span(current);
 
-        let before = crate::tokens::estimate_message_tokens(m);
-        let name = m.name.clone().unwrap_or_else(|| "tool".to_string());
-        m.content = format!(
-            "{ELIDED_PREFIX} ~{before} tokens of `{name}` output from earlier in this session, \
-             dropped to free context. Run it again if you still need it.]"
-        );
-        let after = crate::tokens::estimate_message_tokens(m);
-
-        let freed = before.saturating_sub(after);
-        running = running.saturating_sub(freed);
-        saved += freed;
-        elided += 1;
-    }
-
-    (elided > 0).then_some(TrimReport {
-        results_elided: elided,
-        tokens_saved: saved,
+    (state.elided > 0).then_some(TrimReport {
+        results_elided: state.elided,
+        tokens_saved: state.saved,
     })
+}
+
+/// Running totals for one trim pass, so the two spans above share a budget
+/// instead of each getting a full one.
+struct Elider {
+    running: u64,
+    target: u64,
+    elided: usize,
+    saved: u64,
+}
+
+impl Elider {
+    /// Replaces large tool-result bodies in `span`, oldest first, until the
+    /// running estimate is back under target.
+    fn elide_span(&mut self, span: &mut [Message]) {
+        for m in span.iter_mut() {
+            if self.running <= self.target {
+                return;
+            }
+            if m.role != Role::Tool
+                || m.content.len() < MIN_TRIM_CHARS
+                || m.content.starts_with(ELIDED_PREFIX)
+            {
+                continue;
+            }
+
+            let before = crate::tokens::estimate_message_tokens(m);
+            let name = m.name.clone().unwrap_or_else(|| "tool".to_string());
+            // Deliberately not "run it again if you still need it". That
+            // sentence was an instruction, and the model followed it: a
+            // measured session re-read the same two files eleven times,
+            // each re-read evicting the other, until it ran out of turns.
+            // What replaces it says where the output came from (an earlier
+            // request, so probably not this one's concern) and, if it is
+            // needed after all, points at fetching a part rather than
+            // re-running the whole call.
+            m.content = format!(
+                "{ELIDED_PREFIX} ~{before} tokens of `{name}` output from an earlier request in \
+                 this session, dropped to free context. It is most likely not needed for the \
+                 current request. If it is, fetch only the specific part you need rather than \
+                 repeating the whole call.]"
+            );
+            let after = crate::tokens::estimate_message_tokens(m);
+
+            let freed = before.saturating_sub(after);
+            self.running = self.running.saturating_sub(freed);
+            self.saved += freed;
+            self.elided += 1;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -127,6 +207,18 @@ mod tests {
 
     fn tool_msg(name: &str, chars: usize) -> Message {
         Message::tool_result("call-1", name, "x".repeat(chars))
+    }
+
+    /// Most tests here predate run-scoped protection and describe a
+    /// transcript with no request in flight, which is `0`: nothing is
+    /// protected, so both passes see the whole eligible range and the
+    /// result is the same as the single pass they were written against.
+    fn trim(m: &mut [Message], estimated: u64, window: u64) -> Option<TrimReport> {
+        trim_old_tool_results(m, estimated, window, 0)
+    }
+
+    fn tokens_of(chars: usize) -> u64 {
+        crate::tokens::estimate_message_tokens(&tool_msg("read_file", chars))
     }
 
     /// Enough history that the oldest entries sit outside KEEP_RECENT.
@@ -146,7 +238,7 @@ mod tests {
         let mut m = session(1, 8_000);
         let before = crate::tokens::estimate_tokens(&m);
         // Plenty of headroom: 8k chars against a 1M window.
-        assert!(trim_old_tool_results(&mut m, before, 1_000_000).is_none());
+        assert!(trim(&mut m, before, 1_000_000).is_none());
         assert_eq!(crate::tokens::estimate_tokens(&m), before);
     }
 
@@ -154,7 +246,7 @@ mod tests {
     fn a_large_old_result_is_elided_and_really_shrinks_the_estimate() {
         let mut m = session(1, 60_000);
         let before = crate::tokens::estimate_tokens(&m);
-        let report = trim_old_tool_results(&mut m, before, 24_000).expect("should trim");
+        let report = trim(&mut m, before, 24_000).expect("should trim");
         let after = crate::tokens::estimate_tokens(&m);
 
         assert_eq!(report.results_elided, 1);
@@ -174,24 +266,150 @@ mod tests {
         );
     }
 
-    /// The regression this module's trigger was redesigned around: the
-    /// default model's window is 1,048,576 tokens, so any percentage-based
-    /// rule is unreachable -- 45% of it is ~472k, and the largest real
-    /// session measured was ~43k. A window-relative trigger alone looks
-    /// sensible and silently never fires.
+    /// This test previously asserted the exact opposite -- that a ~36k
+    /// transcript on a 1,048,576-token window *must* be trimmed -- and that
+    /// is the behaviour that failed real tasks. It is inverted rather than
+    /// deleted so the record of what changed, and why, survives in the place
+    /// someone will look.
+    ///
+    /// An ordinary multi-file working set on a huge-window model must be
+    /// left completely alone. There is no cost being avoided by trimming
+    /// here: the window is 3% used, the prefix is cached, and the only
+    /// effect is to take away code the agent is actively working from.
     #[test]
-    fn a_huge_context_window_does_not_disable_trimming() {
-        let mut m = session(3, 40_000); // ~36k tokens, nowhere near 1M
+    fn an_ordinary_working_set_on_a_huge_window_is_left_alone() {
+        let mut m = session(3, 40_000); // ~36k tokens against 1M
         let before = crate::tokens::estimate_tokens(&m);
         assert!(
-            before * 100 < 1_048_576 * TRIM_ABOVE_PERCENT,
-            "fixture must be well under the percentage trigger, else it proves nothing"
+            trim(&mut m, before, 1_048_576).is_none(),
+            "a 36k transcript on a 1M window must not be trimmed"
         );
+        assert!(m.iter().all(|x| !x.content.starts_with(ELIDED_PREFIX)));
+    }
 
-        let report = trim_old_tool_results(&mut m, before, 1_048_576)
-            .expect("must still trim on a 1M-token window");
-        assert!(report.tokens_saved > 0);
-        assert!(crate::tokens::estimate_tokens(&m) < before);
+    /// The concrete regression, in the sizes that produced it: `agent.rs`
+    /// (~14.7k tokens) and `main.rs` (~18.6k) held at the same time on the
+    /// default model. Under the old 25k trigger / 15k target this was
+    /// impossible, and the agent re-read the two files against each other
+    /// until it ran out of turns.
+    #[test]
+    fn the_two_files_that_broke_a_real_task_now_fit_together() {
+        let mut m = vec![Message::system("sys"), Message::user("go")];
+        m.push(tool_msg("read_file", 58_800)); // agent.rs
+        m.push(tool_msg("read_file", 74_618)); // main.rs
+        for _ in 0..KEEP_RECENT {
+            m.push(Message::assistant("working"));
+        }
+        let before = crate::tokens::estimate_tokens(&m);
+        assert!(
+            before > 33_000,
+            "fixture should be the ~33k that used to be untenable, got {before}"
+        );
+        assert!(
+            trim(&mut m, before, 1_048_576).is_none(),
+            "both files must survive together: this is the task that failed"
+        );
+    }
+
+    /// A single maximal `read_file` must stay a small fraction of the whole
+    /// post-trim budget. When these two constants drifted into equality --
+    /// 60,000 bytes out, a 15,000-token target -- every second large read
+    /// evicted the first.
+    #[test]
+    fn one_maximal_read_cannot_amount_to_the_whole_budget() {
+        let max_result_tokens = tokens_of(harness_tools::MAX_READ_BYTES) as f64;
+        let share = max_result_tokens / TRIM_TARGET_CEILING_TOKENS as f64;
+        assert!(
+            share <= MAX_SINGLE_RESULT_SHARE_OF_TARGET,
+            "one read_file is {share:.0e} of the trim target ({max_result_tokens} tokens vs \
+             {TRIM_TARGET_CEILING_TOKENS}); raise the ceiling or lower MAX_READ_BYTES"
+        );
+    }
+
+    /// Trim must stay below compaction, which is the billed mechanism, and
+    /// below the send guard that stops a request going out oversized.
+    #[test]
+    fn trimming_happens_before_compaction_and_well_before_the_send_guard() {
+        for window in [32_000u64, 128_000, 1_048_576] {
+            let trigger = TRIM_ABOVE_CEILING_TOKENS.min(window * TRIM_ABOVE_PERCENT / 100);
+            assert!(
+                trigger < window * 75 / 100,
+                "trim must precede compaction on a {window}-token window"
+            );
+            assert!(trigger < window * 95 / 100);
+        }
+    }
+
+    /// What the current request has read is protected while anything older
+    /// is still available to give -- taking it is what makes the agent read
+    /// the same file again.
+    #[test]
+    fn an_older_request_is_evicted_before_anything_the_current_one_read() {
+        let mut m = vec![Message::system("sys"), Message::user("first request")];
+        m.push(tool_msg("project_map", 40_000)); // belongs to the old request
+        let boundary = m.len();
+        m.push(Message::user("second request"));
+        m.push(tool_msg("read_file", 40_000)); // the current request's own read
+        for _ in 0..KEEP_RECENT {
+            m.push(Message::assistant("working"));
+        }
+
+        // Sized so that giving up the older result alone is enough to get
+        // back under target: what is being pinned is which one goes first,
+        // not how many go.
+        let before = crate::tokens::estimate_tokens(&m);
+        trim_old_tool_results(&mut m, before, 44_000, boundary).expect("should trim");
+
+        let elided: Vec<&str> = m
+            .iter()
+            .filter(|x| x.content.starts_with(ELIDED_PREFIX))
+            .map(|x| x.name.as_deref().unwrap_or(""))
+            .collect();
+        assert_eq!(
+            elided,
+            vec!["project_map"],
+            "the current request's own read must outlive the previous request's"
+        );
+    }
+
+    /// ...but protection is a preference, not a wall. A single request that
+    /// genuinely outgrows the budget still gets trimmed rather than being
+    /// allowed to run into the send guard.
+    #[test]
+    fn a_single_oversized_request_is_still_trimmed_when_nothing_older_exists() {
+        let mut m = vec![Message::system("sys"), Message::user("go")];
+        let boundary = 1; // everything from the user turn on is this request
+        for _ in 0..6 {
+            m.push(tool_msg("read_file", 40_000));
+        }
+        for _ in 0..KEEP_RECENT {
+            m.push(Message::assistant("working"));
+        }
+        let before = crate::tokens::estimate_tokens(&m);
+        let report =
+            trim_old_tool_results(&mut m, before, 120_000, boundary).expect("must still trim");
+        assert!(report.results_elided > 0);
+    }
+
+    /// The elision note is read by the model, and the previous wording
+    /// ("Run it again if you still need it") was followed literally enough
+    /// to cost a 60-turn run.
+    #[test]
+    fn the_elision_note_does_not_tell_the_model_to_re_run_the_call() {
+        let mut m = session(1, 60_000);
+        let before = crate::tokens::estimate_tokens(&m);
+        trim(&mut m, before, 24_000).expect("should trim");
+        let note = &m.iter().find(|x| x.role == Role::Tool).unwrap().content;
+
+        assert!(
+            !note.to_lowercase().contains("run it again"),
+            "must not instruct a re-run: {note}"
+        );
+        assert!(note.contains("earlier request"), "should place it in time");
+        assert!(
+            note.contains("only the specific part"),
+            "should point at a narrower fetch: {note}"
+        );
     }
 
     #[test]
@@ -202,7 +420,7 @@ mod tests {
             m.push(tool_msg("read_file", 60_000));
         }
         let before = crate::tokens::estimate_tokens(&m);
-        assert!(trim_old_tool_results(&mut m, before, 24_000).is_none());
+        assert!(trim(&mut m, before, 24_000).is_none());
         assert!(m.iter().all(|x| !x.content.starts_with(ELIDED_PREFIX)));
     }
 
@@ -214,7 +432,7 @@ mod tests {
         // behaviour being pinned.
         let mut m = session(6, 40_000);
         let before = crate::tokens::estimate_tokens(&m);
-        let report = trim_old_tool_results(&mut m, before, 120_000).expect("should trim");
+        let report = trim(&mut m, before, 120_000).expect("should trim");
         let remaining = m
             .iter()
             .filter(|x| x.role == Role::Tool && !x.content.starts_with(ELIDED_PREFIX))
@@ -234,11 +452,11 @@ mod tests {
     fn running_twice_is_idempotent() {
         let mut m = session(1, 60_000);
         let before = crate::tokens::estimate_tokens(&m);
-        trim_old_tool_results(&mut m, before, 24_000).expect("first pass trims");
+        trim(&mut m, before, 24_000).expect("first pass trims");
         let after_first = crate::tokens::estimate_tokens(&m);
 
         // A second pass must not re-wrap the placeholder in another one.
-        let second = trim_old_tool_results(&mut m, after_first, 24_000);
+        let second = trim(&mut m, after_first, 24_000);
         assert!(second.is_none(), "nothing left worth eliding");
         assert_eq!(crate::tokens::estimate_tokens(&m), after_first);
     }
@@ -247,6 +465,6 @@ mod tests {
     fn small_results_are_not_worth_eliding() {
         let mut m = session(4, MIN_TRIM_CHARS - 1);
         let before = crate::tokens::estimate_tokens(&m);
-        assert!(trim_old_tool_results(&mut m, before, 4_000).is_none());
+        assert!(trim(&mut m, before, 4_000).is_none());
     }
 }
