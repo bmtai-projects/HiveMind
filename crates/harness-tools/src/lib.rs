@@ -31,7 +31,7 @@ pub use diagram::CreateDiagram;
 pub use edit::EditFile;
 pub use embed_cache::EmbedCache;
 pub use error::ToolError;
-pub use fs::{ListDir, ReadFile, Workspace, WriteFile};
+pub use fs::{ListDir, MAX_READ_BYTES, ReadFile, Workspace, WriteFile};
 pub use pdf::CreatePdf;
 pub use project_map::ProjectMap;
 pub use read_program::{ReadProgram, ReadProgramPolicy};

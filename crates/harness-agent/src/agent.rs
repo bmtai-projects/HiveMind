@@ -175,6 +175,24 @@ pub struct Agent {
     /// fresh chance to be told, and `run()` resets it alongside the other
     /// escalation state.
     nudged_this_run: bool,
+    /// What this run has changed on disk, and whether anything has been run
+    /// to check it since. Drives the one validation nudge below.
+    run_ledger: crate::validation::RunLedger,
+    /// The validation nudge's own one-shot flag, kept separate from
+    /// `nudged_this_run` so the two guards can't spend each other's turn: a
+    /// run can genuinely both go in circles *and* finish without checking
+    /// its edits, and each observation is worth making once.
+    validation_nudged_this_run: bool,
+    /// Index in `messages` where the in-flight user request begins.
+    /// Everything from here on is what the agent is working from right now,
+    /// which `crate::trim` protects from being aged out until there is
+    /// nothing older left to give -- trimming a file the current task just
+    /// read is what makes it read the file again.
+    ///
+    /// Restored sessions start at 0, which is correct rather than merely
+    /// safe: before the first `run()` there is no in-flight request, so no
+    /// message is protected and the whole restored transcript is eligible.
+    current_request_start: usize,
     /// Whether any tool call in the last dispatched turn reported a failing
     /// `ToolStatus`. Carried here because a `Message` only holds the summary
     /// text -- the status cannot be recovered from the transcript after the
@@ -257,6 +275,9 @@ impl Agent {
             error_streak: 0,
             last_call_signature: None,
             nudged_this_run: false,
+            run_ledger: crate::validation::RunLedger::default(),
+            validation_nudged_this_run: false,
+            current_request_start: 0,
             last_turn_had_failure: false,
             workspace,
             checkpoints: Vec::new(),
@@ -542,8 +563,13 @@ impl Agent {
         self.error_streak = 0;
         self.last_call_signature = None;
         self.nudged_this_run = false;
+        self.run_ledger.clear();
+        self.validation_nudged_this_run = false;
         self.web_operations_remaining = WEB_OPERATIONS_PER_RUN;
         let mut checkpoint = Checkpoint::open(user_input, self.messages.len());
+        // Same boundary the checkpoint takes, and for a related reason: this
+        // is where "what this request has done" starts.
+        self.current_request_start = self.messages.len();
         self.messages.push(Message::user(user_input.to_string()));
 
         for _turn in 0..self.policy.max_turns {
@@ -668,6 +694,20 @@ impl Agent {
             }
 
             if !has_tool_calls {
+                // The one place a run can end. A model that rewrote files
+                // and stopped without checking them gets asked once, here,
+                // and is then let through on its next answer whatever it
+                // says -- see `validation.rs` for why this is a nudge and
+                // not a gate.
+                if let Some(changed) = self.run_ledger.nudge_now(self.validation_nudged_this_run) {
+                    self.validation_nudged_this_run = true;
+                    self.ui.validation_required(changed);
+                    self.messages.push(Message::user(
+                        crate::validation::VALIDATION_NUDGE.to_string(),
+                    ));
+                    self.persist();
+                    continue;
+                }
                 checkpoint::push(&mut self.checkpoints, checkpoint);
                 self.persist();
                 return Ok(());
@@ -806,6 +846,12 @@ impl Agent {
             // merely *contained* the marker -- a log, a source file, our own
             // docs -- and that answer feeds the escalation counter below.
             let is_error = result.status.is_failure();
+            // Recorded from the call that actually ran and its reported
+            // status, for the same reason `is_error` is: the transcript
+            // keeps only `summary`, so neither which file was written nor
+            // whether the write succeeded survives in a form worth
+            // re-deriving later.
+            self.run_ledger.record(&call.name, &call.args, is_error);
             self.session_cost_usd += result.cost_usd;
             self.ui.tool_end(
                 &call.name,
@@ -980,9 +1026,12 @@ impl Agent {
         let estimated = self
             .last_total_tokens
             .max(crate::tokens::estimate_tokens(&self.messages));
-        if let Some(report) =
-            crate::trim::trim_old_tool_results(&mut self.messages, estimated, self.context_window)
-        {
+        if let Some(report) = crate::trim::trim_old_tool_results(
+            &mut self.messages,
+            estimated,
+            self.context_window,
+            self.current_request_start,
+        ) {
             self.ui
                 .context_trimmed(report.results_elided, report.tokens_saved);
             // The next request is genuinely smaller than the last response's
@@ -1018,6 +1067,19 @@ impl Agent {
                 report.tokens_before,
                 summary_cost_usd,
             );
+            // Compaction is the one thing that renumbers `messages` while a
+            // request is still in flight -- it folds `1..keep_from` into a
+            // single summary -- so the boundary `trim` protects has to move
+            // with it. Left alone it points into whatever now occupies that
+            // index, and the current request quietly loses its protection at
+            // the exact moment context pressure is highest.
+            //
+            // Clamped at 1 because index 0 is the system prompt and the
+            // summary lands at 1. When the current request was itself partly
+            // folded this lands early, which over-protects rather than
+            // under-protects -- the safe direction.
+            let removed = report.messages_before.saturating_sub(report.messages_after);
+            self.current_request_start = self.current_request_start.saturating_sub(removed).max(1);
             // The next request's usage will reflect the smaller prompt;
             // reset our tracked total so we don't immediately re-trigger.
             self.last_total_tokens = 0;

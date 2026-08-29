@@ -89,7 +89,16 @@ impl Workspace {
     }
 }
 
-const MAX_READ_BYTES: usize = 60_000;
+/// Hard cap on how much one `read_file` call may return.
+///
+/// Public because it is half of a cross-crate invariant: `harness_agent`'s
+/// context trimmer sizes its post-trim budget against this, so that a single
+/// maximal read can never amount to the whole budget. When those two drifted
+/// apart -- 60,000 bytes here, a 15,000-token target there -- every second
+/// large read evicted the first and the agent thrashed until it ran out of
+/// turns. See `harness_agent::trim` for the invariant and the test that
+/// pins it.
+pub const MAX_READ_BYTES: usize = 60_000;
 
 #[derive(Deserialize)]
 struct PathArgs {
