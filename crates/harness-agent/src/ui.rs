@@ -80,6 +80,14 @@ pub trait Ui: Send + Sync {
     /// is still correct.
     fn validation_required(&self, _changed_files: usize) {}
 
+    /// Fired when a run used up its turn allowance while still making
+    /// progress, and was granted another block instead of being stopped.
+    ///
+    /// Worth surfacing because the alternative is a run that silently costs
+    /// more than the configured number implied. Defaulted: a host that
+    /// ignores it is still correct.
+    fn turns_extended(&self, _turns_used: u32, _new_limit: u32) {}
+
     /// Fired when the agent bumps away from the cheap "hivemind" default
     /// after repeated/failing tool calls on the current task.
     fn model_escalated(&self, from: &str, to: &str, reason: &str);
