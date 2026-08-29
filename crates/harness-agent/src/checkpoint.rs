@@ -25,9 +25,10 @@ pub const MAX_CHECKPOINTS: usize = 20;
 /// either — only the dedicated file-edit tools.
 ///
 /// Defined in `validation` and shared rather than kept per-module: the same
-/// list decides what `/undo` can restore and what has to be checked before
-/// a run ends, and a tool added to one copy but not the other would get
-/// half of that silently.
+/// list decides what `/undo` can restore, what has to be checked before a
+/// run ends, and which files a compaction summary reports — and a tool
+/// added to one copy but not the others would get some fraction of that
+/// silently.
 use crate::validation::MUTATING_TOOLS;
 
 #[derive(Deserialize)]
