@@ -175,6 +175,16 @@ pub struct Agent {
     /// fresh chance to be told, and `run()` resets it alongside the other
     /// escalation state.
     nudged_this_run: bool,
+    /// Index in `messages` where the in-flight user request begins.
+    /// Everything from here on is what the agent is working from right now,
+    /// which `crate::trim` protects from being aged out until there is
+    /// nothing older left to give -- trimming a file the current task just
+    /// read is what makes it read the file again.
+    ///
+    /// Restored sessions start at 0, which is correct rather than merely
+    /// safe: before the first `run()` there is no in-flight request, so no
+    /// message is protected and the whole restored transcript is eligible.
+    current_request_start: usize,
     /// Whether any tool call in the last dispatched turn reported a failing
     /// `ToolStatus`. Carried here because a `Message` only holds the summary
     /// text -- the status cannot be recovered from the transcript after the
@@ -257,6 +267,7 @@ impl Agent {
             error_streak: 0,
             last_call_signature: None,
             nudged_this_run: false,
+            current_request_start: 0,
             last_turn_had_failure: false,
             workspace,
             checkpoints: Vec::new(),
@@ -544,6 +555,9 @@ impl Agent {
         self.nudged_this_run = false;
         self.web_operations_remaining = WEB_OPERATIONS_PER_RUN;
         let mut checkpoint = Checkpoint::open(user_input, self.messages.len());
+        // Same boundary the checkpoint takes, and for a related reason: this
+        // is where "what this request has done" starts.
+        self.current_request_start = self.messages.len();
         self.messages.push(Message::user(user_input.to_string()));
 
         for _turn in 0..self.policy.max_turns {
@@ -980,9 +994,12 @@ impl Agent {
         let estimated = self
             .last_total_tokens
             .max(crate::tokens::estimate_tokens(&self.messages));
-        if let Some(report) =
-            crate::trim::trim_old_tool_results(&mut self.messages, estimated, self.context_window)
-        {
+        if let Some(report) = crate::trim::trim_old_tool_results(
+            &mut self.messages,
+            estimated,
+            self.context_window,
+            self.current_request_start,
+        ) {
             self.ui
                 .context_trimmed(report.results_elided, report.tokens_saved);
             // The next request is genuinely smaller than the last response's
