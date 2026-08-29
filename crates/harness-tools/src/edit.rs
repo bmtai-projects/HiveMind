@@ -24,6 +24,73 @@ use crate::error::ToolError;
 use crate::fs::Workspace;
 use crate::tool::{FileChangeKind, Tool, ToolResult, obj_schema};
 
+/// Unchanged lines shown either side of an edit in the result.
+///
+/// Enough to re-anchor a following `edit_file` without re-reading, small
+/// enough that echoing it back costs a fraction of the turn it saves.
+const CONTEXT_PAD_LINES: usize = 12;
+/// Hard cap on the echoed window. Replacing a 400-line block should not
+/// echo 400 lines back -- past a point the model should read deliberately
+/// rather than have the whole thing pushed at it.
+const MAX_WINDOW_LINES: usize = 60;
+
+/// The edited region of the file *after* the write, with 1-based line
+/// numbers.
+///
+/// # Why the result carries this at all
+///
+/// `edit_file` demands an exact `old_string`, and the moment an edit lands
+/// the model's picture of that file is stale -- so the only way to get an
+/// exact anchor for the *next* edit is to read the file again. Measured on
+/// a real session that implemented a tracing feature: 31 `read_file` calls
+/// against 24 edits, and 16 of those reads were of a file HiveMind had
+/// itself just written. That is 26% of a 60-turn allowance spent
+/// re-reading its own output, on the run that then hit the turn cap.
+///
+/// Echoing the post-edit window costs a few hundred tokens; the read it
+/// replaces costs a whole turn plus a round trip. Turns are the scarce
+/// resource -- the cap is what stops real work -- so this trade is heavily
+/// in favour of spending tokens.
+fn post_edit_window(path: &str, updated: &str, start_byte: usize, new_len: usize) -> String {
+    let lines: Vec<&str> = updated.lines().collect();
+    if lines.is_empty() {
+        return String::new();
+    }
+    // Byte offsets -> 0-based line indices. Counting newlines before the
+    // offset is exact for both, since `start_byte` is a char boundary that
+    // `str::find` returned and `new_len` is the length of the text written
+    // at it.
+    let first_changed = updated[..start_byte].matches('\n').count();
+    let last_changed = updated[..start_byte + new_len].matches('\n').count();
+
+    let from = first_changed.saturating_sub(CONTEXT_PAD_LINES);
+    let to = (last_changed + CONTEXT_PAD_LINES).min(lines.len().saturating_sub(1));
+    let truncated = to - from + 1 > MAX_WINDOW_LINES;
+    let to = if truncated {
+        from + MAX_WINDOW_LINES - 1
+    } else {
+        to
+    };
+
+    let width = (to + 1).to_string().len();
+    let mut out = format!(
+        "\n\n{path} after the edit, lines {}-{}:\n",
+        from + 1,
+        to + 1
+    );
+    for (i, line) in lines[from..=to].iter().enumerate() {
+        out.push_str(&format!(
+            "{:>width$} | {line}\n",
+            from + i + 1,
+            width = width
+        ));
+    }
+    if truncated {
+        out.push_str("[window capped -- read the file if you need more of it]\n");
+    }
+    out
+}
+
 #[derive(Deserialize)]
 struct EditArgs {
     path: String,
@@ -54,7 +121,9 @@ impl Tool for EditFile {
          files: it rewrites only the changed span, so it is far cheaper and cannot corrupt the \
          parts you leave untouched. `old_string` must match the file exactly (whitespace and \
          indentation included) and, unless `replace_all` is true, must be unique — include enough \
-         surrounding context to pin down a single occurrence."
+         surrounding context to pin down a single occurrence. On success the result echoes the \
+         edited region of the file as it now reads, with line numbers — use that as the anchor for \
+         your next edit to the same file instead of reading it again."
     }
     fn schema(&self) -> serde_json::Value {
         obj_schema(
@@ -131,6 +200,10 @@ impl Tool for EditFile {
             )));
         }
 
+        // Where the replacement lands. `occurrences >= 1` is guaranteed
+        // above, so this never misses; for `replace_all` it is the first
+        // of several sites, which is the one worth echoing.
+        let start_byte = original.find(&a.old_string).unwrap_or(0);
         let updated = if a.replace_all {
             original.replace(&a.old_string, &a.new_string)
         } else {
@@ -156,6 +229,17 @@ impl Tool for EditFile {
         if let Some(note) = crate::secrets::warning(&crate::secrets::scan(&a.new_string)) {
             out.push_str(&note);
         }
+        // Only for a single-site edit. With `replace_all` the sites are
+        // scattered and one window would describe the file misleadingly --
+        // showing the first while implying it covers all of them.
+        if n == 1 {
+            out.push_str(&post_edit_window(
+                &a.path,
+                &updated,
+                start_byte,
+                a.new_string.len(),
+            ));
+        }
         // `edit_file` only ever touches a file that already existed -- it
         // errors out above when the path is missing -- so this is always a
         // modification, never a creation.
@@ -180,6 +264,99 @@ mod tests {
 
     fn args(json: serde_json::Value) -> Box<RawValue> {
         RawValue::from_string(json.to_string()).unwrap()
+    }
+
+    /// The measured regression this exists for: after an edit the model has
+    /// no current text for the file, so it reads again to get an exact
+    /// `old_string`. One session spent 16 of 60 turns re-reading files it
+    /// had itself just written.
+    #[tokio::test]
+    async fn a_successful_edit_returns_the_new_text_so_the_next_edit_needs_no_re_read() {
+        let w = ws("returns_context");
+        let body: String = (1..=40).map(|i| format!("line {i}\n")).collect();
+        std::fs::write(w.root.join("f.rs"), &body).unwrap();
+
+        let out = EditFile(w)
+            .execute(&args(serde_json::json!({
+                "path": "f.rs",
+                "old_string": "line 20",
+                "new_string": "line 20 CHANGED",
+            })))
+            .await
+            .unwrap()
+            .summary;
+
+        assert!(out.starts_with("edited f.rs (1 replacement)"), "{out}");
+        assert!(out.contains("f.rs after the edit"), "{out}");
+        // The edited line, as it now reads on disk -- an exact anchor.
+        assert!(out.contains("line 20 CHANGED"), "{out}");
+        // Surrounding context, so a following edit can anchor near it too.
+        assert!(out.contains("line 12"), "{out}");
+        assert!(out.contains("line 28"), "{out}");
+        // Numbered, so `read_file` with offset/limit stays usable.
+        assert!(out.contains("20 | line 20 CHANGED"), "{out}");
+        // Not the whole file.
+        assert!(
+            !out.contains("line 1 \n") && !out.contains("| line 40"),
+            "{out}"
+        );
+    }
+
+    /// An edit near the top must not underflow into a negative window.
+    #[tokio::test]
+    async fn an_edit_on_the_first_line_still_renders() {
+        let w = ws("first_line");
+        std::fs::write(w.root.join("f.rs"), "alpha\nbeta\ngamma\n").unwrap();
+        let out = EditFile(w)
+            .execute(&args(serde_json::json!({
+                "path": "f.rs", "old_string": "alpha", "new_string": "ALPHA",
+            })))
+            .await
+            .unwrap()
+            .summary;
+        assert!(out.contains("lines 1-3"), "{out}");
+        assert!(out.contains("1 | ALPHA"), "{out}");
+    }
+
+    /// Replacing a large block must not echo the block back -- past a point
+    /// the saving inverts and the result is just expensive.
+    #[tokio::test]
+    async fn a_huge_replacement_is_capped_rather_than_echoed_whole() {
+        let w = ws("capped");
+        let body: String = (1..=400).map(|i| format!("line {i}\n")).collect();
+        std::fs::write(w.root.join("f.rs"), &body).unwrap();
+        let big: String = (1..=300).map(|i| format!("new {i}\n")).collect();
+
+        let out = EditFile(w)
+            .execute(&args(serde_json::json!({
+                "path": "f.rs",
+                "old_string": "line 100\n",
+                "new_string": big,
+            })))
+            .await
+            .unwrap()
+            .summary;
+
+        let shown = out.lines().filter(|l| l.contains(" | ")).count();
+        assert!(shown <= MAX_WINDOW_LINES, "echoed {shown} lines");
+        assert!(out.contains("window capped"), "{out}");
+    }
+
+    /// With `replace_all` the sites are scattered; one window would describe
+    /// the file misleadingly, so none is shown.
+    #[tokio::test]
+    async fn replace_all_reports_the_count_and_shows_no_window() {
+        let w = ws("replace_all_nowindow");
+        std::fs::write(w.root.join("f.rs"), "x\ny\nx\n").unwrap();
+        let out = EditFile(w)
+            .execute(&args(serde_json::json!({
+                "path": "f.rs", "old_string": "x", "new_string": "z", "replace_all": true,
+            })))
+            .await
+            .unwrap()
+            .summary;
+        assert!(out.contains("2 replacements"), "{out}");
+        assert!(!out.contains("after the edit"), "{out}");
     }
 
     #[tokio::test]
