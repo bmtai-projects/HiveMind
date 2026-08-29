@@ -1067,6 +1067,19 @@ impl Agent {
                 report.tokens_before,
                 summary_cost_usd,
             );
+            // Compaction is the one thing that renumbers `messages` while a
+            // request is still in flight -- it folds `1..keep_from` into a
+            // single summary -- so the boundary `trim` protects has to move
+            // with it. Left alone it points into whatever now occupies that
+            // index, and the current request quietly loses its protection at
+            // the exact moment context pressure is highest.
+            //
+            // Clamped at 1 because index 0 is the system prompt and the
+            // summary lands at 1. When the current request was itself partly
+            // folded this lands early, which over-protects rather than
+            // under-protects -- the safe direction.
+            let removed = report.messages_before.saturating_sub(report.messages_after);
+            self.current_request_start = self.current_request_start.saturating_sub(removed).max(1);
             // The next request's usage will reflect the smaller prompt;
             // reset our tracked total so we don't immediately re-trigger.
             self.last_total_tokens = 0;
