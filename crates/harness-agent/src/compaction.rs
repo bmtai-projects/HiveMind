@@ -5,9 +5,46 @@
 //! This is what lets a long session keep running on the cheap Flash tier
 //! instead of either failing outright at the context limit or silently
 //! re-sending (and re-billing) an ever-growing transcript.
+//!
+//! # Why the summary has a fixed shape
+//!
+//! Compaction is the one place in the harness that deliberately destroys
+//! state, so what survives it is a design decision, not a detail. Asking a
+//! model for a concise prose summary optimises for the wrong thing: prose
+//! that reads well drops whatever is least interesting to *narrate*, and
+//! what is least interesting to narrate is usually a flat list of the
+//! user's own restrictions -- "don't touch the migration files", "keep this
+//! backwards-compatible". Those exist nowhere but in conversation text, and
+//! once they're gone the agent will cheerfully violate them for the rest of
+//! a session with no sign anything was lost.
+//!
+//! So the summary is a fixed set of named sections, and a constraint that
+//! was never stated has to be written down as "None stated." rather than
+//! simply going unmentioned -- an empty slot is visible, a missing sentence
+//! is not.
+//!
+//! # What the harness fills in itself
+//!
+//! Which files were edited is not a judgment call: it is recorded in the
+//! transcript's own tool calls, and the harness can read it exactly. That
+//! section is therefore computed here in Rust and appended to whatever the
+//! summarizer returns, rather than being asked for -- it cannot be
+//! hallucinated, cannot be dropped for brevity, and costs no tokens to
+//! produce. The model is asked only for the things that genuinely require
+//! reading the conversation: intent, constraints, decisions, dead ends.
 
 use harness_provider::{DeepSeekClient, ProviderError};
 use harness_types::{ChatRequest, Message, Role, StreamEvent, Usage};
+use serde::Deserialize;
+
+/// Local mirror of `checkpoint`'s helper of the same name. Both exist to
+/// pull one field out of a mutating tool's arguments and neither is part of
+/// any interface, so they stay separate rather than one importing the
+/// other's private type.
+#[derive(Deserialize)]
+struct PathOnly {
+    path: String,
+}
 
 pub struct CompactionPolicy {
     pub threshold_percent: u8,
@@ -70,6 +107,7 @@ pub async fn maybe_compact(
         ),
     };
 
+    let summary = with_edited_files(&summary, &old);
     messages.insert(
         1,
         Message::user(format!(
@@ -150,6 +188,92 @@ fn truncate(s: &str, max_chars: usize) -> String {
     format!("{head}…{tail}")
 }
 
+/// Cap on how many paths the computed section lists. A refactor that
+/// rewrites two hundred files would otherwise spend more context on the
+/// file list than the summary it belongs to -- which is the opposite of
+/// what compaction is for.
+const MAX_LISTED_FILES: usize = 40;
+
+/// Every workspace path the folded span asked `edit_file`/`write_file` to
+/// change, deduplicated and sorted.
+///
+/// Read from the tool calls themselves, which is the only place this is
+/// recorded exactly. One honest limitation: a `Message` keeps a tool's
+/// *summary text* but not its status, so a call that was attempted and
+/// failed is indistinguishable here from one that succeeded, and both are
+/// listed. Over-inclusion is the right way to be wrong -- naming a file the
+/// agent tried and failed to write costs a re-read, while omitting one it
+/// did write is exactly the silent loss this section exists to prevent.
+/// The heading says "asked to edit" rather than "edited" for that reason.
+fn edited_paths(old: &[Message]) -> Vec<String> {
+    let mut paths: Vec<String> = old
+        .iter()
+        .flat_map(|m| &m.tool_calls)
+        .filter(|tc| crate::validation::MUTATING_TOOLS.contains(&tc.name.as_str()))
+        .filter_map(|tc| {
+            serde_json::from_str::<PathOnly>(tc.args.get())
+                .ok()
+                .map(|p| p.path)
+        })
+        .collect();
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+/// Appends the harness-computed file section to a model-written summary.
+/// Returns the summary untouched when the folded span edited nothing, so a
+/// read-only stretch of conversation doesn't gain an empty heading.
+fn with_edited_files(summary: &str, old: &[Message]) -> String {
+    let paths = edited_paths(old);
+    if paths.is_empty() {
+        return summary.to_string();
+    }
+    let mut out = String::from(summary);
+    out.push_str("\n\n## Files asked to edit earlier (recorded by the harness)\n");
+    for path in paths.iter().take(MAX_LISTED_FILES) {
+        out.push_str(&format!("- {path}\n"));
+    }
+    if paths.len() > MAX_LISTED_FILES {
+        out.push_str(&format!("- …and {} more\n", paths.len() - MAX_LISTED_FILES));
+    }
+    out
+}
+
+/// Asks for named slots rather than a good paragraph.
+///
+/// "Write None stated." is load-bearing and not politeness: a summarizer
+/// told merely to mention constraints has no way to distinguish "there were
+/// none" from "I chose not to mention them", and neither does the agent
+/// reading the result afterwards. An explicit empty slot is checkable; a
+/// missing sentence is not.
+const SUMMARY_INSTRUCTIONS: &str = "\
+You compress coding-agent conversation history so that work can continue \
+after the earlier turns are permanently discarded. Reply with exactly these \
+five `## ` sections, in this order, and nothing else:
+
+## Goal
+What the user actually asked for, in their own terms.
+
+## Constraints
+Every explicit instruction, restriction or preference the user stated -- \
+files not to touch, compatibility to preserve, a library, tool or style they \
+named. These exist nowhere else once this history is dropped. Write \"None \
+stated.\" if there genuinely were none. Never invent or infer one.
+
+## Decisions
+Choices already made, and why, so they are not reopened.
+
+## Tried and failed
+Approaches already ruled out, and what went wrong, so they are not retried. \
+Write \"Nothing yet.\" if none.
+
+## Next steps
+What is still outstanding.
+
+Be brief inside each section. Do not add sections, preamble, or closing \
+remarks. Do not list edited files -- that is recorded separately.";
+
 async fn summarize(
     client: &DeepSeekClient,
     model: &str,
@@ -158,17 +282,16 @@ async fn summarize(
     let req = ChatRequest {
         model: model.to_string(),
         messages: vec![
-            Message::system(
-                "You compress coding-agent conversation history. Summarize the transcript below \
-                 concisely: preserve file paths touched, key decisions, and unresolved tasks. \
-                 Output only the summary, no preamble."
-                    .to_string(),
-            ),
+            Message::system(SUMMARY_INSTRUCTIONS.to_string()),
             Message::user(transcript.to_string()),
         ],
         tools: Vec::new(),
         temperature: None,
-        max_tokens: Some(600),
+        // Five sections need more room than one paragraph did, and the
+        // ceiling matters: a summary cut off mid-section loses whichever
+        // sections come last, and "Next steps" is last precisely because
+        // it is the one the agent rereads first.
+        max_tokens: Some(900),
         reasoning_effort: None,
         // A summarization call builds a throwaway two-message prompt with
         // no tools and no shared prefix -- there is nothing here a cache
@@ -215,6 +338,108 @@ mod tests {
     }
     fn tool_res() -> Message {
         Message::tool_result("c", "read_file", "ok")
+    }
+
+    /// An assistant turn calling `tool` once with `args`.
+    fn call(tool: &str, args: serde_json::Value) -> Message {
+        Message {
+            role: Role::Assistant,
+            content: String::new(),
+            reasoning: String::new(),
+            tool_calls: vec![ToolCall {
+                id: "c".into(),
+                name: tool.into(),
+                args: serde_json::value::RawValue::from_string(args.to_string()).unwrap(),
+            }],
+            tool_call_id: None,
+            name: None,
+        }
+    }
+
+    fn edits(paths: &[&str]) -> Vec<Message> {
+        paths
+            .iter()
+            .map(|p| call("edit_file", serde_json::json!({"path": p})))
+            .collect()
+    }
+
+    #[test]
+    fn edited_paths_are_deduplicated_and_sorted() {
+        let msgs = edits(&["src/b.rs", "src/a.rs", "src/b.rs"]);
+        assert_eq!(edited_paths(&msgs), vec!["src/a.rs", "src/b.rs"]);
+    }
+
+    #[test]
+    fn both_mutating_tools_are_counted_and_read_only_ones_are_not() {
+        let msgs = vec![
+            call("write_file", serde_json::json!({"path": "new.rs"})),
+            call("edit_file", serde_json::json!({"path": "old.rs"})),
+            call("read_file", serde_json::json!({"path": "ignored.rs"})),
+            call("search", serde_json::json!({"query": "x"})),
+        ];
+        assert_eq!(edited_paths(&msgs), vec!["new.rs", "old.rs"]);
+    }
+
+    /// The whole point of computing this rather than asking for it: a
+    /// summarizer told to be brief drops file paths, and the harness
+    /// already knows them exactly.
+    #[test]
+    fn the_file_section_is_appended_to_whatever_the_summarizer_returned() {
+        let out = with_edited_files("## Goal\nShip it.", &edits(&["src/main.rs"]));
+        assert!(out.starts_with("## Goal\nShip it."));
+        assert!(out.contains("## Files asked to edit earlier"));
+        assert!(out.contains("- src/main.rs"));
+    }
+
+    #[test]
+    fn a_read_only_span_gains_no_empty_heading() {
+        let msgs = vec![asst_call(), tool_res()];
+        assert_eq!(
+            with_edited_files("## Goal\nExplain it.", &msgs),
+            "## Goal\nExplain it."
+        );
+    }
+
+    /// A mass refactor must not spend more context on its own file list
+    /// than on the summary that list belongs to.
+    #[test]
+    fn a_very_long_file_list_is_capped_and_says_how_many_it_dropped() {
+        let owned: Vec<String> = (0..MAX_LISTED_FILES + 5)
+            .map(|i| format!("src/f{i:03}.rs"))
+            .collect();
+        let refs: Vec<&str> = owned.iter().map(String::as_str).collect();
+        let out = with_edited_files("s", &edits(&refs));
+        assert_eq!(out.matches("\n- src/").count(), MAX_LISTED_FILES);
+        assert!(out.contains("…and 5 more"));
+    }
+
+    /// Malformed or unparseable arguments must not take the rest of the
+    /// list down with them -- compaction runs at 75% context, where losing
+    /// the summary outright is the expensive failure.
+    #[test]
+    fn an_unparseable_tool_call_is_skipped_not_fatal() {
+        let mut msgs = edits(&["good.rs"]);
+        msgs.push(call("edit_file", serde_json::json!({"no_path_here": true})));
+        assert_eq!(edited_paths(&msgs), vec!["good.rs"]);
+    }
+
+    #[test]
+    fn the_instructions_demand_an_explicit_empty_slot_rather_than_silence() {
+        assert!(SUMMARY_INSTRUCTIONS.contains("None stated."));
+        assert!(SUMMARY_INSTRUCTIONS.contains("Never invent or infer one."));
+        // The five slots the agent reads back after a fold.
+        for section in [
+            "## Goal",
+            "## Constraints",
+            "## Decisions",
+            "## Tried and failed",
+            "## Next steps",
+        ] {
+            assert!(
+                SUMMARY_INSTRUCTIONS.contains(section),
+                "{section} missing from the summarizer instructions"
+            );
+        }
     }
 
     /// The API invariant compaction must never break: every `tool` message is
