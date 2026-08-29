@@ -19,6 +19,10 @@ mod semantic;
 mod todo;
 mod tool;
 mod walk;
+/// Exported so `harness-cli`'s `@path` mention expansion shows exactly the
+/// files the read-only tools would find — one walk policy, not two that can
+/// disagree about what "the codebase" is.
+pub use walk::walk_files;
 mod web;
 mod xlsx;
 
