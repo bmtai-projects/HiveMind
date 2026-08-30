@@ -725,12 +725,18 @@ impl Agent {
                 // and is then let through on its next answer whatever it
                 // says -- see `validation.rs` for why this is a nudge and
                 // not a gate.
-                if let Some(changed) = self.run_ledger.nudge_now(self.validation_nudged_this_run) {
+                if let Some(nudge) = self.run_ledger.nudge_now(self.validation_nudged_this_run) {
                     self.validation_nudged_this_run = true;
-                    self.ui.validation_required(changed);
-                    self.messages.push(Message::user(
-                        crate::validation::VALIDATION_NUDGE.to_string(),
-                    ));
+                    let (count, text) = match nudge {
+                        crate::validation::Nudge::NothingRan { changed } => {
+                            (changed, crate::validation::NOTHING_RAN_NUDGE)
+                        }
+                        crate::validation::Nudge::NewCodeNeverRun { created } => {
+                            (created, crate::validation::NEW_CODE_NEVER_RUN_NUDGE)
+                        }
+                    };
+                    self.ui.validation_required(count);
+                    self.messages.push(Message::user(text.to_string()));
                     self.persist();
                     continue;
                 }
@@ -910,7 +916,14 @@ impl Agent {
             // keeps only `summary`, so neither which file was written nor
             // whether the write succeeded survives in a form worth
             // re-deriving later.
-            self.run_ledger.record(&call.name, &call.args, is_error);
+            let created: Vec<String> = result
+                .changed_files
+                .iter()
+                .filter(|c| c.kind == harness_tools::FileChangeKind::Created)
+                .map(|c| c.path.clone())
+                .collect();
+            self.run_ledger
+                .record(&call.name, &call.args, is_error, &created);
             self.session_cost_usd += result.cost_usd;
             self.ui.tool_end(
                 &call.name,
