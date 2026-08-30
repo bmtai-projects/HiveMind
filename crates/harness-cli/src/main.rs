@@ -420,6 +420,11 @@ struct ActivateArgs {
     #[arg(long)]
     web: bool,
 
+    /// Trace end-to-end latency for this session, writing stage timings to
+    /// stderr as they occur. Disabled by default; adds no overhead when off.
+    #[arg(long)]
+    trace_latency: bool,
+
     /// Resume the most recent session for this workspace. Restores the
     /// conversation, model, and accumulated spend -- but not `/undo`
     /// history, which is deliberately never carried across processes (the
@@ -722,9 +727,25 @@ async fn run(args: ActivateArgs) -> anyhow::Result<()> {
     let term_ui: Option<Arc<TermUi>> =
         (!protocol_json).then(|| Arc::new(TermUi::new(args.show_reasoning, resolved.budget_usd)));
 
+    // Latency tracer -- created once, shared across whatever Agent instances
+    // this session constructs. Built *before* the context load below so that
+    // load can be timed: it is startup work that happens once per process
+    // and lands squarely in the first response's latency, which is the thing
+    // this flag exists to explain.
+    let latency_tracer: Option<harness_agent::LatencyTracer> = args.trace_latency.then(|| {
+        let corr_id = format!("hivemind-{}", harness_agent::unix_now());
+        harness_agent::LatencyTracer::new(true, corr_id)
+    });
+
     // Read once, here, and hold it for the process's lifetime -- see
     // `system_prompt`'s doc comment for why re-reading would be expensive.
+    if let Some(t) = &latency_tracer {
+        t.emit("context_loading_started");
+    }
     let project_conventions = conventions::load(&workdir);
+    if let Some(t) = &latency_tracer {
+        t.emit("context_loading_completed");
+    }
 
     let mut registry = Registry::new();
     let ws = Workspace::new(workdir.clone());
@@ -838,6 +859,9 @@ async fn run(args: ActivateArgs) -> anyhow::Result<()> {
             system_prompt(project_conventions.as_deref(), read_program_available),
         );
         agent.warm_connection();
+        if let Some(tracer) = latency_tracer.clone() {
+            agent.enable_tracing(tracer);
+        }
         // Off when the threshold is 0, which is how a user turns offloading
         // off entirely without the harness needing a second switch.
         if resolved.policy.artifact_threshold_bytes > 0 {
@@ -872,6 +896,9 @@ async fn run(args: ActivateArgs) -> anyhow::Result<()> {
         system_prompt(project_conventions.as_deref(), read_program_available),
     );
     agent.warm_connection();
+    if let Some(tracer) = latency_tracer {
+        agent.enable_tracing(tracer);
+    }
     // Off when the threshold is 0, which is how a user turns offloading
     // off entirely without the harness needing a second switch.
     if resolved.policy.artifact_threshold_bytes > 0 {
