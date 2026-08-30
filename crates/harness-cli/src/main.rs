@@ -727,9 +727,25 @@ async fn run(args: ActivateArgs) -> anyhow::Result<()> {
     let term_ui: Option<Arc<TermUi>> =
         (!protocol_json).then(|| Arc::new(TermUi::new(args.show_reasoning, resolved.budget_usd)));
 
+    // Latency tracer -- created once, shared across whatever Agent instances
+    // this session constructs. Built *before* the context load below so that
+    // load can be timed: it is startup work that happens once per process
+    // and lands squarely in the first response's latency, which is the thing
+    // this flag exists to explain.
+    let latency_tracer: Option<harness_agent::LatencyTracer> = args.trace_latency.then(|| {
+        let corr_id = format!("hivemind-{}", harness_agent::unix_now());
+        harness_agent::LatencyTracer::new(true, corr_id)
+    });
+
     // Read once, here, and hold it for the process's lifetime -- see
     // `system_prompt`'s doc comment for why re-reading would be expensive.
+    if let Some(t) = &latency_tracer {
+        t.emit("context_loading_started");
+    }
     let project_conventions = conventions::load(&workdir);
+    if let Some(t) = &latency_tracer {
+        t.emit("context_loading_completed");
+    }
 
     let mut registry = Registry::new();
     let ws = Workspace::new(workdir.clone());
@@ -833,14 +849,6 @@ async fn run(args: ActivateArgs) -> anyhow::Result<()> {
 
     let workspace = workdir.to_string_lossy().to_string();
     let store = harness_agent::SessionStore::new(harness_config::default_sessions_dir());
-
-    // Latency tracer -- created once, shared across whatever Agent instances
-    // this session constructs. Correlation id uses session-relevant context
-    // so traces can be cross-referenced with logs.
-    let latency_tracer: Option<harness_agent::LatencyTracer> = args.trace_latency.then(|| {
-        let corr_id = format!("hivemind-{}", harness_agent::unix_now());
-        harness_agent::LatencyTracer::new(true, corr_id)
-    });
 
     if let Some(json_ui) = json_ui {
         let mut agent = Agent::new(

@@ -10,7 +10,7 @@
 //! the session/request correlation ID. Never logs prompts, source code,
 //! API keys, or provider responses. No external dependencies.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 /// A latency tracer that records named stage timestamps relative to a start
@@ -27,8 +27,17 @@ struct LatencyTracerInner {
     /// Whether tracing is enabled. Checked once per emit — when false, the
     /// entire method is a single `if` that returns immediately.
     enabled: bool,
-    /// The instant the tracer was created (request start time).
-    start: Instant,
+    /// The instant the *current request* started.
+    ///
+    /// Rebased by `begin_request`, not fixed at construction. The spec is
+    /// "milliseconds since request start", and a tracer built once in
+    /// `main.rs` and never reset reports milliseconds since the process
+    /// began instead -- so the second request in a session showed
+    /// `user_request_received +18599ms` and every later figure had to be
+    /// read by subtracting a number the operator had to find first. For a
+    /// tool whose only job is measuring first-response latency, that made
+    /// the output actively misleading.
+    start: Mutex<Instant>,
     /// Correlation ID shared across all events for this session/request.
     correlation_id: String,
 }
@@ -40,9 +49,35 @@ impl LatencyTracer {
         Self {
             inner: Arc::new(LatencyTracerInner {
                 enabled,
-                start: Instant::now(),
+                start: Mutex::new(Instant::now()),
                 correlation_id,
             }),
+        }
+    }
+
+    /// Rebase the clock to now. Called at the top of every user request so
+    /// elapsed figures are relative to *that* request, which is what the
+    /// stage names claim.
+    pub fn begin_request(&self) {
+        if !self.inner.enabled {
+            return;
+        }
+        if let Ok(mut start) = self.inner.start.lock() {
+            *start = Instant::now();
+        }
+    }
+
+    /// Elapsed milliseconds for the current request. Test-only: the real
+    /// output path is `emit`, which writes to stderr and cannot be asserted
+    /// on directly from a unit test.
+    #[cfg(test)]
+    pub(crate) fn elapsed_ms_for_test(&self) -> f64 {
+        if !self.inner.enabled {
+            return 0.0;
+        }
+        match self.inner.start.lock() {
+            Ok(start) => start.elapsed().as_secs_f64() * 1000.0,
+            Err(_) => 0.0,
         }
     }
 
@@ -62,7 +97,13 @@ impl LatencyTracer {
         if !self.inner.enabled {
             return;
         }
-        let elapsed = self.inner.start.elapsed().as_secs_f64() * 1000.0;
+        // A poisoned lock must not take tracing down with it -- this is a
+        // diagnostic, and 0ms is a better answer than a panic in the middle
+        // of someone's request.
+        let elapsed = match self.inner.start.lock() {
+            Ok(start) => start.elapsed().as_secs_f64() * 1000.0,
+            Err(_) => 0.0,
+        };
         eprintln!(
             "[trace] {stage} +{elapsed:.0}ms {}",
             self.inner.correlation_id
@@ -73,6 +114,39 @@ impl LatencyTracer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The defect this replaced: the tracer's clock was fixed at
+    /// construction, so the second request in a session reported
+    /// `user_request_received +18599ms` instead of `+0ms` and every figure
+    /// after it had to be read by subtracting a number the operator had to
+    /// go and find. Measured live before the fix.
+    #[test]
+    fn the_clock_restarts_for_each_request() {
+        let t = LatencyTracer::new(true, "corr".into());
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        let before = t.elapsed_ms_for_test();
+        assert!(before >= 20.0, "clock should have advanced, got {before}");
+
+        t.begin_request();
+        let after = t.elapsed_ms_for_test();
+        assert!(
+            after < before,
+            "begin_request must rebase: {before}ms -> {after}ms"
+        );
+        assert!(
+            after < 10.0,
+            "a fresh request should start near zero, got {after}"
+        );
+    }
+
+    /// `begin_request` on a disabled tracer must stay a no-op like every
+    /// other method -- it is called unconditionally from the agent loop.
+    #[test]
+    fn begin_request_is_a_no_op_when_disabled() {
+        let t = LatencyTracer::new(false, "corr".into());
+        t.begin_request();
+        assert_eq!(t.elapsed_ms_for_test(), 0.0);
+    }
 
     #[test]
     fn disabled_tracer_produces_no_output() {

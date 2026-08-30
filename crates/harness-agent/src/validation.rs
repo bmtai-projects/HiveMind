@@ -67,20 +67,25 @@ pub(crate) const MUTATING_TOOLS: [&str; 2] = ["edit_file", "write_file"];
 /// agreed the work had been checked.
 const COMPILE_MARKERS: &[&str] = &[
     "check",
-    "lint",
     "build",
     "compile",
-    "clippy",
     "tsc",
     "typecheck",
     "mypy",
     "fmt",
-    "vet",
     "audit",
-    "eslint",
-    "ruff",
-    "flake8",
-    "rubocop",
+];
+
+/// Substrings that mean a shell command ran the project's *linter*.
+///
+/// Split out of the compile class because a project can gate on it
+/// independently: this repository fails `cargo clippy -- -D warnings` on code
+/// that compiles and passes every test, and a generated implementation
+/// shipped exactly that -- `cargo check` and `cargo test` both run, clippy
+/// never, two `unwrap`-after-`is_some` errors left behind. Compiling and
+/// testing are not evidence about lint.
+const LINT_MARKERS: &[&str] = &[
+    "clippy", "lint", "eslint", "ruff", "flake8", "rubocop", "vet",
 ];
 
 /// Substrings that mean a shell command actually *ran* the work.
@@ -162,13 +167,15 @@ fn classify_command(command: &str, background: bool) -> Option<CheckKind> {
         if READ_ONLY_COMMANDS.contains(&first) {
             continue;
         }
-        // Tested wins wherever it appears: actually running the code is the
-        // stronger claim, and the whole point of the split is not to let the
-        // weaker one stand in for it.
+        // Checked most-specific first. `cargo clippy` contains neither a
+        // test nor a compile marker, and `cargo test` must not be read as a
+        // lint just because some segment mentions one.
         if TEST_MARKERS.iter().any(|m| segment.contains(m)) {
             return Some(CheckKind::Tested);
         }
-        if COMPILE_MARKERS.iter().any(|m| segment.contains(m)) {
+        if LINT_MARKERS.iter().any(|m| segment.contains(m)) {
+            best = Some(CheckKind::Linted);
+        } else if COMPILE_MARKERS.iter().any(|m| segment.contains(m)) && best.is_none() {
             best = Some(CheckKind::Compiled);
         }
     }
@@ -180,6 +187,8 @@ fn classify_command(command: &str, background: bool) -> Option<CheckKind> {
 enum CheckKind {
     /// It parses and type-checks.
     Compiled,
+    /// The project's linter accepted it.
+    Linted,
     /// It was actually executed.
     Tested,
 }
@@ -205,12 +214,16 @@ pub(crate) struct RunLedger {
     /// nothing has ever executed it, so "it compiles" is a much weaker
     /// statement about it than about a two-line change to a tested file.
     created_source: BTreeSet<String>,
-    /// The strongest claim made since the last mutation. `None` means
-    /// nothing has been run at all. Reset by every mutation, so ordering is
-    /// what it measures -- testing and *then* editing leaves the edit
-    /// unchecked, which a plain "did a test run this turn?" flag waves
-    /// through.
-    checked_since_last_change: Option<CheckKind>,
+    /// Which claims have been made since the last mutation. Tracked
+    /// independently rather than as one "strongest" value, because they are
+    /// not a ladder: `cargo test` passing says nothing about whether clippy
+    /// would, and collapsing them loses the fact that a linter ran as soon
+    /// as anything stronger follows it. All three reset on every mutation,
+    /// so ordering is what this measures -- testing and *then* editing
+    /// leaves the edit unchecked.
+    compiled: bool,
+    linted: bool,
+    tested: bool,
 }
 
 /// What the loop should say, if anything, when a run tries to end.
@@ -220,13 +233,27 @@ pub(crate) enum Nudge {
     NothingRan { changed: usize },
     /// New source files were written and only compiled, never executed.
     NewCodeNeverRun { created: usize },
+    /// New source files were written and tested, but the project's linter
+    /// never ran over them.
+    NewCodeNotLinted { created: usize },
 }
 
 impl RunLedger {
     pub(crate) fn clear(&mut self) {
         self.changed.clear();
         self.created_source.clear();
-        self.checked_since_last_change = None;
+        self.clear_checks();
+    }
+
+    fn clear_checks(&mut self) {
+        self.compiled = false;
+        self.linted = false;
+        self.tested = false;
+    }
+
+    /// Whether anything at all has been run since the last mutation.
+    fn anything_ran(&self) -> bool {
+        self.compiled || self.linted || self.tested
     }
 
     /// Folds one completed tool call into the ledger.
@@ -249,7 +276,7 @@ impl RunLedger {
             }
             if let Ok(parsed) = serde_json::from_str::<PathOnly>(args.get()) {
                 self.changed.insert(parsed.path);
-                self.checked_since_last_change = None;
+                self.clear_checks();
             }
             for path in created {
                 if is_source_file(path) {
@@ -262,10 +289,10 @@ impl RunLedger {
             && let Ok(parsed) = serde_json::from_str::<ShellOnly>(args.get())
             && let Some(kind) = classify_command(&parsed.command, parsed.background)
         {
-            // Never downgrade: a `cargo check` after a `cargo test` does not
-            // un-run the tests.
-            if self.checked_since_last_change != Some(CheckKind::Tested) {
-                self.checked_since_last_change = Some(kind);
+            match kind {
+                CheckKind::Compiled => self.compiled = true,
+                CheckKind::Linted => self.linted = true,
+                CheckKind::Tested => self.tested = true,
             }
         }
     }
@@ -273,8 +300,7 @@ impl RunLedger {
     /// How many files are changed and entirely unchecked, or `None` when the
     /// run has nothing to answer for on that count.
     pub(crate) fn unchecked_change_count(&self) -> Option<usize> {
-        (!self.changed.is_empty() && self.checked_since_last_change.is_none())
-            .then_some(self.changed.len())
+        (!self.changed.is_empty() && !self.anything_ran()).then_some(self.changed.len())
     }
 
     /// The whole policy, in one place: what to say when a run tries to end,
@@ -296,10 +322,19 @@ impl RunLedger {
         // for, and this is exactly the gap a measured run fell through --
         // `cargo check` twice, no tests, a bug that disabled 7 of 9 features
         // after the first request.
-        if self.checked_since_last_change == Some(CheckKind::Compiled)
-            && !self.created_source.is_empty()
-        {
+        if self.created_source.is_empty() {
+            return None;
+        }
+        if !self.tested {
             return Some(Nudge::NewCodeNeverRun {
+                created: self.created_source.len(),
+            });
+        }
+        // Tested but never linted. A separate claim: this repository fails
+        // `cargo clippy -- -D warnings` on code that compiles and passes
+        // every test, and a generated implementation shipped exactly that.
+        if !self.linted {
+            return Some(Nudge::NewCodeNotLinted {
                 created: self.created_source.len(),
             });
         }
@@ -353,6 +388,28 @@ Before finishing:
   single most common way this kind of code ships broken.
 - If a test fails, fix it and re-run. Reporting a failure you introduced is
   not finishing.
+</harness-note>";
+
+/// Delivered once per run, when new source was written and tested but the
+/// project's linter never ran over it.
+///
+/// A distinct claim from the note above, and deliberately gentler: whether a
+/// project has a linter at all is genuinely project-dependent in a way that
+/// "can you run this after compiling it" is not, so this one does offer a
+/// way out. It exists because a generated implementation ran `cargo check`
+/// and `cargo test`, never `cargo clippy`, and left two
+/// `unwrap`-after-`is_some` errors in a repository that gates on
+/// `-D warnings`.
+pub(crate) const NEW_CODE_NOT_LINTED_NUDGE: &str = "\
+<harness-note>
+You wrote new code and ran its tests, but the project's linter has not seen
+it. Many projects gate on the linter separately -- `cargo clippy -- -D
+warnings`, `eslint --max-warnings 0`, `ruff check` -- and reject code that
+compiles and passes every test.
+- Run the linter this project uses, over what you changed.
+- Fix what it reports and re-run it.
+- If this project genuinely has no linter configured, say so in one sentence
+  and finish.
 </harness-note>";
 
 #[cfg(test)]
@@ -605,20 +662,72 @@ mod tests {
     }
 
     #[test]
-    fn new_code_that_was_actually_tested_is_left_alone() {
+    fn new_code_that_was_tested_and_linted_is_left_alone() {
         let mut l = RunLedger::default();
         create(&mut l, "src/trace.rs");
         shell(&mut l, "cargo test -p harness-agent");
+        shell(&mut l, "cargo clippy --workspace -- -D warnings");
+        assert_eq!(l.nudge_now(false), None);
+    }
+
+    /// The real gap: a generated implementation ran `cargo check` and
+    /// `cargo test`, never `cargo clippy`, and left two
+    /// `unwrap`-after-`is_some` errors in a repository that gates on
+    /// `-D warnings`. Passing tests are not evidence about lint.
+    #[test]
+    fn new_code_that_was_tested_but_never_linted_is_asked_for_the_linter() {
+        let mut l = RunLedger::default();
+        create(&mut l, "crates/harness-agent/src/latency_trace.rs");
+        shell(&mut l, "cd HiveMind && cargo check 2>&1");
+        shell(
+            &mut l,
+            "cd HiveMind && cargo test --package harness-agent 2>&1",
+        );
+        assert_eq!(
+            l.nudge_now(false),
+            Some(Nudge::NewCodeNotLinted { created: 1 })
+        );
+    }
+
+    /// Lint is recognised on its own -- `cargo clippy` contains neither a
+    /// compile nor a test marker.
+    #[test]
+    fn the_linter_is_recognised_across_ecosystems() {
+        for cmd in [
+            "cargo clippy -- -D warnings",
+            "npx eslint src --max-warnings 0",
+            "ruff check .",
+            "go vet ./...",
+        ] {
+            assert_eq!(
+                classify_command(cmd, false),
+                Some(CheckKind::Linted),
+                "{cmd} should read as a lint"
+            );
+        }
+    }
+
+    /// Editing existing code still only needs *something* to have run --
+    /// the lint rule is scoped to newly created source, or it would nag on
+    /// every one-line fix.
+    #[test]
+    fn editing_existing_code_is_not_asked_for_the_linter() {
+        let mut l = RunLedger::default();
+        edit(&mut l, "src/agent.rs");
+        shell(&mut l, "cargo test");
         assert_eq!(l.nudge_now(false), None);
     }
 
     /// Tested is the stronger claim and must not be undone by a later
     /// compile-only command.
+    /// The claims are independent, not a ladder: a later `cargo fmt` must
+    /// not erase the fact that tests and clippy already ran.
     #[test]
     fn a_compile_after_a_test_does_not_un_run_the_test() {
         let mut l = RunLedger::default();
         create(&mut l, "src/trace.rs");
         shell(&mut l, "cargo test");
+        shell(&mut l, "cargo clippy");
         shell(&mut l, "cargo fmt");
         assert_eq!(l.nudge_now(false), None);
     }
