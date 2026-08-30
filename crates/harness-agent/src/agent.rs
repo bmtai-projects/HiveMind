@@ -16,6 +16,7 @@ use crate::checkpoint::{self, Checkpoint, UndoReport};
 use crate::compaction::{CompactionPolicy, maybe_compact};
 use crate::hooks::{self, HookDecision};
 use crate::interjection::InterjectionQueue;
+use crate::latency_trace::LatencyTracer;
 use crate::session::{SessionRecord, SessionStore, derive_title, unix_now};
 use crate::ui::Ui;
 
@@ -228,6 +229,9 @@ pub struct Agent {
     /// Swept by `ArtifactStore::prune_orphans`, since no session record will
     /// ever refer to it.
     ephemeral_artifact_id: String,
+    /// Opt-in latency tracer. `None` when disabled (default) -- all trace
+    /// points become a single None-check, zero overhead.
+    tracer: Option<LatencyTracer>,
 }
 
 /// Bookkeeping for a session that's being written to disk.
@@ -297,7 +301,14 @@ impl Agent {
             artifacts: None,
             artifact_threshold_bytes: DEFAULT_ARTIFACT_THRESHOLD_BYTES,
             ephemeral_artifact_id: format!("tmp-{}-{}", std::process::id(), unix_now()),
+            tracer: None,
         }
+    }
+
+    /// Enable latency tracing for this session. No-op is the default; call
+    /// this once at startup if `--trace-latency` was passed.
+    pub fn enable_tracing(&mut self, tracer: LatencyTracer) {
+        self.tracer = Some(tracer);
     }
 
     /// Offload tool results at or above `threshold_bytes` to `store`,
@@ -581,6 +592,9 @@ impl Agent {
         // is where "what this request has done" starts.
         self.current_request_start = self.messages.len();
         self.messages.push(Message::user(user_input.to_string()));
+        if let Some(t) = &self.tracer {
+            t.emit("user_request_received");
+        }
 
         // `max_turns` is a checkpoint, not a wall. When it runs out, a run
         // that is still getting somewhere is granted another block rather
@@ -589,6 +603,9 @@ impl Agent {
         let mut extensions = 0u32;
         let mut turns_used = 0u32;
         loop {
+            if let Some(t) = &self.tracer {
+                t.emit("agent_loop_started");
+            }
             if turns_used >= limit {
                 if extensions < MAX_TURN_EXTENSIONS && self.earned_more_turns() {
                     extensions += 1;
@@ -657,6 +674,9 @@ impl Agent {
             };
 
             self.ui.turn_started();
+            if let Some(t) = &self.tracer {
+                t.emit("provider_request_started");
+            }
             let mut rx = self.client.stream(&req);
             self.messages = std::mem::take(&mut req.messages);
 
@@ -754,10 +774,19 @@ impl Agent {
             // through a 20-step task must still leave everything up to here
             // resumable.
             self.persist();
+            if let Some(t) = &self.tracer {
+                t.emit("session_persistence_completed");
+            }
         }
 
+        if let Some(t) = &self.tracer {
+            t.emit("final_response_completed");
+        }
         checkpoint::push(&mut self.checkpoints, checkpoint);
         self.persist();
+        if let Some(t) = &self.tracer {
+            t.emit("session_persistence_completed");
+        }
         // Everything above already ran: the checkpoint is pushed and the
         // session persisted, so every edit made so far is on disk and
         // resumable. The old message ("reached max turns (60) without
@@ -823,13 +852,36 @@ impl Agent {
     ) -> anyhow::Result<harness_types::ChatResponse> {
         let mut final_response = None;
         let mut saw_text = false;
+        let mut first_token_emitted = false;
+        let mut first_visible_emitted = false;
         while let Some(event) = rx.recv().await {
+            if self.tracer.is_some() && !first_token_emitted {
+                first_token_emitted = true;
+                self.tracer
+                    .as_ref()
+                    .unwrap()
+                    .emit("first_provider_token_received");
+            }
             match event? {
                 StreamEvent::TextDelta(t) => {
+                    if self.tracer.is_some() && !first_visible_emitted {
+                        first_visible_emitted = true;
+                        self.tracer
+                            .as_ref()
+                            .unwrap()
+                            .emit("first_user_visible_event_emitted");
+                    }
                     saw_text = true;
                     self.ui.assistant_delta(&t);
                 }
                 StreamEvent::ReasoningDelta(r) => {
+                    if self.tracer.is_some() && !first_visible_emitted {
+                        first_visible_emitted = true;
+                        self.tracer
+                            .as_ref()
+                            .unwrap()
+                            .emit("first_user_visible_event_emitted");
+                    }
                     self.ui.reasoning_delta(&r);
                 }
                 StreamEvent::ToolCallStarted(name) => {
@@ -860,7 +912,14 @@ impl Agent {
     /// run after, observationally, for calls that actually executed.
     async fn dispatch_and_record(&mut self, calls: Vec<ToolCall>, checkpoint: &mut Checkpoint) {
         checkpoint.capture(&self.workspace, &calls).await;
+        let mut first_tool_traced = false;
         for call in &calls {
+            if let Some(t) = &self.tracer
+                && !first_tool_traced
+            {
+                first_tool_traced = true;
+                t.emit("first_tool_call_started");
+            }
             self.ui.tool_start(&call.name, call.args.get());
         }
 
@@ -899,6 +958,11 @@ impl Agent {
         }
 
         let results = self.tools.dispatch_many(executable).await;
+        if let Some(t) = &self.tracer {
+            if results.first().is_some() {
+                t.emit("first_tool_call_completed");
+            }
+        }
         // Web failures are bounded, non-mutating, and often environmental
         // (empty result, upstream limit). They must not buy an automatic
         // jump to a much pricier model.

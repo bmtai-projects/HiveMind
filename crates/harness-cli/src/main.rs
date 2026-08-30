@@ -420,6 +420,11 @@ struct ActivateArgs {
     #[arg(long)]
     web: bool,
 
+    /// Trace end-to-end latency for this session, writing stage timings to
+    /// stderr as they occur. Disabled by default; adds no overhead when off.
+    #[arg(long)]
+    trace_latency: bool,
+
     /// Resume the most recent session for this workspace. Restores the
     /// conversation, model, and accumulated spend -- but not `/undo`
     /// history, which is deliberately never carried across processes (the
@@ -829,6 +834,14 @@ async fn run(args: ActivateArgs) -> anyhow::Result<()> {
     let workspace = workdir.to_string_lossy().to_string();
     let store = harness_agent::SessionStore::new(harness_config::default_sessions_dir());
 
+    // Latency tracer -- created once, shared across whatever Agent instances
+    // this session constructs. Correlation id uses session-relevant context
+    // so traces can be cross-referenced with logs.
+    let latency_tracer: Option<harness_agent::LatencyTracer> = args.trace_latency.then(|| {
+        let corr_id = format!("hivemind-{}", harness_agent::unix_now());
+        harness_agent::LatencyTracer::new(true, corr_id)
+    });
+
     if let Some(json_ui) = json_ui {
         let mut agent = Agent::new(
             resolved.clone(),
@@ -838,6 +851,9 @@ async fn run(args: ActivateArgs) -> anyhow::Result<()> {
             system_prompt(project_conventions.as_deref(), read_program_available),
         );
         agent.warm_connection();
+        if let Some(tracer) = latency_tracer.clone() {
+            agent.enable_tracing(tracer);
+        }
         // Off when the threshold is 0, which is how a user turns offloading
         // off entirely without the harness needing a second switch.
         if resolved.policy.artifact_threshold_bytes > 0 {
@@ -872,6 +888,9 @@ async fn run(args: ActivateArgs) -> anyhow::Result<()> {
         system_prompt(project_conventions.as_deref(), read_program_available),
     );
     agent.warm_connection();
+    if let Some(tracer) = latency_tracer {
+        agent.enable_tracing(tracer);
+    }
     // Off when the threshold is 0, which is how a user turns offloading
     // off entirely without the harness needing a second switch.
     if resolved.policy.artifact_threshold_bytes > 0 {
