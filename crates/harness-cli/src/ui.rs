@@ -219,6 +219,13 @@ impl Ui for TermUi {
         );
     }
 
+    fn turns_extended(&self, turns_used: u32, new_limit: u32) {
+        self.clear_preview();
+        println!(
+            "\x1b[33m  ↻ still making progress at {turns_used} turns — continuing to {new_limit}\x1b[0m"
+        );
+    }
+
     fn escalation_declined(&self, to: &str, spent: f64, budget: f64) {
         self.clear_preview();
         println!(

@@ -27,6 +27,16 @@ const COMPACTION_KEEP_RECENT: usize = 8;
 /// finish the work on a model costing ~22x input / ~53x output, so the only
 /// thing the switch reliably buys is a faster trip to `stopped_for_budget`.
 const ESCALATION_BUDGET_HEADROOM: f64 = 0.5;
+/// How many extra `max_turns` blocks a run that is still making progress may
+/// be granted before the ceiling stops it regardless. At the default 60 that
+/// is up to 300 turns.
+///
+/// A ceiling still exists because "making progress" is a heuristic and a
+/// wrong answer forever is worse than a wrong answer for a while. But it is
+/// far enough out that no ordinary task reaches it, which is the point: the
+/// limit that stops a real run should be the user's budget, not an arbitrary
+/// count they never chose.
+const MAX_TURN_EXTENSIONS: u32 = 4;
 const SEND_GUARD_PERCENT: u64 = 95;
 const WEB_OPERATIONS_PER_RUN: u8 = 3;
 const WEB_SYSTEM_INSTRUCTION: &str = "\
@@ -572,7 +582,23 @@ impl Agent {
         self.current_request_start = self.messages.len();
         self.messages.push(Message::user(user_input.to_string()));
 
-        for _turn in 0..self.policy.max_turns {
+        // `max_turns` is a checkpoint, not a wall. When it runs out, a run
+        // that is still getting somewhere is granted another block rather
+        // than stopped -- see `earned_more_turns`.
+        let mut limit = self.policy.max_turns;
+        let mut extensions = 0u32;
+        let mut turns_used = 0u32;
+        loop {
+            if turns_used >= limit {
+                if extensions < MAX_TURN_EXTENSIONS && self.earned_more_turns() {
+                    extensions += 1;
+                    limit = limit.saturating_add(self.policy.max_turns);
+                    self.ui.turns_extended(turns_used, limit);
+                } else {
+                    break;
+                }
+            }
+            turns_used += 1;
             // Checked here, not mid-stream: a turn already in flight always
             // finishes (same philosophy as the server's own reserve-then-
             // settle -- never interrupt something already committed to,
@@ -726,10 +752,43 @@ impl Agent {
 
         checkpoint::push(&mut self.checkpoints, checkpoint);
         self.persist();
+        // Everything above already ran: the checkpoint is pushed and the
+        // session persisted, so every edit made so far is on disk and
+        // resumable. The old message ("reached max turns (60) without
+        // completing") said none of that and left the user with a number
+        // and no move to make -- so it named the one limit they had not
+        // chosen and hid the two things that actually help.
         anyhow::bail!(
-            "reached max turns ({}) without completing",
-            self.policy.max_turns
+            "stopped after {turns_used} turns without finishing. Your changes so far are saved. \
+             Send another message (\"continue\") to carry on with the same context, or raise \
+             `max_turns` under [agent] in {}.",
+            harness_config::default_config_path().display()
         )
+    }
+
+    /// Whether a run that has used up its turn allowance has earned more.
+    ///
+    /// `max_turns` exists to stop a runaway, and a runaway is a run that has
+    /// stopped getting anywhere -- which the stall counters already measure,
+    /// far more precisely than a turn count can. A run still making progress
+    /// has not earned a stop; it has only met an arbitrary number.
+    ///
+    /// This is not a theoretical distinction. A measured run implementing a
+    /// tracing feature made 31 reads and 24 edits, reached a clean
+    /// `cargo check`, and was killed mid-`cargo fmt` at turn 60 -- with 55%
+    /// of its budget unspent and no stall ever detected. `edit_file` needs
+    /// an exact string match, so each edit costs a read first; 24 edits is
+    /// ~48 turns before anything else happens. Any real multi-file change
+    /// hits this, and the knob that fixes it lives in a config file the user
+    /// has no reason to know exists.
+    ///
+    /// Budget is deliberately not checked here. When one is set, the top of
+    /// the loop already stops the run cleanly at the right moment with the
+    /// right message; extending into that costs nothing and keeps each guard
+    /// doing one job.
+    fn earned_more_turns(&self) -> bool {
+        let threshold = self.policy.escalate_after_repeats;
+        self.repeat_count < threshold && self.error_streak < threshold
     }
 
     pub fn repair_after_interrupt(&mut self) -> bool {
@@ -1144,6 +1203,23 @@ mod tests {
     use super::*;
     use harness_types::ToolCall;
 
+    /// Mirrors `Agent::earned_more_turns` without needing a whole `Agent`:
+    /// the decision is entirely (repeat_count, error_streak, threshold).
+    fn earned_more_turns_from(repeat_count: u32, error_streak: u32, threshold: u32) -> bool {
+        repeat_count < threshold && error_streak < threshold
+    }
+
+    /// Mirrors the loop's extension arithmetic.
+    fn simulate_limit(max_turns: u32, max_extensions: u32, productive: bool) -> u32 {
+        let mut limit = max_turns;
+        let mut extensions = 0;
+        while extensions < max_extensions && productive {
+            extensions += 1;
+            limit += max_turns;
+        }
+        limit
+    }
+
     fn asst_calls(n: usize) -> Message {
         Message {
             role: Role::Assistant,
@@ -1159,6 +1235,35 @@ mod tests {
             tool_call_id: None,
             name: None,
         }
+    }
+
+    /// The measured failure: a run making steady progress, no stall ever
+    /// detected, killed at an arbitrary count with budget to spare. It must
+    /// now be allowed to continue.
+    #[test]
+    fn a_run_that_is_still_getting_somewhere_is_granted_more_turns() {
+        // repeat/error streaks below the escalation threshold == progress.
+        assert!(earned_more_turns_from(0, 0, 2));
+        assert!(earned_more_turns_from(1, 1, 2));
+    }
+
+    /// The case the guard actually exists for. A model asking for the same
+    /// failing calls has not earned more turns, however many it has left.
+    #[test]
+    fn a_run_going_in_circles_is_still_stopped() {
+        assert!(!earned_more_turns_from(2, 0, 2), "repeating: must stop");
+        assert!(!earned_more_turns_from(0, 2, 2), "failing: must stop");
+        assert!(!earned_more_turns_from(5, 5, 2));
+    }
+
+    /// A ceiling still has to exist -- "making progress" is a heuristic, and
+    /// being wrong forever is worse than being wrong for a while.
+    #[test]
+    fn extensions_are_bounded_so_a_wrong_guess_cannot_run_away() {
+        let granted = simulate_limit(60, MAX_TURN_EXTENSIONS, true);
+        assert_eq!(granted, 60 * (1 + MAX_TURN_EXTENSIONS));
+        // A run that never looks productive never gets past the first block.
+        assert_eq!(simulate_limit(60, MAX_TURN_EXTENSIONS, false), 60);
     }
 
     #[test]
