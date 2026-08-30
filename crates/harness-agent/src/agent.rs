@@ -593,6 +593,9 @@ impl Agent {
         self.current_request_start = self.messages.len();
         self.messages.push(Message::user(user_input.to_string()));
         if let Some(t) = &self.tracer {
+            // Rebase first: every figure below is "since this request
+            // started", which is only true if the clock restarts here.
+            t.begin_request();
             t.emit("user_request_received");
         }
 
@@ -626,6 +629,10 @@ impl Agent {
                 self.ui.stopped_for_budget(self.session_cost_usd, budget);
                 checkpoint::push(&mut self.checkpoints, checkpoint);
                 self.persist();
+                if let Some(t) = &self.tracer {
+                    t.emit("session_persistence_completed");
+                    t.emit("final_response_completed");
+                }
                 return Ok(());
             }
 
@@ -650,6 +657,10 @@ impl Agent {
                     .stopped_for_context_limit(estimated_tokens, self.context_window);
                 checkpoint::push(&mut self.checkpoints, checkpoint);
                 self.persist();
+                if let Some(t) = &self.tracer {
+                    t.emit("session_persistence_completed");
+                    t.emit("final_response_completed");
+                }
                 return Ok(());
             }
 
@@ -754,6 +765,9 @@ impl Agent {
                         crate::validation::Nudge::NewCodeNeverRun { created } => {
                             (created, crate::validation::NEW_CODE_NEVER_RUN_NUDGE)
                         }
+                        crate::validation::Nudge::NewCodeNotLinted { created } => {
+                            (created, crate::validation::NEW_CODE_NOT_LINTED_NUDGE)
+                        }
                     };
                     self.ui.validation_required(count);
                     self.messages.push(Message::user(text.to_string()));
@@ -762,6 +776,10 @@ impl Agent {
                 }
                 checkpoint::push(&mut self.checkpoints, checkpoint);
                 self.persist();
+                if let Some(t) = &self.tracer {
+                    t.emit("session_persistence_completed");
+                    t.emit("final_response_completed");
+                }
                 return Ok(());
             }
 
@@ -855,32 +873,29 @@ impl Agent {
         let mut first_token_emitted = false;
         let mut first_visible_emitted = false;
         while let Some(event) = rx.recv().await {
-            if self.tracer.is_some() && !first_token_emitted {
+            if let Some(t) = self.tracer.as_ref()
+                && !first_token_emitted
+            {
                 first_token_emitted = true;
-                self.tracer
-                    .as_ref()
-                    .unwrap()
-                    .emit("first_provider_token_received");
+                t.emit("first_provider_token_received");
             }
             match event? {
                 StreamEvent::TextDelta(t) => {
-                    if self.tracer.is_some() && !first_visible_emitted {
+                    if let Some(t) = self.tracer.as_ref()
+                        && !first_visible_emitted
+                    {
                         first_visible_emitted = true;
-                        self.tracer
-                            .as_ref()
-                            .unwrap()
-                            .emit("first_user_visible_event_emitted");
+                        t.emit("first_user_visible_event_emitted");
                     }
                     saw_text = true;
                     self.ui.assistant_delta(&t);
                 }
                 StreamEvent::ReasoningDelta(r) => {
-                    if self.tracer.is_some() && !first_visible_emitted {
+                    if let Some(t) = self.tracer.as_ref()
+                        && !first_visible_emitted
+                    {
                         first_visible_emitted = true;
-                        self.tracer
-                            .as_ref()
-                            .unwrap()
-                            .emit("first_user_visible_event_emitted");
+                        t.emit("first_user_visible_event_emitted");
                     }
                     self.ui.reasoning_delta(&r);
                 }
@@ -958,8 +973,10 @@ impl Agent {
         }
 
         let results = self.tools.dispatch_many(executable).await;
-        if let Some(t) = &self.tracer {
-            if results.first().is_some() {
+        if let Some(t) = &self.tracer
+            && !results.is_empty()
+        {
+            {
                 t.emit("first_tool_call_completed");
             }
         }
