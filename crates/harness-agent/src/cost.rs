@@ -47,8 +47,8 @@ mod tests {
         // both, and the mirror test in HiveMind-server/test/cost.test.ts.
         assert_eq!(
             harness_config::HOSTED_MARKUP_MULTIPLIER,
-            1.35,
-            "server default is 1.35; reconcile toward the server, it is what moves money"
+            1.15,
+            "server default is 1.15; reconcile toward the server, it is what moves money"
         );
     }
 

@@ -34,7 +34,7 @@ pub struct ModelCatalogEntry {
 /// figure a hosted user sees is wrong by the size of the gap, and the
 /// budget stops at the wrong point. The server is authoritative — it is
 /// what actually moves money — so reconcile toward it.
-pub const HOSTED_MARKUP_MULTIPLIER: f64 = 1.35;
+pub const HOSTED_MARKUP_MULTIPLIER: f64 = 1.15;
 pub const KNOWN_MODELS: &[ModelCatalogEntry] = &[
     ModelCatalogEntry {
         id: "hivemind",
