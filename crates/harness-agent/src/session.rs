@@ -47,6 +47,10 @@ pub struct SessionRecord {
     /// readable and off unless the user explicitly enabled it.
     #[serde(default)]
     pub web_enabled: bool,
+    /// Skill selected when the session was saved. An id a newer or older
+    /// binary no longer ships restores as no skill rather than failing.
+    #[serde(default)]
+    pub active_skill: Option<String>,
     pub messages: Vec<Message>,
     /// Unix seconds. Stored as plain integers to keep this crate free of a
     /// date-time dependency; formatting for humans is the host's business.
@@ -360,6 +364,7 @@ mod tests {
             budget_usd: None,
             session_cost_usd: 0.0,
             web_enabled: false,
+            active_skill: None,
             messages: vec![Message::system("sys"), Message::user("build a thing")],
             created_at: 100,
             updated_at: 100,
@@ -384,6 +389,28 @@ mod tests {
         // Cost must survive: resuming under a budget can't silently hand out
         // a fresh allowance.
         assert!((loaded.session_cost_usd - 0.0421).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_selected_skill_survives_a_round_trip() {
+        let s = store("skill_round_trip");
+        let mut rec = record("skl", "/ws/one");
+        rec.active_skill = Some("code-review".into());
+        s.save(&rec).unwrap();
+
+        assert_eq!(
+            s.load("skl").unwrap().active_skill.as_deref(),
+            Some("code-review")
+        );
+    }
+
+    // A session written before skills existed must still load.
+    #[test]
+    fn a_record_without_the_skill_field_still_loads() {
+        let s = store("skill_default");
+        let rec = record("old", "/ws/one");
+        s.save(&rec).unwrap();
+        assert_eq!(s.load("old").unwrap().active_skill, None);
     }
 
     #[test]

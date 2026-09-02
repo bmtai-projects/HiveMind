@@ -145,6 +145,34 @@ fn stall_step(
     }
 }
 
+/// Assemble the system message from the base prompt plus whatever is
+/// currently switched on.
+///
+/// Order is precedence: the base prompt already ends with project
+/// conventions, which sit last because the nearest instruction wins ties. A
+/// skill is more specific still -- the user picked it for this task -- so it
+/// goes after both that and the web block, which states a capability rather
+/// than competing over how to approach the work.
+///
+/// Pure and free-standing so the ordering can be asserted without building an
+/// [`Agent`], the same reason `stall_step` above is.
+fn compose_system_prompt(
+    base: &str,
+    web_enabled: bool,
+    skill: Option<&crate::skills::Skill>,
+) -> String {
+    let mut prompt = base.to_string();
+    if web_enabled {
+        prompt.push_str("\n\n");
+        prompt.push_str(WEB_SYSTEM_INSTRUCTION);
+    }
+    if let Some(skill) = skill {
+        prompt.push_str("\n\n");
+        prompt.push_str(&skill.prompt_block());
+    }
+    prompt
+}
+
 pub struct Agent {
     client: DeepSeekClient,
     tools: Registry,
@@ -161,6 +189,7 @@ pub struct Agent {
     session_cost_usd: f64,
     web_available: bool,
     web_enabled: bool,
+    active_skill: Option<&'static crate::skills::Skill>,
     web_operations_remaining: u8,
     last_total_tokens: u64,
     context_window: u64,
@@ -282,6 +311,7 @@ impl Agent {
             session_cost_usd: 0.0,
             web_available,
             web_enabled: false,
+            active_skill: None,
             web_operations_remaining: WEB_OPERATIONS_PER_RUN,
             last_total_tokens: 0,
             context_window,
@@ -355,6 +385,7 @@ impl Agent {
     /// rather than forking a new one on every resume.
     pub fn restore(&mut self, record: SessionRecord, store: SessionStore, system_prompt: String) {
         let restored_web_enabled = record.web_enabled;
+        let restored_skill = record.active_skill;
         let mut messages = record.messages;
         match messages.first_mut() {
             Some(first) if first.role == Role::System => {
@@ -385,6 +416,7 @@ impl Agent {
         self.web_enabled = restored_web_enabled && self.web_available;
         self.tools.set_enabled("web_search", self.web_enabled);
         self.tools.set_enabled("web_fetch", self.web_enabled);
+        self.active_skill = restored_skill.as_deref().and_then(crate::skills::find);
         self.refresh_system_prompt();
     }
 
@@ -410,6 +442,7 @@ impl Agent {
             budget_usd: self.budget_usd,
             session_cost_usd: self.session_cost_usd,
             web_enabled: self.web_enabled,
+            active_skill: self.active_skill.map(|s| s.id.clone()),
             messages: self.messages.clone(),
             created_at: p.created_at,
             updated_at: unix_now(),
@@ -489,12 +522,39 @@ impl Agent {
         Ok(())
     }
 
-    fn refresh_system_prompt(&mut self) {
-        let prompt = if self.web_enabled {
-            format!("{}\n\n{}", self.base_system_prompt, WEB_SYSTEM_INSTRUCTION)
-        } else {
-            self.base_system_prompt.clone()
+    /// The skill specializing this session, if any.
+    pub fn active_skill(&self) -> Option<&str> {
+        self.active_skill.map(|s| s.id.as_str())
+    }
+
+    /// Select a skill (or clear it with `None`) for subsequent turns.
+    ///
+    /// Rewrites the system message in place like [`Self::set_web_enabled`],
+    /// so the change lands on the next turn without restarting the session.
+    /// That invalidates a provider-side cached prefix, which is the same
+    /// already-accepted cost web mode pays -- not a new one.
+    ///
+    /// The lookup fails before the assignment, so a bad id leaves whatever
+    /// was already selected in place rather than silently clearing it.
+    pub fn set_skill(&mut self, id: Option<&str>) -> Result<(), String> {
+        self.active_skill = match id {
+            None => None,
+            Some(id) => Some(
+                crate::skills::find(id)
+                    .ok_or_else(|| format!("unknown skill \"{id}\" -- see `hivemind skills`"))?,
+            ),
         };
+        self.refresh_system_prompt();
+        self.persist();
+        Ok(())
+    }
+
+    fn refresh_system_prompt(&mut self) {
+        let prompt = compose_system_prompt(
+            &self.base_system_prompt,
+            self.web_enabled,
+            self.active_skill,
+        );
         match self.messages.first_mut() {
             Some(first) if first.role == Role::System => *first = Message::system(prompt),
             _ => self.messages.insert(0, Message::system(prompt)),
@@ -1296,6 +1356,38 @@ fn forget_if_a_hook_may_have_rewritten_it(workspace: &Workspace, call: &ToolCall
 mod tests {
     use super::*;
     use harness_types::ToolCall;
+
+    const BASE: &str =
+        "identity and rules\n\n<project-instructions>conventions</project-instructions>";
+
+    #[test]
+    fn no_skill_and_no_web_leaves_the_base_prompt_untouched() {
+        assert_eq!(compose_system_prompt(BASE, false, None), BASE);
+    }
+
+    #[test]
+    fn a_skill_is_appended_fenced_and_last() {
+        let skill = crate::skills::find("code-review").expect("ships");
+        let prompt = compose_system_prompt(BASE, true, Some(skill));
+
+        // Conventions come last in the base prompt because the nearest
+        // instruction wins ties; a skill is chosen for the task, so it wins
+        // over both those and the web block.
+        let conventions = prompt.find("</project-instructions>").expect("base kept");
+        let web = prompt.find("<web-mode>").expect("web block present");
+        let active = prompt.find("<active-skill").expect("skill block present");
+        assert!(conventions < web, "web must follow the base prompt");
+        assert!(web < active, "the skill must land after the web block");
+        assert!(prompt.contains("</active-skill>"));
+    }
+
+    #[test]
+    fn the_skill_block_survives_web_being_off() {
+        let skill = crate::skills::find("test-writing").expect("ships");
+        let prompt = compose_system_prompt(BASE, false, Some(skill));
+        assert!(!prompt.contains("<web-mode>"));
+        assert!(prompt.contains("<active-skill id=\"test-writing\""));
+    }
 
     /// Mirrors `Agent::earned_more_turns` without needing a whole `Agent`:
     /// the decision is entirely (repeat_count, error_streak, threshold).
