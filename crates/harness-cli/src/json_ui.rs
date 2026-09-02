@@ -49,6 +49,11 @@ pub enum Command {
     SetWebEnabled {
         enabled: bool,
     },
+    /// Select a skill by id, or clear the active one with `null`/absent.
+    SetSkill {
+        #[serde(default)]
+        skill: Option<String>,
+    },
     Undo {
         n: usize,
     },
@@ -120,7 +125,13 @@ impl JsonUi {
     /// workspace" races as soon as two sessions start at once. `None` when
     /// persistence is off, which a host must treat as "this conversation
     /// will not be resumable" rather than as an error.
-    pub fn emit_ready(&self, session_id: Option<&str>, web_available: bool, web_enabled: bool) {
+    pub fn emit_ready(
+        &self,
+        session_id: Option<&str>,
+        web_available: bool,
+        web_enabled: bool,
+        active_skill: Option<&str>,
+    ) {
         let models: Vec<_> = harness_config::KNOWN_MODELS
             .iter()
             .map(|m| {
@@ -134,12 +145,26 @@ impl JsonUi {
                 })
             })
             .collect();
+        // Same source of truth `set_skill` validates against, so a host can
+        // never be offered a skill the agent would then reject.
+        let skills: Vec<_> = harness_agent::skills::all()
+            .iter()
+            .map(|s| {
+                json!({
+                    "id": s.id,
+                    "name": s.name,
+                    "description": s.description,
+                })
+            })
+            .collect();
         self.emit(json!({
             "type": "ready",
             "models": models,
             "session_id": session_id,
             "web_available": web_available,
             "web_enabled": web_enabled,
+            "skills": skills,
+            "active_skill": active_skill,
         }));
     }
 
@@ -148,6 +173,13 @@ impl JsonUi {
             "type": "web_mode",
             "available": available,
             "enabled": enabled,
+        }));
+    }
+
+    pub fn emit_skill_mode(&self, active_skill: Option<&str>) {
+        self.emit(json!({
+            "type": "skill_mode",
+            "active_skill": active_skill,
         }));
     }
 

@@ -32,7 +32,7 @@ use std::sync::Arc;
 use clap::{Args, Parser, Subcommand};
 use reedline::Signal;
 
-use commands::{BudgetArg, ModelArg, ReasoningArg, SlashCommand, UndoArg, WebArg};
+use commands::{BudgetArg, ModelArg, ReasoningArg, SkillArg, SlashCommand, UndoArg, WebArg};
 use harness_agent::{Agent, Ui};
 use harness_config::CliOverrides;
 use harness_tools::{
@@ -244,6 +244,9 @@ enum Command {
     /// real third-party coding models; BYOK: whatever your provider key
     /// itself supports).
     Models,
+    /// List skills selectable with --skill or `/skill`. Each specializes the
+    /// prompt for one kind of task; none restrict which tools are available.
+    Skills,
     /// List saved sessions for a workspace, newest first, for `--resume`.
     Sessions(SessionsArgs),
     /// Download the latest release for this platform and replace the
@@ -420,6 +423,12 @@ struct ActivateArgs {
     #[arg(long)]
     web: bool,
 
+    /// Start with a skill active, specializing the prompt for one kind of
+    /// task (run `hivemind skills` to list them). Also settable mid-session
+    /// with `/skill`.
+    #[arg(long)]
+    skill: Option<String>,
+
     /// Trace end-to-end latency for this session, writing stage timings to
     /// stderr as they occur. Disabled by default; adds no overhead when off.
     #[arg(long)]
@@ -455,6 +464,14 @@ fn print_model_catalog() {
         );
     }
     println!("Pick with --model <id>, or /model <id> in the REPL.");
+}
+
+fn print_skill_catalog() {
+    println!("Available skills:");
+    for s in harness_agent::skills::all() {
+        println!("  {:<22} {}", s.id, s.description);
+    }
+    println!("Pick with --skill <id>, or /skill <id> in the REPL.");
 }
 
 /// Roughly how long ago, in the coarsest unit that's still informative --
@@ -598,6 +615,10 @@ async fn main() -> anyhow::Result<()> {
         },
         Command::Models => {
             print_model_catalog();
+            Ok(())
+        }
+        Command::Skills => {
+            print_skill_catalog();
             Ok(())
         }
         Command::Sessions(args) => list_sessions(args),
@@ -884,6 +905,9 @@ async fn run(args: ActivateArgs) -> anyhow::Result<()> {
         if args.web {
             agent.set_web_enabled(true).map_err(anyhow::Error::msg)?;
         }
+        if let Some(skill) = &args.skill {
+            agent.set_skill(Some(skill)).map_err(anyhow::Error::msg)?;
+        }
         return run_json_protocol(&mut agent, ws, json_ui).await;
     }
 
@@ -914,6 +938,9 @@ async fn run(args: ActivateArgs) -> anyhow::Result<()> {
         if args.web {
             agent.set_web_enabled(true).map_err(anyhow::Error::msg)?;
         }
+        if let Some(skill) = &args.skill {
+            agent.set_skill(Some(skill)).map_err(anyhow::Error::msg)?;
+        }
         let expanded = mentions::expand_mentions(prompt, &ws);
         agent.run(&expanded).await?;
         return Ok(());
@@ -930,6 +957,9 @@ async fn run(args: ActivateArgs) -> anyhow::Result<()> {
     )?;
     if args.web {
         agent.set_web_enabled(true).map_err(anyhow::Error::msg)?;
+    }
+    if let Some(skill) = &args.skill {
+        agent.set_skill(Some(skill)).map_err(anyhow::Error::msg)?;
     }
 
     repl(&mut agent, ws, ui, args.yolo, update_check, resolved.mode).await
@@ -1044,6 +1074,7 @@ async fn run_json_protocol(
         agent.session_id(),
         agent.web_available(),
         agent.web_enabled(),
+        agent.active_skill(),
     );
     // A fresh session's history is exactly the one system message;
     // emit_history treats that as "nothing to replay" and stays silent, so
@@ -1183,6 +1214,13 @@ async fn run_json_protocol(
                     ui.emit_error(message);
                 }
                 ui.emit_web_mode(agent.web_available(), agent.web_enabled());
+                ui.emit_turn_done();
+            }
+            json_ui::Command::SetSkill { skill } => {
+                if let Err(message) = agent.set_skill(skill.as_deref()) {
+                    ui.emit_error(&message);
+                }
+                ui.emit_skill_mode(agent.active_skill());
                 ui.emit_turn_done();
             }
             json_ui::Command::Undo { n } => {
@@ -1350,6 +1388,19 @@ async fn repl(
                         "invalid web mode {bad:?} — expected /web on, /web off, or /web status"
                     );
                 }
+                SlashCommand::Skill(SkillArg::Show) => match agent.active_skill() {
+                    Some(id) => println!("skill: {id} (clear with /skill off)"),
+                    None => println!("skill: none (see /skill list)"),
+                },
+                SlashCommand::Skill(SkillArg::List) => print_skill_catalog(),
+                SlashCommand::Skill(SkillArg::Off) => {
+                    let _ = agent.set_skill(None);
+                    println!("skill: none");
+                }
+                SlashCommand::Skill(SkillArg::Set(id)) => match agent.set_skill(Some(&id)) {
+                    Ok(()) => println!("skill: {id}"),
+                    Err(message) => println!("{message}"),
+                },
                 SlashCommand::Cost => {
                     println!("session cost so far: ${:.6}", agent.session_cost_usd())
                 }
