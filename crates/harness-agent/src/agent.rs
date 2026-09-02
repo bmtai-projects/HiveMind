@@ -533,6 +533,9 @@ impl Agent {
     /// so the change lands on the next turn without restarting the session.
     /// That invalidates a provider-side cached prefix, which is the same
     /// already-accepted cost web mode pays -- not a new one.
+    ///
+    /// The lookup fails before the assignment, so a bad id leaves whatever
+    /// was already selected in place rather than silently clearing it.
     pub fn set_skill(&mut self, id: Option<&str>) -> Result<(), String> {
         self.active_skill = match id {
             None => None,
