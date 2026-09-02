@@ -12,6 +12,7 @@ pub const COMMAND_NAMES: &[&str] = &[
     "/reasoning",
     "/budget",
     "/web",
+    "/skill",
     "/cost",
     "/undo",
     "/exit",
@@ -29,6 +30,7 @@ Commands:
   /reasoning [level]  show/set reasoning effort for the active model, or `off`
   /budget [amount]   show/set a session USD spend cap, or `off` (default: unbounded)
   /web [on|off]      show or toggle hosted web search (off by default)
+  /skill [id|list|off]  specialize the prompt for one kind of task
   /cost              show session cost so far
   /undo [n]          undo the last n turns (default 1): restores edited/written
                      files and truncates the conversation back to before them
@@ -72,6 +74,13 @@ pub enum WebArg {
     Invalid(String),
 }
 
+pub enum SkillArg {
+    Show,
+    List,
+    Off,
+    Set(String),
+}
+
 pub enum SlashCommand {
     Help,
     Status,
@@ -86,6 +95,7 @@ pub enum SlashCommand {
     Reasoning(ReasoningArg),
     Budget(BudgetArg),
     Web(WebArg),
+    Skill(SkillArg),
     Cost,
     Undo(UndoArg),
     Exit,
@@ -129,6 +139,12 @@ pub fn parse(line: &str) -> Option<SlashCommand> {
             Some("on") => WebArg::On,
             Some("off") => WebArg::Off,
             Some(other) => WebArg::Invalid(other.to_string()),
+        }),
+        "skill" => SlashCommand::Skill(match arg {
+            None | Some("status") => SkillArg::Show,
+            Some("list") => SkillArg::List,
+            Some("off") | Some("none") => SkillArg::Off,
+            Some(id) => SkillArg::Set(id.to_string()),
         }),
         "cost" | "usage" => SlashCommand::Cost,
         "undo" => SlashCommand::Undo(match arg {
@@ -301,6 +317,32 @@ mod tests {
             parse("/web maybe"),
             Some(SlashCommand::Web(WebArg::Invalid(_)))
         ));
+    }
+
+    // Unlike /web, an unrecognized argument is a skill id, not an error --
+    // validation belongs to the catalog, not the parser.
+    #[test]
+    fn skill_takes_an_id_or_one_of_the_reserved_words() {
+        assert!(matches!(
+            parse("/skill"),
+            Some(SlashCommand::Skill(SkillArg::Show))
+        ));
+        assert!(matches!(
+            parse("/skill status"),
+            Some(SlashCommand::Skill(SkillArg::Show))
+        ));
+        assert!(matches!(
+            parse("/skill list"),
+            Some(SlashCommand::Skill(SkillArg::List))
+        ));
+        assert!(matches!(
+            parse("/skill off"),
+            Some(SlashCommand::Skill(SkillArg::Off))
+        ));
+        match parse("/skill code-review") {
+            Some(SlashCommand::Skill(SkillArg::Set(id))) => assert_eq!(id, "code-review"),
+            _ => panic!("an id should parse as Set"),
+        }
     }
 
     #[test]
