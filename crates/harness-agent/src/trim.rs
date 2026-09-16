@@ -27,16 +27,6 @@ pub struct TrimReport {
     pub tokens_saved: u64,
 }
 
-/// Replace the body of large, old tool results until the estimate is back
-/// under target. Returns `None` when nothing needed doing.
-///
-/// `messages[0]` (the system prompt) is never a tool result, so it is safe
-/// by construction rather than by special case.
-/// `current_request_start` is the index the in-flight user request's own
-/// messages begin at (`Agent::run`'s `messages.len()` before it pushed the
-/// user turn). Everything from there on is what the agent is working from
-/// *right now*; see [`elide_span`] for why that is trimmed only as a last
-/// resort.
 pub fn trim_old_tool_results(
     messages: &mut [Message],
     estimated_tokens: u64,
@@ -75,9 +65,6 @@ pub fn trim_old_tool_results(
     // from under the task in flight.
     let (earlier, current) = messages[..cutoff].split_at_mut(boundary);
     state.elide_span(earlier);
-    // Only if that was not enough. Trimming what the current request just
-    // read is what produced the read/evict/re-read spiral, so it happens
-    // only when there is nothing older left to give.
     state.elide_span(current);
 
     (state.elided > 0).then_some(TrimReport {
@@ -112,14 +99,6 @@ impl Elider {
 
             let before = crate::tokens::estimate_message_tokens(m);
             let name = m.name.clone().unwrap_or_else(|| "tool".to_string());
-            // Deliberately not "run it again if you still need it". That
-            // sentence was an instruction, and the model followed it: a
-            // measured session re-read the same two files eleven times,
-            // each re-read evicting the other, until it ran out of turns.
-            // What replaces it says where the output came from (an earlier
-            // request, so probably not this one's concern) and, if it is
-            // needed after all, points at fetching a part rather than
-            // re-running the whole call.
             m.content = format!(
                 "{ELIDED_PREFIX} ~{before} tokens of `{name}` output from an earlier request in \
                  this session, dropped to free context. It is most likely not needed for the \
@@ -144,10 +123,7 @@ mod tests {
         Message::tool_result("call-1", name, "x".repeat(chars))
     }
 
-    /// Most tests here predate run-scoped protection and describe a
-    /// transcript with no request in flight, which is `0`: nothing is
-    /// protected, so both passes see the whole eligible range and the
-    /// result is the same as the single pass they were written against.
+   
     fn trim(m: &mut [Message], estimated: u64, window: u64) -> Option<TrimReport> {
         trim_old_tool_results(m, estimated, window, 0)
     }
@@ -201,16 +177,6 @@ mod tests {
         );
     }
 
-    /// This test previously asserted the exact opposite -- that a ~36k
-    /// transcript on a 1,048,576-token window *must* be trimmed -- and that
-    /// is the behaviour that failed real tasks. It is inverted rather than
-    /// deleted so the record of what changed, and why, survives in the place
-    /// someone will look.
-    ///
-    /// An ordinary multi-file working set on a huge-window model must be
-    /// left completely alone. There is no cost being avoided by trimming
-    /// here: the window is 3% used, the prefix is cached, and the only
-    /// effect is to take away code the agent is actively working from.
     #[test]
     fn an_ordinary_working_set_on_a_huge_window_is_left_alone() {
         let mut m = session(3, 40_000); // ~36k tokens against 1M
@@ -222,11 +188,7 @@ mod tests {
         assert!(m.iter().all(|x| !x.content.starts_with(ELIDED_PREFIX)));
     }
 
-    /// The concrete regression, in the sizes that produced it: `agent.rs`
-    /// (~14.7k tokens) and `main.rs` (~18.6k) held at the same time on the
-    /// default model. Under the old 25k trigger / 15k target this was
-    /// impossible, and the agent re-read the two files against each other
-    /// until it ran out of turns.
+
     #[test]
     fn the_two_files_that_broke_a_real_task_now_fit_together() {
         let mut m = vec![Message::system("sys"), Message::user("go")];
@@ -246,10 +208,6 @@ mod tests {
         );
     }
 
-    /// A single maximal `read_file` must stay a small fraction of the whole
-    /// post-trim budget. When these two constants drifted into equality --
-    /// 60,000 bytes out, a 15,000-token target -- every second large read
-    /// evicted the first.
     #[test]
     fn one_maximal_read_cannot_amount_to_the_whole_budget() {
         let max_result_tokens = tokens_of(harness_tools::MAX_READ_BYTES) as f64;
