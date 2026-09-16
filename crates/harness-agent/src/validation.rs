@@ -1,70 +1,11 @@
-//! One question, asked once per run: *you changed files — did you check
-//! that they work?*
-//!
-//! A run ends the moment the model answers without calling a tool
-//! (`agent.rs`'s `if !has_tool_calls`). Nothing today distinguishes "I read
-//! the code and here's your answer" from "I rewrote four files and I'm
-//! declaring victory without compiling any of them." Both simply end the
-//! turn. This module is the difference: it tracks, per run, whether the
-//! workspace was actually mutated and whether anything has been run to
-//! check it *since* the last mutation, so the loop can push back exactly
-//! once before letting the run finish.
-//!
-//! # Why a nudge and not a hard gate
-//!
-//! The obvious design -- refuse to complete until validation happens -- is
-//! the wrong one here, and expensively so. The harness cannot know what
-//! "validated" means in an arbitrary repository, so a hard gate has a
-//! failure mode with no floor: a model that doesn't know how to satisfy it
-//! keeps trying until `max_turns`, burning a full run's budget to produce
-//! nothing. That is strictly worse than the premature completion it was
-//! meant to prevent. So this fires **once** per run and then gets out of
-//! the way -- the same shape, for the same reason, as the existing
-//! `STALL_NUDGE`/`nudged_this_run` pair in `agent.rs`. Worst case is one
-//! extra turn, bounded and paid once.
-//!
-//! # What this deliberately does not claim
-//!
-//! It does not check that validation *passed*. A model that runs the tests,
-//! sees three failures, and declares success anyway is a real problem, and
-//! not this one -- catching it means understanding arbitrary tool output
-//! well enough to grade it. What is checked here is narrower and fully
-//! decidable from the harness's own records: whether the model *looked*.
+
 
 use std::collections::BTreeSet;
 
 use serde::Deserialize;
 use serde_json::value::RawValue;
 
-/// The tools whose success means the workspace is now different from what
-/// the model last saw checked.
-///
-/// Shared with `checkpoint.rs` rather than duplicated, because the two
-/// features have to agree: a tool that mutates the workspace needs both a
-/// pre-turn snapshot to undo to *and* a check before the run ends, and a
-/// future tool added to one list but not the other would silently get one
-/// half of that.
-///
-/// `run_shell` is not here, and can't be. A shell command's effect on the
-/// workspace is unbounded and invisible from the call site -- `ls` and a
-/// codemod are the same shape from here -- so treating every shell call as
-/// a mutation would make the most common read-only command in the tool set
-/// demand validation of nothing. The cost of that omission is real and
-/// worth stating plainly: work done entirely through `run_shell` is not
-/// tracked as a change by this module, exactly as it is not covered by
-/// `/undo`.
 pub(crate) const MUTATING_TOOLS: [&str; 2] = ["edit_file", "write_file"];
-
-/// Substrings that mean a shell command *compiled or linted* the work.
-///
-/// These prove the code parses and type-checks. They prove nothing about
-/// whether it behaves, which is a different claim and used to be treated as
-/// the same one -- `"check"` sat in the same list as `"test"`, so a run that
-/// only ever executed `cargo check` was recorded as verified. That is not a
-/// hypothetical: a measured run created a new module, ran `cargo check`
-/// twice, never ran a single test, and shipped a bug that made 7 of its 9
-/// features silently stop working after the first request. The harness
-/// agreed the work had been checked.
 const COMPILE_MARKERS: &[&str] = &[
     "check",
     "build",
@@ -76,40 +17,22 @@ const COMPILE_MARKERS: &[&str] = &[
     "audit",
 ];
 
-/// Substrings that mean a shell command ran the project's *linter*.
-///
-/// Split out of the compile class because a project can gate on it
-/// independently: this repository fails `cargo clippy -- -D warnings` on code
-/// that compiles and passes every test, and a generated implementation
-/// shipped exactly that -- `cargo check` and `cargo test` both run, clippy
-/// never, two `unwrap`-after-`is_some` errors left behind. Compiling and
-/// testing are not evidence about lint.
 const LINT_MARKERS: &[&str] = &[
     "clippy", "lint", "eslint", "ruff", "flake8", "rubocop", "vet",
 ];
 
-/// Substrings that mean a shell command actually *ran* the work.
-///
-/// Matching stays deliberately generous, for the same asymmetry as before: a
-/// false positive costs nothing (no nudge, which is what shipped for every
-/// release before this), a false negative costs one wasted turn.
+
 const TEST_MARKERS: &[&str] = &[
     "test", "pytest", "jest", "vitest", "rspec", "phpunit", "gradle", "mvn", "verify",
 ];
 
-/// Extensions that count as source code for the "new code, never run" rule.
-///
-/// A newly created `.md` or `.toml` has nothing to execute, and demanding a
-/// test for one would be the kind of false alarm that teaches people to
-/// ignore the real ones.
+
 const SOURCE_EXTENSIONS: &[&str] = &[
     "rs", "ts", "tsx", "js", "jsx", "py", "go", "java", "rb", "php", "c", "cc", "cpp", "h", "hpp",
     "cs", "swift", "kt", "scala", "sh",
 ];
 
-/// First tokens that mean "I am reading, not checking" -- these never count
-/// as validation however much they look like it. Without this, `cat
-/// test_fixtures.json` and `rm -rf build/` both read as a passing check.
+
 const READ_ONLY_COMMANDS: &[&str] = &[
     "cat", "ls", "head", "tail", "grep", "rg", "find", "cd", "echo", "pwd", "which", "wc", "less",
     "more", "tree", "stat", "file", "rm", "mv", "cp", "mkdir", "touch",
@@ -127,25 +50,12 @@ struct ShellOnly {
     background: bool,
 }
 
-/// Whether a shell command counts as having checked the work.
-///
-/// Background commands never do: `run_shell` with `background: true`
-/// returns before the command has produced a result, so nothing about its
-/// outcome is known at the point it would satisfy the check -- and the
-/// thing most often started that way is a dev server, whose command line
-/// ("npm run build:watch") is exactly the kind of string that would
-/// otherwise match.
+
 fn classify_command(command: &str, background: bool) -> Option<CheckKind> {
     if background {
         return None;
     }
-    // Judged per segment, not on the whole string. Agents overwhelmingly
-    // write `cd repo && cargo check 2>&1 | head -80`, and looking only at
-    // the first token of that sees `cd` -- a read-only command -- and
-    // concludes nothing was checked at all. The measured run that motivated
-    // this module ran exactly two shell commands, and *both* began `cd
-    // HiveMind && ...`, so the original first-token rule scored a run that
-    // compiled twice as having run nothing.
+   
     let lowered = command.trim().to_lowercase();
     let normalized = lowered
         .replace("&&", ";")
@@ -159,17 +69,12 @@ fn classify_command(command: &str, background: bool) -> Option<CheckKind> {
             .split_whitespace()
             .next()
             .unwrap_or_default()
-            // `./scripts/test.sh` and `/usr/bin/ls` should be judged on the
-            // program name, not the path that reached it.
             .rsplit('/')
             .next()
             .unwrap_or_default();
         if READ_ONLY_COMMANDS.contains(&first) {
             continue;
         }
-        // Checked most-specific first. `cargo clippy` contains neither a
-        // test nor a compile marker, and `cargo test` must not be read as a
-        // lint just because some segment mentions one.
         if TEST_MARKERS.iter().any(|m| segment.contains(m)) {
             return Some(CheckKind::Tested);
         }
@@ -199,28 +104,12 @@ fn is_source_file(path: &str) -> bool {
         .is_some_and(|ext| SOURCE_EXTENSIONS.contains(&ext.to_lowercase().as_str()))
 }
 
-/// What one run has done to the workspace, and how hard anyone has looked
-/// at it since.
-///
-/// Scoped to a single `run()` -- one user request -- and reset at its top.
-/// A check that ran in answer to an earlier request says nothing about files
-/// changed in this one.
+
 #[derive(Default)]
 pub(crate) struct RunLedger {
     /// Workspace-relative paths successfully mutated this run.
     changed: BTreeSet<String>,
-    /// Paths *created* this run that look like source code. Tracked apart
-    /// from `changed` because new code carries a claim an edit does not:
-    /// nothing has ever executed it, so "it compiles" is a much weaker
-    /// statement about it than about a two-line change to a tested file.
     created_source: BTreeSet<String>,
-    /// Which claims have been made since the last mutation. Tracked
-    /// independently rather than as one "strongest" value, because they are
-    /// not a ladder: `cargo test` passing says nothing about whether clippy
-    /// would, and collapsing them loses the fact that a linter ran as soon
-    /// as anything stronger follows it. All three reset on every mutation,
-    /// so ordering is what this measures -- testing and *then* editing
-    /// leaves the edit unchecked.
     compiled: bool,
     linted: bool,
     tested: bool,
@@ -255,20 +144,6 @@ impl RunLedger {
     fn anything_ran(&self) -> bool {
         self.compiled || self.linted || self.tested
     }
-
-    /// Folds one completed tool call into the ledger.
-    ///
-    /// `created` carries the paths the tool reported creating, taken from
-    /// `ToolResult::changed_files` rather than guessed from arguments --
-    /// `write_file` already reports `FileChangeKind::Created`, and that is
-    /// the only way to tell a brand-new module from a rewrite of an existing
-    /// one.
-    ///
-    /// `failed` is used differently for the two cases on purpose. A failed
-    /// `edit_file` wrote nothing, so it is not a change to answer for. A
-    /// failed `cargo test` is still a test run -- arguably the most valuable
-    /// kind -- so it counts regardless: the model looked, and what it saw is
-    /// now in its context.
     pub(crate) fn record(&mut self, tool: &str, args: &RawValue, failed: bool, created: &[String]) {
         if MUTATING_TOOLS.contains(&tool) {
             if failed {
@@ -297,19 +172,11 @@ impl RunLedger {
         }
     }
 
-    /// How many files are changed and entirely unchecked, or `None` when the
-    /// run has nothing to answer for on that count.
+   
     pub(crate) fn unchecked_change_count(&self) -> Option<usize> {
         (!self.changed.is_empty() && !self.anything_ran()).then_some(self.changed.len())
     }
 
-    /// The whole policy, in one place: what to say when a run tries to end,
-    /// or `None` to let it finish.
-    ///
-    /// Kept here rather than inline at the call site so the part with a
-    /// decision in it -- *including* the one-shot rule, which is the half
-    /// that makes this safe -- is testable without standing up a provider to
-    /// drive the loop.
     pub(crate) fn nudge_now(&self, already_nudged: bool) -> Option<Nudge> {
         if already_nudged {
             return None;
@@ -317,11 +184,7 @@ impl RunLedger {
         if let Some(changed) = self.unchecked_change_count() {
             return Some(Nudge::NothingRan { changed });
         }
-        // New code that was compiled but never executed. Compiling proves it
-        // parses; it proves nothing about the behaviour the run was asked
-        // for, and this is exactly the gap a measured run fell through --
-        // `cargo check` twice, no tests, a bug that disabled 7 of 9 features
-        // after the first request.
+       
         if self.created_source.is_empty() {
             return None;
         }
@@ -330,9 +193,7 @@ impl RunLedger {
                 created: self.created_source.len(),
             });
         }
-        // Tested but never linted. A separate claim: this repository fails
-        // `cargo clippy -- -D warnings` on code that compiles and passes
-        // every test, and a generated implementation shipped exactly that.
+        
         if !self.linted {
             return Some(Nudge::NewCodeNotLinted {
                 created: self.created_source.len(),
@@ -342,12 +203,7 @@ impl RunLedger {
     }
 }
 
-/// Delivered once per run, when a run that changed files tries to end
-/// without running anything at all.
-///
-/// Written the same way as `STALL_NUDGE`: as instructions rather than an
-/// accusation, and with an explicit way out. The escape hatch in the last
-/// line is not politeness -- it is what keeps this from being a trap.
+
 pub(crate) const NOTHING_RAN_NUDGE: &str = "\
 <harness-note>
 You changed files in this task but have not run anything that checks them.
@@ -361,21 +217,7 @@ Before finishing:
   in one sentence and finish. Do not invent a command to satisfy this note.
 </harness-note>";
 
-/// Delivered once per run, when new source files were written and only
-/// compiled -- never executed.
-///
-/// Deliberately *not* offering the "if nothing applies, say so" escape the
-/// note above offers. That out exists for a repo with nothing to run; this
-/// note only fires when the run has already successfully run a compile step,
-/// which means a toolchain exists and the same toolchain can run tests. The
-/// honest answer here is almost never "nothing applies", so offering it
-/// would mostly be offering a way to skip the work.
-///
-/// It asks for one specific thing -- exercise it twice -- because that is
-/// what the failure it was built from needed. The module in question latched
-/// its state on the first call and went silent for every request after it;
-/// any test that invoked it a second time would have failed instantly, and
-/// no test that invoked it once ever could.
+
 pub(crate) const NEW_CODE_NEVER_RUN_NUDGE: &str = "\
 <harness-note>
 You wrote new code and compiled it, but nothing has executed it. Compiling
@@ -390,16 +232,7 @@ Before finishing:
   not finishing.
 </harness-note>";
 
-/// Delivered once per run, when new source was written and tested but the
-/// project's linter never ran over it.
-///
-/// A distinct claim from the note above, and deliberately gentler: whether a
-/// project has a linter at all is genuinely project-dependent in a way that
-/// "can you run this after compiling it" is not, so this one does offer a
-/// way out. It exists because a generated implementation ran `cargo check`
-/// and `cargo test`, never `cargo clippy`, and left two
-/// `unwrap`-after-`is_some` errors in a repository that gates on
-/// `-D warnings`.
+
 pub(crate) const NEW_CODE_NOT_LINTED_NUDGE: &str = "\
 <harness-note>
 You wrote new code and ran its tests, but the project's linter has not seen
@@ -466,9 +299,7 @@ mod tests {
         assert_eq!(l.unchecked_change_count(), None);
     }
 
-    /// The ordering case a per-turn "did anything get tested?" flag gets
-    /// wrong, and the whole reason the flag is cleared by mutation rather
-    /// than set once per run.
+   
     #[test]
     fn checking_before_the_last_edit_does_not_count() {
         let mut l = RunLedger::default();
@@ -640,10 +471,6 @@ mod tests {
         assert_eq!(classify_command("cd repo && ls build/", false), None);
     }
 
-    /// The exact run this rule was built from: a new module written,
-    /// `cargo check` run twice, no test ever executed. The old single-class
-    /// marker list called that validated, and the bug it hid disabled 7 of
-    /// the feature's 9 stages after the first request.
     #[test]
     fn new_code_that_was_only_compiled_is_still_asked_for_a_test() {
         let mut l = RunLedger::default();
@@ -718,10 +545,7 @@ mod tests {
         assert_eq!(l.nudge_now(false), None);
     }
 
-    /// Tested is the stronger claim and must not be undone by a later
-    /// compile-only command.
-    /// The claims are independent, not a ladder: a later `cargo fmt` must
-    /// not erase the fact that tests and clippy already ran.
+ 
     #[test]
     fn a_compile_after_a_test_does_not_un_run_the_test() {
         let mut l = RunLedger::default();
