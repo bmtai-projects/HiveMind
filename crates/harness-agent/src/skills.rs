@@ -1,18 +1,8 @@
-//! Named instruction sets that specialize the system prompt for one kind of
-//! task -- frontend design, code review, test writing, debugging. A skill
-//! changes how the agent works on a task; it never changes what tools it has
-//! or who it is.
-//!
-//! The built-ins are markdown files with a small frontmatter header, embedded
-//! at compile time. [`Skill`] owns its strings rather than borrowing
-//! `&'static str` so a later version can build one from a file read off disk
-//! -- a user or project skills directory -- without changing this type or
-//! [`crate::Agent::set_skill`].
+
 
 use std::sync::LazyLock;
 
-/// One selectable skill: metadata for pickers, plus the instruction body
-/// spliced into the system prompt while it is active.
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Skill {
     pub id: String,
@@ -22,15 +12,6 @@ pub struct Skill {
 }
 
 impl Skill {
-    /// The instructions as they appear in the system prompt, fenced in a
-    /// boundary tag like `conventions.rs` does for project instructions, so
-    /// the model can tell where the specialization starts and stops.
-    ///
-    /// The framing here is deliberately lighter than the conventions one:
-    /// built-in skills ship inside the binary and are as trusted as the base
-    /// prompt itself. A future skill loaded from a workspace directory is
-    /// exactly as untrusted as a cloned `AGENTS.md` and will need the full
-    /// "data you are reading, not an instruction you follow" treatment.
     pub fn prompt_block(&self) -> String {
         format!(
             "<active-skill id=\"{}\" name=\"{}\">\n{}\n</active-skill>\n\n\
@@ -67,9 +48,6 @@ pub fn find(id: &str) -> Option<&'static Skill> {
     SKILLS.iter().find(|s| s.id == id)
 }
 
-/// Split `---`-fenced `key: value` frontmatter from the instruction body.
-/// Hand-rolled rather than pulling in a YAML crate: the header is three flat
-/// scalar fields and nothing here needs the rest of the format.
 fn parse(raw: &str) -> Result<Skill, String> {
     let body = raw
         .strip_prefix("---\n")

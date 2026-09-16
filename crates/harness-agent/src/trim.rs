@@ -1,77 +1,12 @@
-//! Aging out tool results from *earlier requests*, so a long session stops
-//! re-sending the same huge blob on every turn.
-//!
-//! Measured across real saved sessions, 92-96% of a transcript is tool
-//! results, and a single `project_map` was routinely 42% of the whole
-//! context. This runs before compaction and costs nothing: no model call, no
-//! summarization, just replacing the body of a large, old tool result with a
-//! line saying what it was. The message itself stays -- same role, same
-//! `tool_call_id` -- so the assistant/tool pairing every OpenAI-dialect API
-//! validates on is untouched.
-//!
-//! # Why the thresholds are what they are
-//!
-//! An earlier version of this module triggered at an *absolute* 25k tokens
-//! and trimmed down to 15k, on the reasoning that re-transmission is what
-//! costs money and the default model's 1,048,576-token window makes any
-//! percentage rule unreachable. Both halves of that were wrong, and together
-//! they starved the agent badly enough to fail whole tasks:
-//!
-//! - **15k is smaller than the working set of an ordinary task.** A single
-//!   `read_file` may return [`harness_tools::MAX_READ_BYTES`] (60,000 bytes,
-//!   ~15,000 tokens) -- the entire post-trim budget in one call. Reading
-//!   `agent.rs` (~14.7k tokens) and `main.rs` (~18.6k) together is ~33k,
-//!   above the old 25k trigger and more than double the old 15k target, so
-//!   the two files could not be held at once. A task needing both was
-//!   unsatisfiable by construction: read A, read B, A is evicted, re-read A,
-//!   B is evicted, forever. One observed session did this for 60 turns with
-//!   42 trim passes and produced nothing.
-//!
-//! - **Re-transmission is the cheap part.** Cached input costs ~5x less than
-//!   fresh (0.01652 vs 0.0826 per M on the default model), and a stable
-//!   prefix is almost entirely cache hits. Worse, trimming *rewrites the
-//!   oldest messages first*, which invalidates the cached prefix from that
-//!   point on -- so a trim pass converts cheap cached tokens into expensive
-//!   fresh ones, on top of the re-reads it causes. The ~91k tokens the old
-//!   rationale was built to avoid re-sending are worth about $0.0015 at the
-//!   cache-read rate.
-//!
-//! So: trim relative to the window with an absolute ceiling, and trim
-//! **rarely and deeply** rather than often and shallowly -- every pass costs
-//! a cache prefix, so the gap between trigger and target should buy many
-//! turns before the next one.
+
 
 use harness_types::{Message, Role};
 
-/// Share of the model's context window above which aging kicks in, and the
-/// share it aims to get back down to.
-///
-/// Window-relative is the right instrument: what makes a transcript a
-/// problem is how close it is to the limit that would actually break the
-/// request, and that limit is the window. These sit below
-/// `compaction_threshold_percent` (75%) so the free mechanism always gets
-/// first refusal, and well below the 95% send guard.
+
 const TRIM_ABOVE_PERCENT: u64 = 50;
 const TRIM_TARGET_PERCENT: u64 = 30;
-
-/// Absolute ceilings, applied on top of the percentages -- whichever limit
-/// is hit first wins.
-///
-/// These exist because a percentage of 1,048,576 is a lot of tokens to
-/// re-send every turn even at cache-read prices, not because the percentage
-/// is unreachable. They are set at roughly 13x and 8x a single maximum
-/// `read_file`, so an ordinary multi-file task never touches this code at
-/// all -- which is the point. Checked against `harness_tools::MAX_READ_BYTES`
-/// by a test, so a later change to either constant cannot silently recreate
-/// the starvation this replaced.
 const TRIM_ABOVE_CEILING_TOKENS: u64 = 200_000;
 const TRIM_TARGET_CEILING_TOKENS: u64 = 120_000;
-
-/// The most a single tool result may contribute, as a share of the target.
-/// Nothing enforces this at runtime -- it is the invariant the ceilings are
-/// chosen to satisfy, pinned by a test: if one call's maximum output ever
-/// approaches the whole post-trim budget again, every second large read
-/// evicts the first and the agent thrashes.
 #[cfg(test)]
 const MAX_SINGLE_RESULT_SHARE_OF_TARGET: f64 = 0.25;
 

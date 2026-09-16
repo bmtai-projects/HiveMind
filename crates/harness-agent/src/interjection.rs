@@ -1,29 +1,7 @@
-//! Mid-turn steering: messages the user sends *while* the agent is already
-//! working.
-//!
-//! Without this, a long multi-step turn is all-or-nothing — watching it head
-//! the wrong way at step 5 leaves only "kill it and start over", which throws
-//! away every tool result already paid for. A queued interjection instead
-//! reaches the model at the next turn boundary, so the work so far survives
-//! and the model gets to weigh the new instruction against what it was
-//! already doing.
-//!
-//! Delivery is deliberately *not* immediate. [`crate::Agent`] drains this at
-//! the top of its turn loop — the same single safe point budget enforcement
-//! uses — never mid-stream and never between an assistant's `tool_calls` and
-//! their results (which would be an invalid transcript, rejected outright by
-//! an OpenAI-dialect API).
+
 
 use std::sync::{Arc, Mutex};
-
-/// Per-message ceiling before truncation. A pasted stack trace or file dump
-/// shouldn't be able to blow out the context window from a side channel that
-/// bypasses the normal input path.
 const MAX_INTERJECTION_CHARS: usize = 25_000;
-
-/// A cheaply-cloneable handle to one agent's pending interjections. Clones
-/// share the same queue, so a host can hand one to an input task and keep
-/// another for itself.
 #[derive(Clone, Default)]
 pub struct InterjectionQueue {
     pending: Arc<Mutex<Vec<String>>>,
@@ -34,10 +12,6 @@ impl InterjectionQueue {
         Self::default()
     }
 
-    /// Queue a message for delivery at the next turn boundary. Returns
-    /// `false` for blank input (nothing queued) so a caller can tell an
-    /// accidental bare Enter from a real instruction — the CLI uses exactly
-    /// that to distinguish "interject" from "abort".
     pub fn push(&self, text: impl Into<String>) -> bool {
         let text = text.into();
         if text.trim().is_empty() {
@@ -59,11 +33,6 @@ impl InterjectionQueue {
         self.lock().clear();
     }
 
-    /// Take everything pending and render it as a single user message, or
-    /// `None` when nothing is queued. One message rather than one per
-    /// interjection: the framing sentence only needs saying once, and fewer
-    /// history entries keeps the transcript (and every future prompt that
-    /// replays it) smaller.
     pub fn drain_formatted(&self) -> Option<String> {
         let drained: Vec<String> = self.lock().drain(..).collect();
         if drained.is_empty() {
@@ -86,9 +55,6 @@ impl InterjectionQueue {
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Vec<String>> {
-        // Poisoning would mean a panic while holding the lock; the queue is
-        // plain data with no invariant to corrupt, so recovering is strictly
-        // better than propagating a panic into the agent loop.
         self.pending.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
