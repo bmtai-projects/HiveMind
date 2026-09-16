@@ -1,8 +1,3 @@
-//! The sample↔tools agent loop, with compaction, cost-aware escalation off
-//! the cheap default, and optional budget enforcement. Analogue of
-//! grok-build's session driver (`xai-grok-shell`) + `xai-grok-agent`'s
-//! policy bundle.
-
 mod agent;
 mod checkpoint;
 mod compaction;
