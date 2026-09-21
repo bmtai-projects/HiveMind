@@ -455,11 +455,16 @@ mod tests {
     async fn envelope_reaches_the_hook_on_stdin() {
         // Round-trip: a hook that greps its own stdin for the tool name
         // denies only if the envelope was actually delivered correctly.
-        let hooks = vec![spec(
-            HookEvent::PreToolUse,
-            None,
-            r#"grep -q '"tool_name":"run_shell"' && exit 2 || exit 0"#,
-        )];
+        // `grep`'s single-quoted pattern is bash syntax -- cmd.exe doesn't
+        // strip single quotes at all, so they'd become part of a pattern
+        // that can never match. `findstr` is cmd's built-in equivalent and
+        // needs no quoting for a plain substring.
+        #[cfg(windows)]
+        let command = r#"findstr "run_shell" >nul && exit 2 || exit 0"#;
+        #[cfg(not(windows))]
+        let command = r#"grep -q '"tool_name":"run_shell"' && exit 2 || exit 0"#;
+
+        let hooks = vec![spec(HookEvent::PreToolUse, None, command)];
         let decision = run_pre_tool_use(
             &hooks,
             &call("run_shell", serde_json::json!({"command":"ls"})),
@@ -474,17 +479,22 @@ mod tests {
         // Two hooks: the first denies. If the second ran too, we couldn't
         // tell from this assertion alone, so pair it with a distinct
         // reason check to prove which one actually fired.
+        // Same reasoning as `ECHO_JSON_DENY` above: no surrounding single
+        // quotes, since cmd.exe wouldn't strip them the way bash does.
+        #[cfg(windows)]
+        let (first, second) = (
+            r#"echo {"decision":"deny","reason":"first"}"#,
+            r#"echo {"decision":"deny","reason":"second"}"#,
+        );
+        #[cfg(not(windows))]
+        let (first, second) = (
+            r#"echo '{"decision":"deny","reason":"first"}'"#,
+            r#"echo '{"decision":"deny","reason":"second"}'"#,
+        );
+
         let hooks = vec![
-            spec(
-                HookEvent::PreToolUse,
-                None,
-                r#"echo '{"decision":"deny","reason":"first"}'"#,
-            ),
-            spec(
-                HookEvent::PreToolUse,
-                None,
-                r#"echo '{"decision":"deny","reason":"second"}'"#,
-            ),
+            spec(HookEvent::PreToolUse, None, first),
+            spec(HookEvent::PreToolUse, None, second),
         ];
         let decision =
             run_pre_tool_use(&hooks, &call("run_shell", serde_json::json!({})), ".").await;

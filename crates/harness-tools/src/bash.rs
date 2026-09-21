@@ -402,7 +402,13 @@ pub fn shell_command(command: &str) -> Command {
     #[cfg(windows)]
     {
         let mut cmd = Command::new("cmd");
-        cmd.arg("/C").arg(command);
+        // Plain `.arg(command)` applies `CommandLineToArgvW` escaping (e.g.
+        // backslash-escaping embedded `"`), but `cmd.exe /C` parses its
+        // remainder with its own, different rules -- so escaped quotes
+        // arrive mangled. `raw_arg` appends the text verbatim, which is what
+        // `/C`'s own parser expects.
+        cmd.arg("/C");
+        cmd.raw_arg(command);
         cmd
     }
 
@@ -446,17 +452,14 @@ pub fn strip_verbatim(path: &Path) -> PathBuf {
     #[cfg(windows)]
     {
         use std::path::{Component, Prefix};
-        if let Some(Component::Prefix(p)) = path.components().next() {
-            match p.kind() {
-                Prefix::VerbatimDisk(drive) => {
-                    let rest: PathBuf = path.components().skip(1).collect();
-                    return PathBuf::from(format!("{}:\\", drive as char)).join(rest);
-                }
-                // A verbatim UNC share (`\\?\UNC\server\share`) has no plain
-                // equivalent that gains anything, so it's left alone.
-                _ => {}
-            }
+        if let Some(Component::Prefix(p)) = path.components().next()
+            && let Prefix::VerbatimDisk(drive) = p.kind()
+        {
+            let rest: PathBuf = path.components().skip(1).collect();
+            return PathBuf::from(format!("{}:\\", drive as char)).join(rest);
         }
+        // A verbatim UNC share (`\\?\UNC\server\share`) has no plain
+        // equivalent that gains anything, so it's left alone.
         path.to_path_buf()
     }
 
@@ -595,10 +598,16 @@ mod tests {
             .summary;
         assert!(out.contains("hello"), "{out}");
 
+        // `;` is a bash separator, not a cmd.exe one -- under `cmd /C` it
+        // would be swallowed as a literal argument and `exit 3` would never
+        // run, so the two shells need their own command strings here.
+        #[cfg(windows)]
+        let fail_command = "echo oops 1>&2 & exit 3";
+        #[cfg(not(windows))]
+        let fail_command = "echo oops >&2; exit 3";
+
         let failed = bash()
-            .execute(&args(
-                serde_json::json!({"command": "echo oops >&2; exit 3"}),
-            ))
+            .execute(&args(serde_json::json!({"command": fail_command})))
             .await
             .unwrap()
             .summary;

@@ -259,11 +259,15 @@ fn collect_stats(root: &Path, strip_base: &Path) -> Vec<FileStat> {
                 .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
                 .map(|d| d.as_nanos())
                 .unwrap_or(0);
+            // Normalize to forward slashes so indexed paths compare equal
+            // regardless of platform -- `in_scope` and the fingerprint both
+            // depend on this being stable text, not a raw OS path render.
             let rel = p
                 .strip_prefix(strip_base)
                 .unwrap_or(&p)
                 .display()
-                .to_string();
+                .to_string()
+                .replace('\\', "/");
             Some(FileStat {
                 path: p,
                 rel,
@@ -550,7 +554,8 @@ impl Tool for SemanticSearch {
                         .strip_prefix(&strip_base)
                         .unwrap_or(&resolved)
                         .display()
-                        .to_string(),
+                        .to_string()
+                        .replace('\\', "/"),
                 )
             }
             _ => None,
