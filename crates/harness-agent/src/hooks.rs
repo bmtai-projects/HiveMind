@@ -6,7 +6,6 @@ use harness_types::ToolCall;
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 
-
 const MAX_PAYLOAD_BYTES: usize = 128 * 1024;
 
 /// Matches Claude Code's own hook convention (and grok-build's), so a hook
@@ -121,7 +120,6 @@ async fn run_one(
         return on_failure(spec, "hook input could not be serialized");
     };
 
-
     let mut cmd = harness_tools::shell_command(&spec.command);
 
     cmd.current_dir(harness_tools::strip_verbatim(std::path::Path::new(
@@ -150,7 +148,6 @@ async fn run_one(
 
     parse_decision(spec, &output)
 }
-
 
 fn on_failure(spec: &HookSpec, what_went_wrong: &str) -> HookDecision {
     if !spec.enforcement {
@@ -231,7 +228,6 @@ mod tests {
         }
     }
 
-
     #[cfg(windows)]
     const SLEEP_LONGER_THAN_ANY_TIMEOUT: &str = "ping -n 6 127.0.0.1 > nul";
     #[cfg(not(windows))]
@@ -299,8 +295,6 @@ mod tests {
         );
     }
 
-   
-
     #[tokio::test]
     async fn an_enforcement_hook_that_succeeds_still_allows() {
         let decision = run_pre_tool_use(
@@ -318,7 +312,6 @@ mod tests {
 
     #[tokio::test]
     async fn a_broken_enforcement_hook_denies_instead_of_failing_open() {
-       
         let decision = run_pre_tool_use(
             &[enforcing("exit 17")],
             &call("run_shell", serde_json::json!({})),
@@ -412,11 +405,16 @@ mod tests {
     async fn envelope_reaches_the_hook_on_stdin() {
         // Round-trip: a hook that greps its own stdin for the tool name
         // denies only if the envelope was actually delivered correctly.
-        let hooks = vec![spec(
-            HookEvent::PreToolUse,
-            None,
-            r#"grep -q '"tool_name":"run_shell"' && exit 2 || exit 0"#,
-        )];
+        // `grep`'s single-quoted pattern is bash syntax -- cmd.exe doesn't
+        // strip single quotes at all, so they'd become part of a pattern
+        // that can never match. `findstr` is cmd's built-in equivalent and
+        // needs no quoting for a plain substring.
+        #[cfg(windows)]
+        let command = r#"findstr "run_shell" >nul && exit 2 || exit 0"#;
+        #[cfg(not(windows))]
+        let command = r#"grep -q '"tool_name":"run_shell"' && exit 2 || exit 0"#;
+
+        let hooks = vec![spec(HookEvent::PreToolUse, None, command)];
         let decision = run_pre_tool_use(
             &hooks,
             &call("run_shell", serde_json::json!({"command":"ls"})),
@@ -428,17 +426,25 @@ mod tests {
 
     #[tokio::test]
     async fn first_denying_hook_short_circuits_later_ones() {
+        // Two hooks: the first denies. If the second ran too, we couldn't
+        // tell from this assertion alone, so pair it with a distinct
+        // reason check to prove which one actually fired.
+        // Same reasoning as `ECHO_JSON_DENY` above: no surrounding single
+        // quotes, since cmd.exe wouldn't strip them the way bash does.
+        #[cfg(windows)]
+        let (first, second) = (
+            r#"echo {"decision":"deny","reason":"first"}"#,
+            r#"echo {"decision":"deny","reason":"second"}"#,
+        );
+        #[cfg(not(windows))]
+        let (first, second) = (
+            r#"echo '{"decision":"deny","reason":"first"}'"#,
+            r#"echo '{"decision":"deny","reason":"second"}'"#,
+        );
+
         let hooks = vec![
-            spec(
-                HookEvent::PreToolUse,
-                None,
-                r#"echo '{"decision":"deny","reason":"first"}'"#,
-            ),
-            spec(
-                HookEvent::PreToolUse,
-                None,
-                r#"echo '{"decision":"deny","reason":"second"}'"#,
-            ),
+            spec(HookEvent::PreToolUse, None, first),
+            spec(HookEvent::PreToolUse, None, second),
         ];
         let decision =
             run_pre_tool_use(&hooks, &call("run_shell", serde_json::json!({})), ".").await;

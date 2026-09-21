@@ -105,7 +105,10 @@ mod tests {
             .filter_map(|p| {
                 p.strip_prefix(root)
                     .ok()
-                    .map(|r| r.to_string_lossy().into_owned())
+                    // `walk_files` correctly returns platform-native
+                    // `PathBuf`s; this test's own assertions are written
+                    // with forward slashes, so normalize only here.
+                    .map(|r| r.to_string_lossy().replace('\\', "/"))
             })
             .collect();
         v.sort();

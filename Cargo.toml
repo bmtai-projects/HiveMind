@@ -6,6 +6,7 @@ members = [
     "crates/harness-provider",
     "crates/harness-tools",
     "crates/harness-agent",
+    "crates/harness-review",
     "crates/harness-cli",
 ]
 
@@ -22,6 +23,7 @@ harness-config = { path = "crates/harness-config" }
 harness-provider = { path = "crates/harness-provider" }
 harness-tools = { path = "crates/harness-tools" }
 harness-agent = { path = "crates/harness-agent" }
+harness-review = { path = "crates/harness-review" }
 
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "signal", "time", "io-util", "io-std", "sync", "fs"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
@@ -38,6 +40,7 @@ rand = "0.9"
 reedline = "0.38"
 walkdir = "2"
 open = "5"
+sha2 = "0.11"
 
 [profile.release]
 opt-level = 3

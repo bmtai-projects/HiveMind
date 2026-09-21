@@ -15,6 +15,7 @@ harness-config = { workspace = true }
 harness-provider = { workspace = true }
 harness-tools = { workspace = true }
 harness-agent = { workspace = true }
+harness-review = { workspace = true }
 tokio = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
