@@ -629,8 +629,10 @@ name = "harness-agent"
 version = "1.9.9"
 dependencies = [
  "anyhow",
+ "async-trait",
  "harness-config",
  "harness-provider",
+ "harness-review",
  "harness-tools",
  "harness-types",
  "serde",
@@ -648,6 +650,7 @@ dependencies = [
  "harness-agent",
  "harness-config",
  "harness-provider",
+ "harness-review",
  "harness-tools",
  "harness-types",
  "open",
@@ -691,6 +694,7 @@ dependencies = [
 name = "harness-review"
 version = "1.9.9"
 dependencies = [
+ "async-trait",
  "serde",
  "serde_json",
  "sha2",

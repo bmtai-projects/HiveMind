@@ -262,6 +262,25 @@ impl GitRepository {
         &self.root
     }
 
+    /// Resolve two revision names once and return their immutable merge-base
+    /// commit. CLI `--base` uses this before acquiring a range so review
+    /// semantics match a pull request's changed side rather than every
+    /// commit that happens to exist on the named branch.
+    pub fn merge_base(&self, base: &str, head: &str) -> Result<String, ReviewError> {
+        let base = self.resolve_revision(base)?;
+        let head = self.resolve_revision(head)?;
+        let output = self.git(&["merge-base", &base, &head], GIT_METADATA_LIMIT)?;
+        let oid = std::str::from_utf8(&output.stdout)
+            .map_err(|_| ReviewError::Parse("Git returned a non-UTF-8 merge base".into()))?
+            .trim();
+        if oid.len() < 40 || !oid.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(ReviewError::Parse(format!(
+                "Git returned an invalid merge-base object ID {oid:?}"
+            )));
+        }
+        Ok(oid.to_string())
+    }
+
     pub fn acquire(
         &self,
         target: ReviewTarget,
@@ -1351,6 +1370,41 @@ mod tests {
         assert_eq!(diff.files.len(), 1);
         assert_eq!(diff.files[0].path, "tracked.txt");
         assert!(diff.files[0].patch.contains("+side"));
+    }
+
+    #[test]
+    fn merge_base_resolves_diverged_branches_to_one_immutable_oid() {
+        let Some(dir) = repository() else { return };
+        let original_branch = Command::new("git")
+            .args(["branch", "--show-current"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        let original_branch = String::from_utf8(original_branch.stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+        run(dir.path(), &["branch", "base"]);
+        std::fs::write(dir.path().join("tracked.txt"), "feature\n").unwrap();
+        run(dir.path(), &["add", "tracked.txt"]);
+        run(dir.path(), &["commit", "--quiet", "-m", "feature"]);
+        run(dir.path(), &["switch", "--quiet", "base"]);
+        std::fs::write(dir.path().join("base-only.txt"), "base\n").unwrap();
+        run(dir.path(), &["add", "base-only.txt"]);
+        run(dir.path(), &["commit", "--quiet", "-m", "base"]);
+
+        let repo = GitRepository::open(dir.path()).unwrap();
+        let merge_base = repo.merge_base(&original_branch, "HEAD").unwrap();
+        assert_eq!(merge_base.len(), 40);
+        let expected = Command::new("git")
+            .args(["rev-parse", &format!("{original_branch}~1")])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert_eq!(
+            merge_base,
+            String::from_utf8(expected.stdout).unwrap().trim()
+        );
     }
 
     #[test]
