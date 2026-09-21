@@ -20,10 +20,16 @@ use serde::Deserialize;
 /// REPL session's lifetime, not disk space.
 pub const MAX_CHECKPOINTS: usize = 20;
 
-/// The two tool names that participate in checkpointing. Matches
-/// grok-build's own scope exactly: shell-driven file changes aren't
-/// checkpointed there either — only the dedicated file-edit tools.
-const MUTATING_TOOLS: [&str; 2] = ["edit_file", "write_file"];
+/// The tool names that participate in checkpointing. Matches grok-build's
+/// own scope exactly: shell-driven file changes aren't checkpointed there
+/// either — only the dedicated file-edit tools.
+///
+/// Defined in `validation` and shared rather than kept per-module: the same
+/// list decides what `/undo` can restore, what has to be checked before a
+/// run ends, and which files a compaction summary reports — and a tool
+/// added to one copy but not the others would get some fraction of that
+/// silently.
+use crate::validation::MUTATING_TOOLS;
 
 #[derive(Deserialize)]
 struct PathOnly {

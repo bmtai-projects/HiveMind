@@ -37,18 +37,10 @@ mod tests {
 
     #[test]
     fn the_quoted_markup_matches_the_one_the_server_actually_charges() {
-        // The same business number lives twice: here (what the CLI quotes in
-        // /cost, streams per turn, and enforces --budget against) and in
-        // HiveMind-server's src/config.ts MARKUP_MULTIPLIER (what decrements
-        // the balance). Nothing links them at build time -- different
-        // languages, different repositories -- so this test is the link.
-        // Changing one alone means hosted users are quoted a price they are
-        // not billed, and their budget stops at the wrong number. Update
-        // both, and the mirror test in HiveMind-server/test/cost.test.ts.
         assert_eq!(
             harness_config::HOSTED_MARKUP_MULTIPLIER,
-            1.35,
-            "server default is 1.35; reconcile toward the server, it is what moves money"
+            1.15,
+            "server default is 1.15; reconcile toward the server, it is what moves money"
         );
     }
 
@@ -64,9 +56,9 @@ mod tests {
     fn hosted_applies_the_markup_byok_does_not() {
         let hosted = estimate_cost_usd(&usage(1_000_000, 0), "hivemind", true).unwrap();
         let byok = estimate_cost_usd(&usage(1_000_000, 0), "hivemind", false).unwrap();
-        // hivemind's wholesale input_per_m is 0.0938 -- 1M miss tokens costs
+        // hivemind's wholesale input_per_m is 0.0826 -- 1M miss tokens costs
         // exactly that wholesale, times the markup when hosted.
-        assert!((byok - 0.0938).abs() < 1e-9);
-        assert!((hosted - 0.0938 * harness_config::HOSTED_MARKUP_MULTIPLIER).abs() < 1e-9);
+        assert!((byok - 0.0826).abs() < 1e-9);
+        assert!((hosted - 0.0826 * harness_config::HOSTED_MARKUP_MULTIPLIER).abs() < 1e-9);
     }
 }

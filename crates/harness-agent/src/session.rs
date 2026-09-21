@@ -1,24 +1,3 @@
-//! Session persistence: the conversation survives the process.
-//!
-//! Context is a *purchased* asset here — every message in a long session was
-//! paid for at the token rate, and a compaction summary literally cost a
-//! model call to produce. Losing all of it because a terminal closed (or a
-//! VS Code window reloaded) throws away real money, so state is written at
-//! every turn boundary rather than only at a clean exit.
-//!
-//! Deliberately plain JSON files, not a database: the whole store is a
-//! directory of records that a human can read, diff, back up, or delete with
-//! `rm`. At the sizes compaction already bounds sessions to, indexing buys
-//! nothing.
-//!
-//! # What is *not* persisted
-//!
-//! `/undo` checkpoints stay in memory only. They hold pre-edit file
-//! snapshots, and restoring a file from a previous process — against a
-//! working tree that may have been edited, committed, or branched since —
-//! is a materially different and riskier promise than replaying a
-//! conversation. Resuming restores what was *said*, never what was on disk.
-
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
@@ -27,14 +6,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use harness_types::Message;
 use serde::{Deserialize, Serialize};
 
-/// One saved conversation. Everything needed to pick up exactly where the
-/// session left off, including cost accounting — resuming under a `--budget`
-/// must not silently reset spend to zero and hand out a fresh allowance.
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionRecord {
     pub id: String,
-    /// Canonical workspace path this session belongs to, so `--continue` in
-    /// one project can never resume another project's conversation.
     pub workspace: String,
     pub model: String,
     #[serde(default)]
@@ -43,13 +18,11 @@ pub struct SessionRecord {
     pub budget_usd: Option<f64>,
     #[serde(default)]
     pub session_cost_usd: f64,
-    /// Opt-in hosted capability. Default keeps every pre-web-mode session
-    /// readable and off unless the user explicitly enabled it.
     #[serde(default)]
     pub web_enabled: bool,
+    #[serde(default)]
+    pub active_skill: Option<String>,
     pub messages: Vec<Message>,
-    /// Unix seconds. Stored as plain integers to keep this crate free of a
-    /// date-time dependency; formatting for humans is the host's business.
     pub created_at: u64,
     pub updated_at: u64,
     /// First line of the first user message, for `hivemind sessions`.
@@ -133,11 +106,6 @@ impl SessionStore {
         self.dir.join(format!("{id}.json"))
     }
 
-    /// Write atomically: serialize to a temp file in the same directory,
-    /// then rename over the target. A crash (or a kill mid-save, which is
-    /// exactly what happens when a user Ctrl-C's) can then leave either the
-    /// old complete file or the new complete file — never a half-written one
-    /// that fails to parse on resume.
     pub fn save(&self, record: &SessionRecord) -> Result<(), SessionError> {
         std::fs::create_dir_all(&self.dir).map_err(|source| SessionError::Io {
             path: self.dir.display().to_string(),
@@ -152,11 +120,6 @@ impl SessionStore {
             path: tmp_path.display().to_string(),
             source,
         })?;
-
-        // A conversation can contain anything the agent read -- source, keys,
-        // customer data. Same posture as credentials.toml: owner-only on
-        // Unix. (No NTFS equivalent applied on Windows, where per-user
-        // profile ACLs already cover this.)
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -187,9 +150,7 @@ impl SessionStore {
         })
     }
 
-    /// Sessions for one workspace, newest first. Unreadable or corrupt files
-    /// are skipped rather than failing the whole listing — one bad record
-    /// must not make `--continue` unusable.
+
     pub fn list_for_workspace(&self, workspace: &str) -> Vec<SessionSummary> {
         let Ok(entries) = std::fs::read_dir(&self.dir) else {
             return Vec::new();
@@ -221,9 +182,7 @@ impl SessionStore {
         self.load(&newest.id).ok()
     }
 
-    /// Delete one session by id. `Ok(false)` if it was already gone --
-    /// deleting something twice is the caller getting what they asked for,
-    /// not an error worth propagating.
+   
     pub fn delete(&self, id: &str) -> Result<bool, SessionError> {
         let path = self.path_for(id);
         match std::fs::remove_file(&path) {
@@ -236,9 +195,7 @@ impl SessionStore {
         }
     }
 
-    /// Every session in the store regardless of workspace, newest first.
-    /// Retention is a property of the whole store, not of whichever project
-    /// happens to be open, so pruning cannot use `list_for_workspace`.
+
     pub fn list_all(&self) -> Vec<SessionSummary> {
         let Ok(entries) = std::fs::read_dir(&self.dir) else {
             return Vec::new();
@@ -262,21 +219,7 @@ impl SessionStore {
         out
     }
 
-    /// Delete every session across all workspaces last updated more than
-    /// `max_age_secs` ago, returning the ids removed. Ids in `keep` are
-    /// never deleted however old they are — a host with those conversations
-    /// open right now would otherwise have one vanish from under a live
-    /// window mid-session.
-    ///
-    /// Keyed on `updated_at` from the record, not the file's mtime: a
-    /// backup/restore, a `cp -r`, or a sync client rewrites mtimes wholesale
-    /// and would otherwise either wipe the store at once or keep it alive
-    /// forever. The record's own timestamp is the only one that tracks when
-    /// the *conversation* was last touched.
-    ///
-    /// A file that cannot be read or parsed is left alone: there is no way
-    /// to tell a corrupt record's age, and silently deleting unreadable user
-    /// data is a worse failure than keeping it.
+   
     pub fn prune_older_than_except(&self, max_age_secs: u64, keep: &[String]) -> Vec<String> {
         let Ok(entries) = std::fs::read_dir(&self.dir) else {
             return Vec::new();
@@ -337,10 +280,6 @@ pub fn derive_title(messages: &[Message]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Process- and thread-unique for the same reason as the pdf tests'
-    /// helper: a fixed path lets two overlapping test runs delete each
-    /// other's fixtures, which shows up as a rare, unexplainable failure.
     fn store(name: &str) -> SessionStore {
         let dir = std::env::temp_dir().join(format!(
             "hivemind_session_test_{name}_{}_{:?}",
@@ -360,6 +299,7 @@ mod tests {
             budget_usd: None,
             session_cost_usd: 0.0,
             web_enabled: false,
+            active_skill: None,
             messages: vec![Message::system("sys"), Message::user("build a thing")],
             created_at: 100,
             updated_at: 100,
@@ -384,6 +324,28 @@ mod tests {
         // Cost must survive: resuming under a budget can't silently hand out
         // a fresh allowance.
         assert!((loaded.session_cost_usd - 0.0421).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_selected_skill_survives_a_round_trip() {
+        let s = store("skill_round_trip");
+        let mut rec = record("skl", "/ws/one");
+        rec.active_skill = Some("code-review".into());
+        s.save(&rec).unwrap();
+
+        assert_eq!(
+            s.load("skl").unwrap().active_skill.as_deref(),
+            Some("code-review")
+        );
+    }
+
+    // A session written before skills existed must still load.
+    #[test]
+    fn a_record_without_the_skill_field_still_loads() {
+        let s = store("skill_default");
+        let rec = record("old", "/ws/one");
+        s.save(&rec).unwrap();
+        assert_eq!(s.load("old").unwrap().active_skill, None);
     }
 
     #[test]
@@ -491,18 +453,6 @@ mod tests {
         assert_eq!(derive_title(&[]), "");
     }
 
-    /// V4 from the M1 plan: a session written before the ToolResult
-    /// envelope existed must still load and resume.
-    ///
-    /// The JSON below is the exact shape a 1.9.2 binary wrote -- captured
-    /// from a real file in the session store, not reconstructed. It is
-    /// frozen here so the guarantee does not depend on whichever sessions
-    /// happen to be on the machine running the tests.
-    ///
-    /// This holds because a `ToolResult` never reaches a `SessionRecord`:
-    /// only its `summary` becomes a `Message`. The test exists to keep that
-    /// true, since a later field added to `Message` would break every saved
-    /// session silently and only on someone's `--continue`.
     #[test]
     fn a_session_written_before_the_tool_result_envelope_still_loads() {
         let s = store("pre_m1");
@@ -535,8 +485,6 @@ mod tests {
 
         assert_eq!(loaded.messages.len(), 5);
         assert_eq!(loaded.turn_count(), 1);
-        // The tool result is still plain text, with no status alongside it --
-        // which is exactly why nothing had to migrate.
         let tool_msg = loaded
             .messages
             .iter()
@@ -621,9 +569,6 @@ mod tests {
 
     #[test]
     fn a_future_dated_record_is_kept_not_wrapped_into_deletion() {
-        // A skewed clock (or a restored backup) can date a record ahead of
-        // now; unsigned subtraction would otherwise wrap to a huge age and
-        // delete it.
         let s = store("prune_future");
         let mut r = record("ahead", "/ws");
         r.updated_at = unix_now() + 10 * DAY;
@@ -635,8 +580,6 @@ mod tests {
 
     #[test]
     fn an_unreadable_record_is_left_alone_rather_than_deleted() {
-        // Its age is unknowable, and silently destroying user data that
-        // merely failed to parse is worse than keeping a stale file.
         let s = store("prune_corrupt");
         std::fs::create_dir_all(s.dir()).unwrap();
         std::fs::write(s.dir().join("broken.json"), b"{not json").unwrap();

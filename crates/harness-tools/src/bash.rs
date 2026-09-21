@@ -31,6 +31,71 @@ struct BackgroundProc {
     log: PathBuf,
 }
 
+/// A cloneable handle onto one [`Bash`]'s background-process registry.
+///
+/// Exists because `Drop::drop` is not the only moment this list needs to be
+/// emptied: it never runs at all if the process is killed by an unhandled
+/// signal (`SIGTERM`/`SIGKILL`, no unwinding), which is exactly how a host
+/// stops a running agent -- so a `node server.js` the model backgrounded
+/// would otherwise survive the very shutdown that was supposed to end it.
+/// `harness-cli`'s top-level signal handler holds one of these, obtained
+/// before `Bash` is moved into the tool registry, and calls
+/// [`BackgroundProcesses::kill_all`] itself on the way out. [`Bash::drop`]
+/// calls the same method, so ordinary process exit and a caught signal both
+/// go through one implementation.
+#[derive(Clone)]
+pub struct BackgroundProcesses(Arc<std::sync::Mutex<Vec<BackgroundProc>>>);
+
+impl BackgroundProcesses {
+    fn new() -> Self {
+        Self(Arc::new(std::sync::Mutex::new(Vec::new())))
+    }
+
+    fn push(&self, proc: BackgroundProc) {
+        self.0
+            .lock()
+            .expect("background registry mutex poisoned")
+            .push(proc);
+    }
+
+    /// Kill and drop any tracked process whose original command line equals
+    /// `command`, so restarting a backgrounded server ("edit the file, run
+    /// it again") replaces the previous instance instead of leaving it
+    /// bound to the port the new one wants. Returns whether anything was
+    /// replaced, purely for the tool result's wording.
+    fn replace_if_same_command(&self, command: &str) -> bool {
+        let mut running = self.0.lock().expect("background registry mutex poisoned");
+        let mut replaced = false;
+        running.retain(|p| {
+            if p.command == command {
+                kill_process_group(p.pid);
+                let _ = std::fs::remove_file(&p.log);
+                replaced = true;
+                return false;
+            }
+            true
+        });
+        replaced
+    }
+
+    /// Kill every tracked process group and drop its log file. Safe to call
+    /// more than once (a second call finds nothing left to do) and safe to
+    /// call from both a normal `Drop` and a signal handler racing it --
+    /// whichever runs first empties the list, so the other is a no-op.
+    pub fn kill_all(&self) {
+        let procs = match self.0.lock() {
+            Ok(mut g) => std::mem::take(&mut *g),
+            // Poisoned only if a writer panicked; the list is still readable
+            // and leaking real processes is worse than ignoring the poison.
+            Err(e) => std::mem::take(&mut *e.into_inner()),
+        };
+        for p in procs {
+            kill_process_group(p.pid);
+            let _ = std::fs::remove_file(&p.log);
+        }
+    }
+}
+
 /// Runs a shell command in the workspace root. The highest-risk tool, so
 /// every command is gated by [`Bash::approve`] unless explicitly disabled
 /// (headless/`--yolo` runs pass `None`).
@@ -45,9 +110,10 @@ pub struct Bash {
     /// once approved.
     approval_lock: Mutex<()>,
     /// Long-running commands the model explicitly backgrounded. A `std`
-    /// mutex, not tokio's: the only writer outside `execute` is `Drop`,
-    /// which is synchronous and cannot await.
-    background: std::sync::Mutex<Vec<BackgroundProc>>,
+    /// mutex, not tokio's: writers include `Drop`, which is synchronous and
+    /// cannot await, and a signal handler holding a cloned
+    /// [`BackgroundProcesses`], which must not itself be `async`.
+    background: BackgroundProcesses,
 }
 
 impl Bash {
@@ -57,8 +123,16 @@ impl Bash {
             timeout: Duration::from_secs(120),
             approve: None,
             approval_lock: Mutex::new(()),
-            background: std::sync::Mutex::new(Vec::new()),
+            background: BackgroundProcesses::new(),
         }
+    }
+
+    /// A cloned handle onto this instance's background-process registry.
+    /// Get it *before* handing `self` to the tool registry, so a top-level
+    /// signal handler can still reach and kill those processes even though
+    /// it no longer owns the `Bash` value itself.
+    pub fn background_handle(&self) -> BackgroundProcesses {
+        self.background.clone()
     }
 
     pub fn with_approval(mut self, approve: ApproveFn) -> Self {
@@ -116,23 +190,7 @@ impl Bash {
         // again), and leaving the previous copy alive would hand the model
         // the exact port conflict this whole mechanism exists to prevent --
         // except now self-inflicted. Same command means "replace it".
-        let replaced = {
-            let mut running = self
-                .background
-                .lock()
-                .expect("background registry mutex poisoned");
-            let mut replaced = false;
-            running.retain(|p| {
-                if p.command == command {
-                    kill_process_group(p.pid);
-                    let _ = std::fs::remove_file(&p.log);
-                    replaced = true;
-                    return false;
-                }
-                true
-            });
-            replaced
-        };
+        let replaced = self.background.replace_if_same_command(command);
 
         let child = cmd.spawn().map_err(ToolError::Io)?;
         let pid = child.id().unwrap_or(0);
@@ -141,14 +199,11 @@ impl Bash {
         // leader, which is all Drop needs to reap the whole tree later.
         drop(child);
 
-        self.background
-            .lock()
-            .expect("background registry mutex poisoned")
-            .push(BackgroundProc {
-                pid,
-                command: command.to_string(),
-                log: log.clone(),
-            });
+        self.background.push(BackgroundProc {
+            pid,
+            command: command.to_string(),
+            log: log.clone(),
+        });
 
         let note = if replaced {
             "replaced the previous run of this same command, then "
@@ -216,16 +271,7 @@ pub(crate) fn own_process_group(cmd: &mut Command) {
 
 impl Drop for Bash {
     fn drop(&mut self) {
-        let procs = match self.background.lock() {
-            Ok(mut g) => std::mem::take(&mut *g),
-            // Poisoned only if a writer panicked; the list is still readable
-            // and leaking real processes is worse than ignoring the poison.
-            Err(e) => std::mem::take(&mut *e.into_inner()),
-        };
-        for p in procs {
-            kill_process_group(p.pid);
-            let _ = std::fs::remove_file(&p.log);
-        }
+        self.background.kill_all();
     }
 }
 
@@ -761,6 +807,47 @@ mod tests {
         }
         kill_process_group(pid);
         panic!("pid {pid} survived the session that owned it");
+    }
+
+    /// The path a host's kill signal actually takes: cleanup fired
+    /// explicitly through a cloned [`BackgroundProcesses`] handle, with the
+    /// owning `Bash` (and therefore its `Drop` impl) never touched at all --
+    /// this is what proves the harness-cli signal handler can reach these
+    /// processes independently of whether the process ever unwinds normally.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn kill_all_reaps_a_background_process_without_dropping_bash() {
+        let tool = bash();
+        let handle = tool.background_handle();
+        let out = tool
+            .execute(&args(serde_json::json!({
+                "command": "sleep 30", "background": true
+            })))
+            .await
+            .unwrap()
+            .summary;
+        let pid: u32 = out
+            .split_once("pid ")
+            .and_then(|(_, rest)| rest.split(')').next())
+            .and_then(|p| p.trim().parse().ok())
+            .unwrap();
+        assert!(alive(pid));
+
+        handle.kill_all();
+
+        for _ in 0..50 {
+            if !alive(pid) {
+                // A second call must be a harmless no-op, not a panic on an
+                // already-empty list or an already-dead pid -- the same
+                // shape `Drop` itself could race if a signal and a normal
+                // exit ever overlapped.
+                handle.kill_all();
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        kill_process_group(pid);
+        panic!("pid {pid} survived an explicit kill_all()");
     }
 
     /// Re-running the same background command is "restart it", not "race the
