@@ -1,5 +1,7 @@
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
@@ -12,7 +14,9 @@ use harness_review::{
 };
 use serde::Serialize;
 
-use harness_agent::AgentReviewSampler;
+use harness_agent::{
+    AgentReviewSampler, ReviewProgressSink, ReviewSamplingProgress, ReviewSamplingStage,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum ReviewFormat {
@@ -220,7 +224,8 @@ async fn run_inner(
                 mode: None,
             },
         )?;
-        let sampler = AgentReviewSampler::new(resolved, workdir.clone());
+        let sampler = AgentReviewSampler::new(resolved, workdir.clone())
+            .with_progress(events.progress_sink());
         build_review_report(
             &sampler,
             &diff,
@@ -340,7 +345,11 @@ fn write_report(format: ReviewFormat, report: &ReviewReport) -> anyhow::Result<(
 struct EventWriter {
     enabled: bool,
     review_id: ReviewId,
-    sequence: u64,
+    // Shared (not plain `u64`) so `progress_sink`'s callback -- which must be
+    // `Send + Sync` and can fire from inside the model call this struct is
+    // otherwise idle during -- keeps emitting the same monotonic sequence
+    // rather than a second, overlapping one.
+    sequence: Arc<AtomicU64>,
 }
 
 impl EventWriter {
@@ -348,7 +357,7 @@ impl EventWriter {
         Self {
             enabled: format == ReviewFormat::Ndjson,
             review_id,
-            sequence: 0,
+            sequence: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -356,16 +365,46 @@ impl EventWriter {
         if !self.enabled {
             return Ok(());
         }
-        self.sequence += 1;
+        let sequence = self.sequence.fetch_add(1, Ordering::SeqCst) + 1;
         let envelope = ReviewEventEnvelope::new(
             self.review_id.clone(),
-            self.sequence,
+            sequence,
             event,
             serde_json::to_value(data)?,
         );
         println!("{}", serde_json::to_string(&envelope)?);
         std::io::stdout().flush()?;
         Ok(())
+    }
+
+    /// A candidate-generation or evidence-validation pass can run for
+    /// several minutes with no other output, which looks identical to a
+    /// hang. This turns `AgentReviewSampler`'s existing (but previously
+    /// unwired) progress callback into visible stderr lines always, plus
+    /// NDJSON events when that's the selected format.
+    fn progress_sink(&self) -> ReviewProgressSink {
+        let ndjson_enabled = self.enabled;
+        let review_id = self.review_id.clone();
+        let sequence = Arc::clone(&self.sequence);
+        Arc::new(move |progress: ReviewSamplingProgress| {
+            let stage = match progress.stage {
+                ReviewSamplingStage::CandidateGeneration => "candidate generation",
+                ReviewSamplingStage::EvidenceValidation => "evidence validation",
+            };
+            eprintln!("review: {stage}: {}", progress.message);
+
+            if !ndjson_enabled {
+                return;
+            }
+            let data = serde_json::json!({"stage": stage, "message": progress.message});
+            let seq = sequence.fetch_add(1, Ordering::SeqCst) + 1;
+            let envelope =
+                ReviewEventEnvelope::new(review_id.clone(), seq, "review.sampling_progress", data);
+            if let Ok(line) = serde_json::to_string(&envelope) {
+                println!("{line}");
+                let _ = std::io::stdout().flush();
+            }
+        })
     }
 }
 
