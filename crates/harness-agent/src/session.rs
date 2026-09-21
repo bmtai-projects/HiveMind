@@ -6,7 +6,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use harness_types::Message;
 use serde::{Deserialize, Serialize};
 
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionRecord {
     pub id: String,
@@ -150,7 +149,6 @@ impl SessionStore {
         })
     }
 
-
     pub fn list_for_workspace(&self, workspace: &str) -> Vec<SessionSummary> {
         let Ok(entries) = std::fs::read_dir(&self.dir) else {
             return Vec::new();
@@ -182,7 +180,6 @@ impl SessionStore {
         self.load(&newest.id).ok()
     }
 
-   
     pub fn delete(&self, id: &str) -> Result<bool, SessionError> {
         let path = self.path_for(id);
         match std::fs::remove_file(&path) {
@@ -194,7 +191,6 @@ impl SessionStore {
             }),
         }
     }
-
 
     pub fn list_all(&self) -> Vec<SessionSummary> {
         let Ok(entries) = std::fs::read_dir(&self.dir) else {
@@ -219,7 +215,6 @@ impl SessionStore {
         out
     }
 
-   
     pub fn prune_older_than_except(&self, max_age_secs: u64, keep: &[String]) -> Vec<String> {
         let Ok(entries) = std::fs::read_dir(&self.dir) else {
             return Vec::new();

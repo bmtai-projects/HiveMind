@@ -1,8 +1,5 @@
-
-
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
-
 
 #[derive(Clone)]
 pub struct LatencyTracer {
@@ -29,7 +26,6 @@ impl LatencyTracer {
         }
     }
 
-   
     pub fn begin_request(&self) {
         if !self.inner.enabled {
             return;
@@ -39,7 +35,6 @@ impl LatencyTracer {
         }
     }
 
-    
     #[cfg(test)]
     pub(crate) fn elapsed_ms_for_test(&self) -> f64 {
         if !self.inner.enabled {
@@ -51,12 +46,11 @@ impl LatencyTracer {
         }
     }
 
-    
     pub fn emit(&self, stage: &str) {
         if !self.inner.enabled {
             return;
         }
-        
+
         let elapsed = match self.inner.start.lock() {
             Ok(start) => start.elapsed().as_secs_f64() * 1000.0,
             Err(_) => 0.0,

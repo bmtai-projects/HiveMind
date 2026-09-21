@@ -6,7 +6,6 @@ use harness_types::ToolCall;
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 
-
 const MAX_PAYLOAD_BYTES: usize = 128 * 1024;
 
 /// Matches Claude Code's own hook convention (and grok-build's), so a hook
@@ -121,7 +120,6 @@ async fn run_one(
         return on_failure(spec, "hook input could not be serialized");
     };
 
-
     let mut cmd = harness_tools::shell_command(&spec.command);
 
     cmd.current_dir(harness_tools::strip_verbatim(std::path::Path::new(
@@ -150,7 +148,6 @@ async fn run_one(
 
     parse_decision(spec, &output)
 }
-
 
 fn on_failure(spec: &HookSpec, what_went_wrong: &str) -> HookDecision {
     if !spec.enforcement {
@@ -231,7 +228,6 @@ mod tests {
         }
     }
 
-
     #[cfg(windows)]
     const SLEEP_LONGER_THAN_ANY_TIMEOUT: &str = "ping -n 6 127.0.0.1 > nul";
     #[cfg(not(windows))]
@@ -299,8 +295,6 @@ mod tests {
         );
     }
 
-   
-
     #[tokio::test]
     async fn an_enforcement_hook_that_succeeds_still_allows() {
         let decision = run_pre_tool_use(
@@ -318,7 +312,6 @@ mod tests {
 
     #[tokio::test]
     async fn a_broken_enforcement_hook_denies_instead_of_failing_open() {
-       
         let decision = run_pre_tool_use(
             &[enforcing("exit 17")],
             &call("run_shell", serde_json::json!({})),
