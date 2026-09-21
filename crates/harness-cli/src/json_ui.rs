@@ -49,6 +49,11 @@ pub enum Command {
     SetWebEnabled {
         enabled: bool,
     },
+    /// Select a skill by id, or clear the active one with `null`/absent.
+    SetSkill {
+        #[serde(default)]
+        skill: Option<String>,
+    },
     Undo {
         n: usize,
     },
@@ -64,6 +69,14 @@ pub enum Command {
     Interject {
         text: String,
     },
+    /// Cancel the turn currently running. Like `Approve`/`Interject`, and
+    /// for the same reason, this is resolved immediately by the reader task
+    /// rather than queued behind `tx` -- queueing it behind the very run it
+    /// exists to interrupt would mean it's only ever seen after that run
+    /// finishes on its own, which is not an abort. A no-op if no turn is
+    /// running (the reader task cannot know that without racing the main
+    /// loop, so the main loop drops it silently if it arrives late).
+    Abort,
 }
 
 pub struct JsonUi {
@@ -112,7 +125,13 @@ impl JsonUi {
     /// workspace" races as soon as two sessions start at once. `None` when
     /// persistence is off, which a host must treat as "this conversation
     /// will not be resumable" rather than as an error.
-    pub fn emit_ready(&self, session_id: Option<&str>, web_available: bool, web_enabled: bool) {
+    pub fn emit_ready(
+        &self,
+        session_id: Option<&str>,
+        web_available: bool,
+        web_enabled: bool,
+        active_skill: Option<&str>,
+    ) {
         let models: Vec<_> = harness_config::KNOWN_MODELS
             .iter()
             .map(|m| {
@@ -126,12 +145,26 @@ impl JsonUi {
                 })
             })
             .collect();
+        // Same source of truth `set_skill` validates against, so a host can
+        // never be offered a skill the agent would then reject.
+        let skills: Vec<_> = harness_agent::skills::all()
+            .iter()
+            .map(|s| {
+                json!({
+                    "id": s.id,
+                    "name": s.name,
+                    "description": s.description,
+                })
+            })
+            .collect();
         self.emit(json!({
             "type": "ready",
             "models": models,
             "session_id": session_id,
             "web_available": web_available,
             "web_enabled": web_enabled,
+            "skills": skills,
+            "active_skill": active_skill,
         }));
     }
 
@@ -140,6 +173,13 @@ impl JsonUi {
             "type": "web_mode",
             "available": available,
             "enabled": enabled,
+        }));
+    }
+
+    pub fn emit_skill_mode(&self, active_skill: Option<&str>) {
+        self.emit(json!({
+            "type": "skill_mode",
+            "active_skill": active_skill,
         }));
     }
 
@@ -182,6 +222,18 @@ impl JsonUi {
     /// equally whether what just finished was a message or a command.
     pub fn emit_turn_done(&self) {
         self.emit(json!({"type": "turn_done"}));
+    }
+
+    /// Sent instead of (never in addition to) `turn_done` when an
+    /// `abort` command actually cancelled a running turn -- so the
+    /// extension can render "stopped" rather than a turn that quietly
+    /// produced no new content. A `repaired` flag distinguishes a clean
+    /// stop between tool calls from one that landed mid-tool-call and had
+    /// to drop an incomplete call from the transcript, which is worth a
+    /// different message: the second case is the one place aborting can
+    /// visibly shorten what the model already did.
+    pub fn emit_aborted(&self, repaired: bool) {
+        self.emit(json!({"type": "aborted", "repaired": repaired}));
     }
 
     pub fn emit_error(&self, message: &str) {

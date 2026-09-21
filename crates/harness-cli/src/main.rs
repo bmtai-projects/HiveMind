@@ -33,7 +33,7 @@ use std::sync::Arc;
 use clap::{Args, Parser, Subcommand};
 use reedline::Signal;
 
-use commands::{BudgetArg, ModelArg, ReasoningArg, SlashCommand, UndoArg, WebArg};
+use commands::{BudgetArg, ModelArg, ReasoningArg, SkillArg, SlashCommand, UndoArg, WebArg};
 use harness_agent::{Agent, Ui};
 use harness_config::CliOverrides;
 use harness_tools::{
@@ -248,6 +248,9 @@ enum Command {
     /// real third-party coding models; BYOK: whatever your provider key
     /// itself supports).
     Models,
+    /// List skills selectable with --skill or `/skill`. Each specializes the
+    /// prompt for one kind of task; none restrict which tools are available.
+    Skills,
     /// List saved sessions for a workspace, newest first, for `--resume`.
     Sessions(SessionsArgs),
     /// Download the latest release for this platform and replace the
@@ -424,6 +427,17 @@ struct ActivateArgs {
     #[arg(long)]
     web: bool,
 
+    /// Start with a skill active, specializing the prompt for one kind of
+    /// task (run `hivemind skills` to list them). Also settable mid-session
+    /// with `/skill`.
+    #[arg(long)]
+    skill: Option<String>,
+
+    /// Trace end-to-end latency for this session, writing stage timings to
+    /// stderr as they occur. Disabled by default; adds no overhead when off.
+    #[arg(long)]
+    trace_latency: bool,
+
     /// Resume the most recent session for this workspace. Restores the
     /// conversation, model, and accumulated spend -- but not `/undo`
     /// history, which is deliberately never carried across processes (the
@@ -454,6 +468,14 @@ fn print_model_catalog() {
         );
     }
     println!("Pick with --model <id>, or /model <id> in the REPL.");
+}
+
+fn print_skill_catalog() {
+    println!("Available skills:");
+    for s in harness_agent::skills::all() {
+        println!("  {:<22} {}", s.id, s.description);
+    }
+    println!("Pick with --skill <id>, or /skill <id> in the REPL.");
 }
 
 /// Roughly how long ago, in the coarsest unit that's still informative --
@@ -600,6 +622,10 @@ async fn main() -> anyhow::Result<()> {
             print_model_catalog();
             Ok(())
         }
+        Command::Skills => {
+            print_skill_catalog();
+            Ok(())
+        }
         Command::Sessions(args) => list_sessions(args),
         Command::Update => self_update::run().await,
         Command::Hooks(args) => match args.action {
@@ -623,6 +649,64 @@ async fn main() -> anyhow::Result<()> {
         std::process::exit(1);
     }
     Ok(())
+}
+
+/// Kill every backgrounded shell process the moment this process is asked
+/// to terminate, instead of leaving that to [`harness_tools::Bash`]'s own
+/// `Drop` impl.
+///
+/// `Drop` is not enough on its own: it only runs on ordinary unwinding, and
+/// the one way a host actually stops a running agent -- the VS Code
+/// extension's `child.kill()`, equally a `docker stop`, a supervisor, or a
+/// terminal's own SIGTERM -- does not unwind anything. Left alone, a `node
+/// server.js` the model backgrounded would keep running, bound to its port,
+/// for as long as the machine stays up, orphaned by the very shutdown that
+/// was supposed to end it. This does not replace `Drop`; a clean exit
+/// (stdin EOF, `/exit`, an unrecoverable error) still goes through it
+/// exactly as before -- this only covers the path `Drop` cannot reach.
+///
+/// Unix-only: Windows has no equivalent of a catchable termination signal
+/// for `TerminateProcess`/`taskkill`, which is how a host actually kills a
+/// child there (see `harness_tools::bash::kill_process_group`'s own note on
+/// the same platform gap). `Drop` remains the only cleanup path on Windows,
+/// unchanged from before this existed.
+///
+/// SIGTERM only, deliberately not SIGINT: `tokio::signal` fans one incoming
+/// signal out to *every* listener registered for it, and the interactive
+/// REPL's `run_steerable` already races `tokio::signal::ctrl_c()` (SIGINT)
+/// to offer "steer or abort" mid-turn. Racing SIGINT here too would answer
+/// that same signal by killing the whole process out from under it before
+/// the user's steer-or-abort prompt could even be read. SIGTERM has no such
+/// conflict -- nothing else in this codebase listens for it -- and it is
+/// what actually matters here: it's what Node's `child.kill()` sends by
+/// default, which is how the VS Code extension stops the CLI today.
+fn spawn_background_cleanup_on_kill(background: harness_tools::BackgroundProcesses) {
+    #[cfg(unix)]
+    {
+        tokio::spawn(async move {
+            let Ok(mut term) =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            else {
+                // Can only fail if SIGTERM were somehow invalid for this
+                // platform, which it never is on Unix -- but failing open
+                // (no extra cleanup, `Drop` still applies on a normal exit)
+                // is safer than panicking a background task over it.
+                return;
+            };
+            term.recv().await;
+            background.kill_all();
+            // Not a plain `return`: the rest of the process (the REPL loop,
+            // the JSON protocol loop, whatever else is running) does not
+            // otherwise learn that SIGTERM arrived at all, so nothing else
+            // would ever ask it to stop. 143 = 128 + SIGTERM, the
+            // conventional exit code for "terminated by this signal."
+            std::process::exit(143);
+        });
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = background;
+    }
 }
 
 async fn run(args: ActivateArgs) -> anyhow::Result<()> {
@@ -669,9 +753,25 @@ async fn run(args: ActivateArgs) -> anyhow::Result<()> {
     let term_ui: Option<Arc<TermUi>> =
         (!protocol_json).then(|| Arc::new(TermUi::new(args.show_reasoning, resolved.budget_usd)));
 
+    // Latency tracer -- created once, shared across whatever Agent instances
+    // this session constructs. Built *before* the context load below so that
+    // load can be timed: it is startup work that happens once per process
+    // and lands squarely in the first response's latency, which is the thing
+    // this flag exists to explain.
+    let latency_tracer: Option<harness_agent::LatencyTracer> = args.trace_latency.then(|| {
+        let corr_id = format!("hivemind-{}", harness_agent::unix_now());
+        harness_agent::LatencyTracer::new(true, corr_id)
+    });
+
     // Read once, here, and hold it for the process's lifetime -- see
     // `system_prompt`'s doc comment for why re-reading would be expensive.
+    if let Some(t) = &latency_tracer {
+        t.emit("context_loading_started");
+    }
     let project_conventions = conventions::load(&workdir);
+    if let Some(t) = &latency_tracer {
+        t.emit("context_loading_completed");
+    }
 
     let mut registry = Registry::new();
     let ws = Workspace::new(workdir.clone());
@@ -766,7 +866,12 @@ async fn run(args: ActivateArgs) -> anyhow::Result<()> {
     } else if !args.yolo && !headless {
         bash = bash.with_approval(Arc::new(ui::terminal_approve));
     }
+    // Captured before `bash` moves into the registry below, so it survives
+    // independently of whether `Bash::drop` ever actually runs -- see
+    // `spawn_background_cleanup_on_kill`.
+    let background_procs = bash.background_handle();
     registry.register(Arc::new(bash));
+    spawn_background_cleanup_on_kill(background_procs);
 
     let workspace = workdir.to_string_lossy().to_string();
     let store = harness_agent::SessionStore::new(harness_config::default_sessions_dir());
@@ -780,6 +885,9 @@ async fn run(args: ActivateArgs) -> anyhow::Result<()> {
             system_prompt(project_conventions.as_deref(), read_program_available),
         );
         agent.warm_connection();
+        if let Some(tracer) = latency_tracer.clone() {
+            agent.enable_tracing(tracer);
+        }
         // Off when the threshold is 0, which is how a user turns offloading
         // off entirely without the harness needing a second switch.
         if resolved.policy.artifact_threshold_bytes > 0 {
@@ -802,6 +910,9 @@ async fn run(args: ActivateArgs) -> anyhow::Result<()> {
         if args.web {
             agent.set_web_enabled(true).map_err(anyhow::Error::msg)?;
         }
+        if let Some(skill) = &args.skill {
+            agent.set_skill(Some(skill)).map_err(anyhow::Error::msg)?;
+        }
         return run_json_protocol(&mut agent, ws, json_ui).await;
     }
 
@@ -814,6 +925,9 @@ async fn run(args: ActivateArgs) -> anyhow::Result<()> {
         system_prompt(project_conventions.as_deref(), read_program_available),
     );
     agent.warm_connection();
+    if let Some(tracer) = latency_tracer {
+        agent.enable_tracing(tracer);
+    }
     // Off when the threshold is 0, which is how a user turns offloading
     // off entirely without the harness needing a second switch.
     if resolved.policy.artifact_threshold_bytes > 0 {
@@ -828,6 +942,9 @@ async fn run(args: ActivateArgs) -> anyhow::Result<()> {
         // unpersisted -- no session file, no clutter in `hivemind sessions`.
         if args.web {
             agent.set_web_enabled(true).map_err(anyhow::Error::msg)?;
+        }
+        if let Some(skill) = &args.skill {
+            agent.set_skill(Some(skill)).map_err(anyhow::Error::msg)?;
         }
         let expanded = mentions::expand_mentions(prompt, &ws);
         agent.run(&expanded).await?;
@@ -845,6 +962,9 @@ async fn run(args: ActivateArgs) -> anyhow::Result<()> {
     )?;
     if args.web {
         agent.set_web_enabled(true).map_err(anyhow::Error::msg)?;
+    }
+    if let Some(skill) = &args.skill {
+        agent.set_skill(Some(skill)).map_err(anyhow::Error::msg)?;
     }
 
     repl(&mut agent, ws, ui, args.yolo, update_check, resolved.mode).await
@@ -894,6 +1014,17 @@ fn attach_or_restore_session(
                 store,
                 system_prompt(project_conventions, read_program_available),
             );
+            // `repair_after_interrupt` was previously only ever called from
+            // the interactive REPL's own Ctrl+C handler, immediately after
+            // the very interruption it was cleaning up from -- so a session
+            // that ended any other way (the JSON protocol has no live abort
+            // at all until now, and a hard kill/crash bypasses both) could
+            // carry a dangling tool-call group forward into every future
+            // resume, unrepaired, for as long as the session file existed.
+            // Calling it here instead means *any* interruption is caught
+            // the next time the session is opened, regardless of how the
+            // process actually ended -- including before this fix existed.
+            let repaired = agent.repair_after_interrupt();
             if announce {
                 println!(
                     "\x1b[90m⟲ resumed session {} — {turns} turns, ${cost:.4} spent{}\x1b[0m",
@@ -904,6 +1035,11 @@ fn attach_or_restore_session(
                         format!(" · {title}")
                     }
                 );
+                if repaired {
+                    println!(
+                        "\x1b[90m  (last session ended mid-step; dropped its incomplete tool call)\x1b[0m"
+                    );
+                }
             }
         }
         None => {
@@ -943,6 +1079,7 @@ async fn run_json_protocol(
         agent.session_id(),
         agent.web_available(),
         agent.web_enabled(),
+        agent.active_skill(),
     );
     // A fresh session's history is exactly the one system message;
     // emit_history treats that as "nothing to replay" and stays silent, so
@@ -953,6 +1090,17 @@ async fn run_json_protocol(
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<json_ui::Command>();
     let reader_ui = ui.clone();
     let reader_queue = agent.interjections();
+    // `Some` only while `UserMessage` below is actually awaiting `agent.run()`
+    // -- an `Abort` that arrives while idle must find nothing to cancel, not
+    // get stored and fire against whatever the *next* turn happens to be.
+    // `Notify` itself stores at most one wakeup permit, which is what makes
+    // an `Abort` racing the exact instant a turn starts safe either way:
+    // whichever of "the run future starts polling `notified()`" and "the
+    // reader task calls `notify_one()`" happens first, the other side still
+    // observes it.
+    let current_run_abort: Arc<std::sync::Mutex<Option<Arc<tokio::sync::Notify>>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let reader_abort = current_run_abort.clone();
     let reader = tokio::spawn(async move {
         let stdin = tokio::io::stdin();
         let mut lines = tokio::io::BufReader::new(stdin).lines();
@@ -977,17 +1125,26 @@ async fn run_json_protocol(
                 }
             };
             match cmd {
-                // Both of these are resolved right here rather than
-                // forwarded: they are the commands that exist *because* a
-                // turn is already in flight, so queueing them behind the
-                // main loop -- which is busy awaiting that very turn --
-                // would deadlock the one thing they're for.
+                // All three are resolved right here rather than forwarded:
+                // they are the commands that exist *because* a turn is
+                // already in flight, so queueing them behind the main loop
+                // -- which is busy awaiting that very turn -- would
+                // deadlock the one thing they're for.
                 json_ui::Command::Approve {
                     request_id,
                     approved,
                 } => reader_ui.resolve_approval(&request_id, approved),
                 json_ui::Command::Interject { text } => {
                     reader_queue.push(text);
+                }
+                json_ui::Command::Abort => {
+                    if let Some(notify) = reader_abort
+                        .lock()
+                        .expect("abort-handle mutex poisoned")
+                        .as_ref()
+                    {
+                        notify.notify_one();
+                    }
                 }
                 other => {
                     if tx.send(other).is_err() {
@@ -1005,13 +1162,45 @@ async fn run_json_protocol(
         match cmd {
             json_ui::Command::UserMessage { text } => {
                 let expanded = mentions::expand_mentions(&text, &ws);
-                if let Err(e) = agent.run(&expanded).await {
-                    ui.emit_error(&format!("{e:#}"));
+                let notify = Arc::new(tokio::sync::Notify::new());
+                *current_run_abort
+                    .lock()
+                    .expect("abort-handle mutex poisoned") = Some(notify.clone());
+
+                // Pinned and raced against the abort signal exactly the way
+                // the interactive terminal's `run_steerable` races
+                // `tokio::signal::ctrl_c()` -- dropping `running` on the
+                // abort branch cancels whatever it was doing (an in-flight
+                // model request, a running tool call's `.await`) the same
+                // way any dropped future does, with no extra plumbing.
+                let mut running = Box::pin(agent.run(&expanded));
+                tokio::select! {
+                    result = &mut running => {
+                        if let Err(e) = result {
+                            ui.emit_error(&format!("{e:#}"));
+                        }
+                        *current_run_abort.lock().expect("abort-handle mutex poisoned") = None;
+                        // Always emitted after a user_message's run()
+                        // settles, success or error -- signals the
+                        // extension may send the next line.
+                        ui.emit_turn_done();
+                    }
+                    _ = notify.notified() => {
+                        drop(running);
+                        *current_run_abort.lock().expect("abort-handle mutex poisoned") = None;
+                        // Mirrors the terminal path's `repair_after_interrupt`
+                        // call: a turn cancelled mid-tool-call can leave an
+                        // assistant message whose tool_calls have no
+                        // matching results, which the next request would
+                        // send to the model as-is. Dropped here so it never
+                        // reaches the wire, and reported so the extension
+                        // can say what actually happened -- a stop that
+                        // trimmed the transcript is worth a different
+                        // message than a stop that landed cleanly.
+                        let repaired = agent.repair_after_interrupt();
+                        ui.emit_aborted(repaired);
+                    }
                 }
-                // Always emitted after a user_message's run() settles,
-                // success or error -- signals the extension may send the
-                // next line.
-                ui.emit_turn_done();
             }
             json_ui::Command::SetModel { model } => {
                 agent.set_model(model);
@@ -1032,6 +1221,13 @@ async fn run_json_protocol(
                 ui.emit_web_mode(agent.web_available(), agent.web_enabled());
                 ui.emit_turn_done();
             }
+            json_ui::Command::SetSkill { skill } => {
+                if let Err(message) = agent.set_skill(skill.as_deref()) {
+                    ui.emit_error(&message);
+                }
+                ui.emit_skill_mode(agent.active_skill());
+                ui.emit_turn_done();
+            }
             json_ui::Command::Undo { n } => {
                 let report = agent.undo(n).await;
                 ui.emit_undo_result(report.as_ref());
@@ -1043,7 +1239,9 @@ async fn run_json_protocol(
                 agent.force_compact().await;
                 ui.emit_turn_done();
             }
-            json_ui::Command::Approve { .. } | json_ui::Command::Interject { .. } => {
+            json_ui::Command::Approve { .. }
+            | json_ui::Command::Interject { .. }
+            | json_ui::Command::Abort => {
                 unreachable!("filtered out and resolved directly by the reader task above")
             }
         }
@@ -1195,6 +1393,19 @@ async fn repl(
                         "invalid web mode {bad:?} — expected /web on, /web off, or /web status"
                     );
                 }
+                SlashCommand::Skill(SkillArg::Show) => match agent.active_skill() {
+                    Some(id) => println!("skill: {id} (clear with /skill off)"),
+                    None => println!("skill: none (see /skill list)"),
+                },
+                SlashCommand::Skill(SkillArg::List) => print_skill_catalog(),
+                SlashCommand::Skill(SkillArg::Off) => {
+                    let _ = agent.set_skill(None);
+                    println!("skill: none");
+                }
+                SlashCommand::Skill(SkillArg::Set(id)) => match agent.set_skill(Some(&id)) {
+                    Ok(()) => println!("skill: {id}"),
+                    Err(message) => println!("{message}"),
+                },
                 SlashCommand::Cost => {
                     println!("session cost so far: ${:.6}", agent.session_cost_usd())
                 }

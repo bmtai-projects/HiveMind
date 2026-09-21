@@ -137,7 +137,20 @@ impl DeepSeekClient {
                     tokio::time::sleep(delay).await;
                 }
                 Err(e) => {
-                    let _ = tx.send(Err(e));
+                    // Distinguishes "retried the full budget and every
+                    // attempt failed the same retryable way" (offline, or
+                    // upstream is down) from "failed once and retrying was
+                    // never going to help" (a bad API key, a malformed
+                    // request) -- the first is worth saying "gave up after
+                    // N attempts" about; framing the second that way would
+                    // be misleading; only one attempt was ever going to be
+                    // made.
+                    let final_error = if e.is_retryable() {
+                        ProviderError::RetriesExhausted(attempt + 1, Box::new(e))
+                    } else {
+                        e
+                    };
+                    let _ = tx.send(Err(final_error));
                     return;
                 }
             }

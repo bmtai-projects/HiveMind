@@ -16,6 +16,7 @@ use crate::checkpoint::{self, Checkpoint, UndoReport};
 use crate::compaction::{CompactionPolicy, maybe_compact};
 use crate::hooks::{self, HookDecision};
 use crate::interjection::InterjectionQueue;
+use crate::latency_trace::LatencyTracer;
 use crate::session::{SessionRecord, SessionStore, derive_title, unix_now};
 use crate::ui::Ui;
 
@@ -27,6 +28,16 @@ const COMPACTION_KEEP_RECENT: usize = 8;
 /// finish the work on a model costing ~22x input / ~53x output, so the only
 /// thing the switch reliably buys is a faster trip to `stopped_for_budget`.
 const ESCALATION_BUDGET_HEADROOM: f64 = 0.5;
+/// How many extra `max_turns` blocks a run that is still making progress may
+/// be granted before the ceiling stops it regardless. At the default 60 that
+/// is up to 300 turns.
+///
+/// A ceiling still exists because "making progress" is a heuristic and a
+/// wrong answer forever is worse than a wrong answer for a while. But it is
+/// far enough out that no ordinary task reaches it, which is the point: the
+/// limit that stops a real run should be the user's budget, not an arbitrary
+/// count they never chose.
+const MAX_TURN_EXTENSIONS: u32 = 4;
 const SEND_GUARD_PERCENT: u64 = 95;
 const WEB_OPERATIONS_PER_RUN: u8 = 3;
 const WEB_SYSTEM_INSTRUCTION: &str = "\
@@ -134,6 +145,34 @@ fn stall_step(
     }
 }
 
+/// Assemble the system message from the base prompt plus whatever is
+/// currently switched on.
+///
+/// Order is precedence: the base prompt already ends with project
+/// conventions, which sit last because the nearest instruction wins ties. A
+/// skill is more specific still -- the user picked it for this task -- so it
+/// goes after both that and the web block, which states a capability rather
+/// than competing over how to approach the work.
+///
+/// Pure and free-standing so the ordering can be asserted without building an
+/// [`Agent`], the same reason `stall_step` above is.
+fn compose_system_prompt(
+    base: &str,
+    web_enabled: bool,
+    skill: Option<&crate::skills::Skill>,
+) -> String {
+    let mut prompt = base.to_string();
+    if web_enabled {
+        prompt.push_str("\n\n");
+        prompt.push_str(WEB_SYSTEM_INSTRUCTION);
+    }
+    if let Some(skill) = skill {
+        prompt.push_str("\n\n");
+        prompt.push_str(&skill.prompt_block());
+    }
+    prompt
+}
+
 pub struct Agent {
     client: DeepSeekClient,
     tools: Registry,
@@ -150,6 +189,7 @@ pub struct Agent {
     session_cost_usd: f64,
     web_available: bool,
     web_enabled: bool,
+    active_skill: Option<&'static crate::skills::Skill>,
     web_operations_remaining: u8,
     last_total_tokens: u64,
     context_window: u64,
@@ -175,6 +215,24 @@ pub struct Agent {
     /// fresh chance to be told, and `run()` resets it alongside the other
     /// escalation state.
     nudged_this_run: bool,
+    /// What this run has changed on disk, and whether anything has been run
+    /// to check it since. Drives the one validation nudge below.
+    run_ledger: crate::validation::RunLedger,
+    /// The validation nudge's own one-shot flag, kept separate from
+    /// `nudged_this_run` so the two guards can't spend each other's turn: a
+    /// run can genuinely both go in circles *and* finish without checking
+    /// its edits, and each observation is worth making once.
+    validation_nudged_this_run: bool,
+    /// Index in `messages` where the in-flight user request begins.
+    /// Everything from here on is what the agent is working from right now,
+    /// which `crate::trim` protects from being aged out until there is
+    /// nothing older left to give -- trimming a file the current task just
+    /// read is what makes it read the file again.
+    ///
+    /// Restored sessions start at 0, which is correct rather than merely
+    /// safe: before the first `run()` there is no in-flight request, so no
+    /// message is protected and the whole restored transcript is eligible.
+    current_request_start: usize,
     /// Whether any tool call in the last dispatched turn reported a failing
     /// `ToolStatus`. Carried here because a `Message` only holds the summary
     /// text -- the status cannot be recovered from the transcript after the
@@ -200,6 +258,9 @@ pub struct Agent {
     /// Swept by `ArtifactStore::prune_orphans`, since no session record will
     /// ever refer to it.
     ephemeral_artifact_id: String,
+    /// Opt-in latency tracer. `None` when disabled (default) -- all trace
+    /// points become a single None-check, zero overhead.
+    tracer: Option<LatencyTracer>,
 }
 
 /// Bookkeeping for a session that's being written to disk.
@@ -250,6 +311,7 @@ impl Agent {
             session_cost_usd: 0.0,
             web_available,
             web_enabled: false,
+            active_skill: None,
             web_operations_remaining: WEB_OPERATIONS_PER_RUN,
             last_total_tokens: 0,
             context_window,
@@ -257,6 +319,9 @@ impl Agent {
             error_streak: 0,
             last_call_signature: None,
             nudged_this_run: false,
+            run_ledger: crate::validation::RunLedger::default(),
+            validation_nudged_this_run: false,
+            current_request_start: 0,
             last_turn_had_failure: false,
             workspace,
             checkpoints: Vec::new(),
@@ -266,7 +331,14 @@ impl Agent {
             artifacts: None,
             artifact_threshold_bytes: DEFAULT_ARTIFACT_THRESHOLD_BYTES,
             ephemeral_artifact_id: format!("tmp-{}-{}", std::process::id(), unix_now()),
+            tracer: None,
         }
+    }
+
+    /// Enable latency tracing for this session. No-op is the default; call
+    /// this once at startup if `--trace-latency` was passed.
+    pub fn enable_tracing(&mut self, tracer: LatencyTracer) {
+        self.tracer = Some(tracer);
     }
 
     /// Offload tool results at or above `threshold_bytes` to `store`,
@@ -313,6 +385,7 @@ impl Agent {
     /// rather than forking a new one on every resume.
     pub fn restore(&mut self, record: SessionRecord, store: SessionStore, system_prompt: String) {
         let restored_web_enabled = record.web_enabled;
+        let restored_skill = record.active_skill;
         let mut messages = record.messages;
         match messages.first_mut() {
             Some(first) if first.role == Role::System => {
@@ -343,6 +416,7 @@ impl Agent {
         self.web_enabled = restored_web_enabled && self.web_available;
         self.tools.set_enabled("web_search", self.web_enabled);
         self.tools.set_enabled("web_fetch", self.web_enabled);
+        self.active_skill = restored_skill.as_deref().and_then(crate::skills::find);
         self.refresh_system_prompt();
     }
 
@@ -368,6 +442,7 @@ impl Agent {
             budget_usd: self.budget_usd,
             session_cost_usd: self.session_cost_usd,
             web_enabled: self.web_enabled,
+            active_skill: self.active_skill.map(|s| s.id.clone()),
             messages: self.messages.clone(),
             created_at: p.created_at,
             updated_at: unix_now(),
@@ -447,12 +522,39 @@ impl Agent {
         Ok(())
     }
 
-    fn refresh_system_prompt(&mut self) {
-        let prompt = if self.web_enabled {
-            format!("{}\n\n{}", self.base_system_prompt, WEB_SYSTEM_INSTRUCTION)
-        } else {
-            self.base_system_prompt.clone()
+    /// The skill specializing this session, if any.
+    pub fn active_skill(&self) -> Option<&str> {
+        self.active_skill.map(|s| s.id.as_str())
+    }
+
+    /// Select a skill (or clear it with `None`) for subsequent turns.
+    ///
+    /// Rewrites the system message in place like [`Self::set_web_enabled`],
+    /// so the change lands on the next turn without restarting the session.
+    /// That invalidates a provider-side cached prefix, which is the same
+    /// already-accepted cost web mode pays -- not a new one.
+    ///
+    /// The lookup fails before the assignment, so a bad id leaves whatever
+    /// was already selected in place rather than silently clearing it.
+    pub fn set_skill(&mut self, id: Option<&str>) -> Result<(), String> {
+        self.active_skill = match id {
+            None => None,
+            Some(id) => Some(
+                crate::skills::find(id)
+                    .ok_or_else(|| format!("unknown skill \"{id}\" -- see `hivemind skills`"))?,
+            ),
         };
+        self.refresh_system_prompt();
+        self.persist();
+        Ok(())
+    }
+
+    fn refresh_system_prompt(&mut self) {
+        let prompt = compose_system_prompt(
+            &self.base_system_prompt,
+            self.web_enabled,
+            self.active_skill,
+        );
         match self.messages.first_mut() {
             Some(first) if first.role == Role::System => *first = Message::system(prompt),
             _ => self.messages.insert(0, Message::system(prompt)),
@@ -542,11 +644,41 @@ impl Agent {
         self.error_streak = 0;
         self.last_call_signature = None;
         self.nudged_this_run = false;
+        self.run_ledger.clear();
+        self.validation_nudged_this_run = false;
         self.web_operations_remaining = WEB_OPERATIONS_PER_RUN;
         let mut checkpoint = Checkpoint::open(user_input, self.messages.len());
+        // Same boundary the checkpoint takes, and for a related reason: this
+        // is where "what this request has done" starts.
+        self.current_request_start = self.messages.len();
         self.messages.push(Message::user(user_input.to_string()));
+        if let Some(t) = &self.tracer {
+            // Rebase first: every figure below is "since this request
+            // started", which is only true if the clock restarts here.
+            t.begin_request();
+            t.emit("user_request_received");
+        }
 
-        for _turn in 0..self.policy.max_turns {
+        // `max_turns` is a checkpoint, not a wall. When it runs out, a run
+        // that is still getting somewhere is granted another block rather
+        // than stopped -- see `earned_more_turns`.
+        let mut limit = self.policy.max_turns;
+        let mut extensions = 0u32;
+        let mut turns_used = 0u32;
+        loop {
+            if let Some(t) = &self.tracer {
+                t.emit("agent_loop_started");
+            }
+            if turns_used >= limit {
+                if extensions < MAX_TURN_EXTENSIONS && self.earned_more_turns() {
+                    extensions += 1;
+                    limit = limit.saturating_add(self.policy.max_turns);
+                    self.ui.turns_extended(turns_used, limit);
+                } else {
+                    break;
+                }
+            }
+            turns_used += 1;
             // Checked here, not mid-stream: a turn already in flight always
             // finishes (same philosophy as the server's own reserve-then-
             // settle -- never interrupt something already committed to,
@@ -557,6 +689,10 @@ impl Agent {
                 self.ui.stopped_for_budget(self.session_cost_usd, budget);
                 checkpoint::push(&mut self.checkpoints, checkpoint);
                 self.persist();
+                if let Some(t) = &self.tracer {
+                    t.emit("session_persistence_completed");
+                    t.emit("final_response_completed");
+                }
                 return Ok(());
             }
 
@@ -581,6 +717,10 @@ impl Agent {
                     .stopped_for_context_limit(estimated_tokens, self.context_window);
                 checkpoint::push(&mut self.checkpoints, checkpoint);
                 self.persist();
+                if let Some(t) = &self.tracer {
+                    t.emit("session_persistence_completed");
+                    t.emit("final_response_completed");
+                }
                 return Ok(());
             }
 
@@ -605,6 +745,9 @@ impl Agent {
             };
 
             self.ui.turn_started();
+            if let Some(t) = &self.tracer {
+                t.emit("provider_request_started");
+            }
             let mut rx = self.client.stream(&req);
             self.messages = std::mem::take(&mut req.messages);
 
@@ -668,8 +811,35 @@ impl Agent {
             }
 
             if !has_tool_calls {
+                // The one place a run can end. A model that rewrote files
+                // and stopped without checking them gets asked once, here,
+                // and is then let through on its next answer whatever it
+                // says -- see `validation.rs` for why this is a nudge and
+                // not a gate.
+                if let Some(nudge) = self.run_ledger.nudge_now(self.validation_nudged_this_run) {
+                    self.validation_nudged_this_run = true;
+                    let (count, text) = match nudge {
+                        crate::validation::Nudge::NothingRan { changed } => {
+                            (changed, crate::validation::NOTHING_RAN_NUDGE)
+                        }
+                        crate::validation::Nudge::NewCodeNeverRun { created } => {
+                            (created, crate::validation::NEW_CODE_NEVER_RUN_NUDGE)
+                        }
+                        crate::validation::Nudge::NewCodeNotLinted { created } => {
+                            (created, crate::validation::NEW_CODE_NOT_LINTED_NUDGE)
+                        }
+                    };
+                    self.ui.validation_required(count);
+                    self.messages.push(Message::user(text.to_string()));
+                    self.persist();
+                    continue;
+                }
                 checkpoint::push(&mut self.checkpoints, checkpoint);
                 self.persist();
+                if let Some(t) = &self.tracer {
+                    t.emit("session_persistence_completed");
+                    t.emit("final_response_completed");
+                }
                 return Ok(());
             }
 
@@ -682,14 +852,56 @@ impl Agent {
             // through a 20-step task must still leave everything up to here
             // resumable.
             self.persist();
+            if let Some(t) = &self.tracer {
+                t.emit("session_persistence_completed");
+            }
         }
 
+        if let Some(t) = &self.tracer {
+            t.emit("final_response_completed");
+        }
         checkpoint::push(&mut self.checkpoints, checkpoint);
         self.persist();
+        if let Some(t) = &self.tracer {
+            t.emit("session_persistence_completed");
+        }
+        // Everything above already ran: the checkpoint is pushed and the
+        // session persisted, so every edit made so far is on disk and
+        // resumable. The old message ("reached max turns (60) without
+        // completing") said none of that and left the user with a number
+        // and no move to make -- so it named the one limit they had not
+        // chosen and hid the two things that actually help.
         anyhow::bail!(
-            "reached max turns ({}) without completing",
-            self.policy.max_turns
+            "stopped after {turns_used} turns without finishing. Your changes so far are saved. \
+             Send another message (\"continue\") to carry on with the same context, or raise \
+             `max_turns` under [agent] in {}.",
+            harness_config::default_config_path().display()
         )
+    }
+
+    /// Whether a run that has used up its turn allowance has earned more.
+    ///
+    /// `max_turns` exists to stop a runaway, and a runaway is a run that has
+    /// stopped getting anywhere -- which the stall counters already measure,
+    /// far more precisely than a turn count can. A run still making progress
+    /// has not earned a stop; it has only met an arbitrary number.
+    ///
+    /// This is not a theoretical distinction. A measured run implementing a
+    /// tracing feature made 31 reads and 24 edits, reached a clean
+    /// `cargo check`, and was killed mid-`cargo fmt` at turn 60 -- with 55%
+    /// of its budget unspent and no stall ever detected. `edit_file` needs
+    /// an exact string match, so each edit costs a read first; 24 edits is
+    /// ~48 turns before anything else happens. Any real multi-file change
+    /// hits this, and the knob that fixes it lives in a config file the user
+    /// has no reason to know exists.
+    ///
+    /// Budget is deliberately not checked here. When one is set, the top of
+    /// the loop already stops the run cleanly at the right moment with the
+    /// right message; extending into that costs nothing and keeps each guard
+    /// doing one job.
+    fn earned_more_turns(&self) -> bool {
+        let threshold = self.policy.escalate_after_repeats;
+        self.repeat_count < threshold && self.error_streak < threshold
     }
 
     pub fn repair_after_interrupt(&mut self) -> bool {
@@ -718,13 +930,33 @@ impl Agent {
     ) -> anyhow::Result<harness_types::ChatResponse> {
         let mut final_response = None;
         let mut saw_text = false;
+        let mut first_token_emitted = false;
+        let mut first_visible_emitted = false;
         while let Some(event) = rx.recv().await {
+            if let Some(t) = self.tracer.as_ref()
+                && !first_token_emitted
+            {
+                first_token_emitted = true;
+                t.emit("first_provider_token_received");
+            }
             match event? {
                 StreamEvent::TextDelta(t) => {
+                    if let Some(t) = self.tracer.as_ref()
+                        && !first_visible_emitted
+                    {
+                        first_visible_emitted = true;
+                        t.emit("first_user_visible_event_emitted");
+                    }
                     saw_text = true;
                     self.ui.assistant_delta(&t);
                 }
                 StreamEvent::ReasoningDelta(r) => {
+                    if let Some(t) = self.tracer.as_ref()
+                        && !first_visible_emitted
+                    {
+                        first_visible_emitted = true;
+                        t.emit("first_user_visible_event_emitted");
+                    }
                     self.ui.reasoning_delta(&r);
                 }
                 StreamEvent::ToolCallStarted(name) => {
@@ -755,7 +987,14 @@ impl Agent {
     /// run after, observationally, for calls that actually executed.
     async fn dispatch_and_record(&mut self, calls: Vec<ToolCall>, checkpoint: &mut Checkpoint) {
         checkpoint.capture(&self.workspace, &calls).await;
+        let mut first_tool_traced = false;
         for call in &calls {
+            if let Some(t) = &self.tracer
+                && !first_tool_traced
+            {
+                first_tool_traced = true;
+                t.emit("first_tool_call_started");
+            }
             self.ui.tool_start(&call.name, call.args.get());
         }
 
@@ -794,6 +1033,13 @@ impl Agent {
         }
 
         let results = self.tools.dispatch_many(executable).await;
+        if let Some(t) = &self.tracer
+            && !results.is_empty()
+        {
+            {
+                t.emit("first_tool_call_completed");
+            }
+        }
         // Web failures are bounded, non-mutating, and often environmental
         // (empty result, upstream limit). They must not buy an automatic
         // jump to a much pricier model.
@@ -806,6 +1052,19 @@ impl Agent {
             // merely *contained* the marker -- a log, a source file, our own
             // docs -- and that answer feeds the escalation counter below.
             let is_error = result.status.is_failure();
+            // Recorded from the call that actually ran and its reported
+            // status, for the same reason `is_error` is: the transcript
+            // keeps only `summary`, so neither which file was written nor
+            // whether the write succeeded survives in a form worth
+            // re-deriving later.
+            let created: Vec<String> = result
+                .changed_files
+                .iter()
+                .filter(|c| c.kind == harness_tools::FileChangeKind::Created)
+                .map(|c| c.path.clone())
+                .collect();
+            self.run_ledger
+                .record(&call.name, &call.args, is_error, &created);
             self.session_cost_usd += result.cost_usd;
             self.ui.tool_end(
                 &call.name,
@@ -980,9 +1239,12 @@ impl Agent {
         let estimated = self
             .last_total_tokens
             .max(crate::tokens::estimate_tokens(&self.messages));
-        if let Some(report) =
-            crate::trim::trim_old_tool_results(&mut self.messages, estimated, self.context_window)
-        {
+        if let Some(report) = crate::trim::trim_old_tool_results(
+            &mut self.messages,
+            estimated,
+            self.context_window,
+            self.current_request_start,
+        ) {
             self.ui
                 .context_trimmed(report.results_elided, report.tokens_saved);
             // The next request is genuinely smaller than the last response's
@@ -1018,6 +1280,19 @@ impl Agent {
                 report.tokens_before,
                 summary_cost_usd,
             );
+            // Compaction is the one thing that renumbers `messages` while a
+            // request is still in flight -- it folds `1..keep_from` into a
+            // single summary -- so the boundary `trim` protects has to move
+            // with it. Left alone it points into whatever now occupies that
+            // index, and the current request quietly loses its protection at
+            // the exact moment context pressure is highest.
+            //
+            // Clamped at 1 because index 0 is the system prompt and the
+            // summary lands at 1. When the current request was itself partly
+            // folded this lands early, which over-protects rather than
+            // under-protects -- the safe direction.
+            let removed = report.messages_before.saturating_sub(report.messages_after);
+            self.current_request_start = self.current_request_start.saturating_sub(removed).max(1);
             // The next request's usage will reflect the smaller prompt;
             // reset our tracked total so we don't immediately re-trigger.
             self.last_total_tokens = 0;
@@ -1082,6 +1357,55 @@ mod tests {
     use super::*;
     use harness_types::ToolCall;
 
+    const BASE: &str =
+        "identity and rules\n\n<project-instructions>conventions</project-instructions>";
+
+    #[test]
+    fn no_skill_and_no_web_leaves_the_base_prompt_untouched() {
+        assert_eq!(compose_system_prompt(BASE, false, None), BASE);
+    }
+
+    #[test]
+    fn a_skill_is_appended_fenced_and_last() {
+        let skill = crate::skills::find("code-review").expect("ships");
+        let prompt = compose_system_prompt(BASE, true, Some(skill));
+
+        // Conventions come last in the base prompt because the nearest
+        // instruction wins ties; a skill is chosen for the task, so it wins
+        // over both those and the web block.
+        let conventions = prompt.find("</project-instructions>").expect("base kept");
+        let web = prompt.find("<web-mode>").expect("web block present");
+        let active = prompt.find("<active-skill").expect("skill block present");
+        assert!(conventions < web, "web must follow the base prompt");
+        assert!(web < active, "the skill must land after the web block");
+        assert!(prompt.contains("</active-skill>"));
+    }
+
+    #[test]
+    fn the_skill_block_survives_web_being_off() {
+        let skill = crate::skills::find("test-writing").expect("ships");
+        let prompt = compose_system_prompt(BASE, false, Some(skill));
+        assert!(!prompt.contains("<web-mode>"));
+        assert!(prompt.contains("<active-skill id=\"test-writing\""));
+    }
+
+    /// Mirrors `Agent::earned_more_turns` without needing a whole `Agent`:
+    /// the decision is entirely (repeat_count, error_streak, threshold).
+    fn earned_more_turns_from(repeat_count: u32, error_streak: u32, threshold: u32) -> bool {
+        repeat_count < threshold && error_streak < threshold
+    }
+
+    /// Mirrors the loop's extension arithmetic.
+    fn simulate_limit(max_turns: u32, max_extensions: u32, productive: bool) -> u32 {
+        let mut limit = max_turns;
+        let mut extensions = 0;
+        while extensions < max_extensions && productive {
+            extensions += 1;
+            limit += max_turns;
+        }
+        limit
+    }
+
     fn asst_calls(n: usize) -> Message {
         Message {
             role: Role::Assistant,
@@ -1097,6 +1421,35 @@ mod tests {
             tool_call_id: None,
             name: None,
         }
+    }
+
+    /// The measured failure: a run making steady progress, no stall ever
+    /// detected, killed at an arbitrary count with budget to spare. It must
+    /// now be allowed to continue.
+    #[test]
+    fn a_run_that_is_still_getting_somewhere_is_granted_more_turns() {
+        // repeat/error streaks below the escalation threshold == progress.
+        assert!(earned_more_turns_from(0, 0, 2));
+        assert!(earned_more_turns_from(1, 1, 2));
+    }
+
+    /// The case the guard actually exists for. A model asking for the same
+    /// failing calls has not earned more turns, however many it has left.
+    #[test]
+    fn a_run_going_in_circles_is_still_stopped() {
+        assert!(!earned_more_turns_from(2, 0, 2), "repeating: must stop");
+        assert!(!earned_more_turns_from(0, 2, 2), "failing: must stop");
+        assert!(!earned_more_turns_from(5, 5, 2));
+    }
+
+    /// A ceiling still has to exist -- "making progress" is a heuristic, and
+    /// being wrong forever is worse than being wrong for a while.
+    #[test]
+    fn extensions_are_bounded_so_a_wrong_guess_cannot_run_away() {
+        let granted = simulate_limit(60, MAX_TURN_EXTENSIONS, true);
+        assert_eq!(granted, 60 * (1 + MAX_TURN_EXTENSIONS));
+        // A run that never looks productive never gets past the first block.
+        assert_eq!(simulate_limit(60, MAX_TURN_EXTENSIONS, false), 60);
     }
 
     #[test]

@@ -36,6 +36,7 @@ fn record(id: &str, updated_at: u64) -> SessionRecord {
         budget_usd: None,
         session_cost_usd: 0.0,
         web_enabled: false,
+        active_skill: None,
         messages: vec![Message::system("s")],
         created_at: updated_at,
         updated_at,

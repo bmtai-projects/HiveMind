@@ -1,30 +1,30 @@
-//! The sample↔tools agent loop, with compaction, cost-aware escalation off
-//! the cheap default, and optional budget enforcement. Analogue of
-//! grok-build's session driver (`xai-grok-shell`) + `xai-grok-agent`'s
-//! policy bundle.
-
 mod agent;
 mod checkpoint;
 mod compaction;
 mod cost;
 mod hooks;
 mod interjection;
+mod latency_trace;
 mod review_orchestrator;
 mod session;
+pub mod skills;
 mod tokens;
 mod trim;
 mod ui;
+mod validation;
 
 pub use agent::Agent;
 pub use checkpoint::{OriginalState, UndoReport};
 pub use compaction::{CompactionPolicy, CompactionReport};
 pub use cost::estimate_cost_usd;
 pub use interjection::InterjectionQueue;
+pub use latency_trace::LatencyTracer;
 pub use review_orchestrator::{
     AgentReviewSampler, ReviewProgressSink, ReviewSamplingProgress, ReviewSamplingStage,
 };
 pub use session::{
     SessionError, SessionRecord, SessionStore, SessionSummary, derive_title, unix_now,
 };
+pub use skills::Skill;
 pub use tokens::estimate_tokens;
 pub use ui::Ui;

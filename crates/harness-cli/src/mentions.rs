@@ -38,7 +38,10 @@ pub fn expand_mentions(input: &str, workspace: &Workspace) -> String {
             continue;
         };
         if metadata.is_dir() {
-            resolved.push((candidate.to_string(), Mentioned::Dir(dir_listing(&path))));
+            resolved.push((
+                candidate.to_string(),
+                Mentioned::Dir(dir_listing(&path, workspace)),
+            ));
             continue;
         }
         if !metadata.is_file() {
@@ -95,23 +98,46 @@ fn is_binary(bytes: &[u8]) -> bool {
 
 /// Workspace-relative file listing for a mentioned directory, capped so a
 /// huge tree can't swamp the prompt.
-fn dir_listing(root: &Path) -> String {
+///
+/// The paths are relative to the **workspace**, not to the mentioned
+/// directory, and that distinction is the whole point. Every file tool
+/// resolves its `path` argument against the workspace root, so a listing
+/// relative to the mention is a list of paths that are guaranteed to fail
+/// the moment the model uses one.
+///
+/// That is not hypothetical. With a workspace open on a directory holding
+/// several repositories -- the ordinary way to work on more than one --
+/// `@HiveMind/` produced `crates/harness-cli/src/main.rs`, while the only
+/// path any tool would accept was `HiveMind/crates/harness-cli/src/main.rs`.
+/// The model used what it was given, got "No such file or directory" from
+/// every call, and spent turns probing with `ls` and `echo $PWD` before
+/// working out on its own that the tools resolve against the workspace root.
+/// It was reasoning correctly from information the harness had made up.
+fn dir_listing(root: &Path, workspace: &Workspace) -> String {
     let mut lines: Vec<String> = Vec::new();
     let mut truncated = false;
 
-    for entry in walkdir::WalkDir::new(root)
-        .into_iter()
-        .filter_entry(|e| !is_ignored(e))
-        .filter_map(Result::ok)
-    {
-        if !entry.file_type().is_file() {
-            continue;
-        }
+    // `Workspace` stores the root exactly as it was given but canonicalizes
+    // inside `resolve`, so `root` here is already canonical while
+    // `workspace.root` may not be -- on macOS that is `/private/var/...`
+    // against `/var/...`, and stripping one from the other silently yields
+    // nothing. Canonicalize the same way `resolve` does, with the same
+    // fallback, so the two agree by construction.
+    let workspace_root = workspace
+        .root
+        .canonicalize()
+        .unwrap_or_else(|_| workspace.root.clone());
+
+    // The same walk the read-only tools use, so a mention shows exactly the
+    // files those tools would find. This listing used to keep its own ignore
+    // list, which is how mentioning a JS project pasted in its `.next/`
+    // build output until it hit the cap below.
+    for path in harness_tools::walk_files(root) {
         if lines.len() >= MAX_DIR_ENTRIES {
             truncated = true;
             break;
         }
-        if let Ok(rel) = entry.path().strip_prefix(root) {
+        if let Ok(rel) = path.strip_prefix(&workspace_root) {
             // Normalize to forward slashes so the listing is the same text
             // on every platform, not just whichever one is rendering it.
             lines.push(rel.to_string_lossy().replace('\\', "/"));
@@ -195,6 +221,73 @@ mod tests {
         assert!(out.contains("<directory path=\"salesforce\">"));
         assert!(out.contains("README.md"));
         assert!(out.contains("src/app.js"));
+    }
+
+    /// The regression that made `@repo/` unusable from a workspace holding
+    /// more than one repository. Every path a mention lists has to be one a
+    /// file tool will actually accept -- i.e. resolvable by `Workspace` --
+    /// and the previous listing was relative to the mentioned directory, so
+    /// none of them were.
+    ///
+    /// The pre-existing test above did not catch this: it asserted the
+    /// output *contained* `src/app.js`, which is equally true of the correct
+    /// `salesforce/src/app.js` and the broken `src/app.js`. This asserts the
+    /// property that actually matters instead of a substring.
+    #[test]
+    fn every_path_a_directory_mention_lists_is_one_the_tools_can_resolve() {
+        let ws = test_workspace("multi_repo");
+        fs::create_dir_all(ws.root.join("HiveMind/crates/harness-cli/src")).unwrap();
+        fs::create_dir_all(ws.root.join("HiveMind-site/src")).unwrap();
+        fs::write(
+            ws.root.join("HiveMind/crates/harness-cli/src/main.rs"),
+            "fn main() {}",
+        )
+        .unwrap();
+        fs::write(ws.root.join("HiveMind/Cargo.toml"), "[package]").unwrap();
+        // A sibling repo that must not leak into the mentioned one's listing.
+        fs::write(ws.root.join("HiveMind-site/src/page.tsx"), "export {}").unwrap();
+
+        let out = expand_mentions("work in @HiveMind/", &ws);
+        let listing = out
+            .split("<directory path=\"HiveMind/\">\n")
+            .nth(1)
+            .and_then(|s| s.split("\n</directory>").next())
+            .expect("a directory block");
+
+        assert!(!listing.is_empty(), "listing should not be empty");
+        for line in listing.lines() {
+            assert!(
+                line.starts_with("HiveMind/"),
+                "listed path {line:?} is not workspace-relative -- no tool can resolve it"
+            );
+            ws.resolve(line)
+                .unwrap_or_else(|e| panic!("listed path {line:?} does not resolve: {e}"));
+        }
+        assert!(listing.contains("HiveMind/crates/harness-cli/src/main.rs"));
+        assert!(
+            !listing.contains("page.tsx"),
+            "a mention must not list a sibling directory's files"
+        );
+    }
+
+    /// A mention of a JS project used to paste in its whole build output,
+    /// because this listing kept its own ignore list separate from the one
+    /// the read-only tools used. It now shares theirs, so `.next/` is
+    /// excluded here for the same reason it is excluded from `project_map`.
+    #[test]
+    fn a_directory_mention_excludes_generated_output() {
+        let ws = test_workspace("mention_generated");
+        fs::create_dir_all(ws.root.join("site/.next/static")).unwrap();
+        fs::create_dir_all(ws.root.join("site/src")).unwrap();
+        fs::write(ws.root.join("site/src/page.tsx"), "export {}").unwrap();
+        fs::write(ws.root.join("site/.next/static/chunk.js"), "generated").unwrap();
+
+        let out = expand_mentions("@site", &ws);
+        assert!(out.contains("site/src/page.tsx"));
+        assert!(
+            !out.contains("chunk.js"),
+            "build output must not reach the prompt"
+        );
     }
 
     #[test]
