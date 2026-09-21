@@ -21,6 +21,7 @@ mod hooks_config;
 mod input;
 mod json_ui;
 mod mentions;
+mod review;
 mod self_update;
 mod ui;
 mod update_check;
@@ -42,6 +43,7 @@ use harness_tools::{
 };
 use input::HivePrompt;
 use json_ui::JsonUi;
+use review::ReviewArgs;
 use ui::TermUi;
 
 /// The agent's own identity paragraph.
@@ -238,6 +240,8 @@ struct Cli {
 enum Command {
     /// Start the agent — interactive REPL, or headless with --prompt.
     Activate(ActivateArgs),
+    /// Review a local Git change without modifying the repository.
+    Review(ReviewArgs),
     /// Manage your HiveMind hosted account (sign in, sign out, check balance).
     Auth(AuthArgs),
     /// List models selectable with --model (hosted mode: "hivemind" plus 6
@@ -586,6 +590,7 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let result = match cli.command {
         Command::Activate(args) => run(args).await,
+        Command::Review(args) => review::run(args).await,
         Command::Auth(args) => match args.action {
             AuthAction::Login { api_base } => auth::login(api_base).await,
             AuthAction::Logout => auth::logout().await,
