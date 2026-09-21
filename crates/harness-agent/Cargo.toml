@@ -10,8 +10,10 @@ harness-types = { workspace = true }
 harness-config = { workspace = true }
 harness-provider = { workspace = true }
 harness-tools = { workspace = true }
+harness-review = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+async-trait = { workspace = true }

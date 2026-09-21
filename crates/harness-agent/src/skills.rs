@@ -1,7 +1,4 @@
-
-
 use std::sync::LazyLock;
-
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Skill {
@@ -49,6 +46,11 @@ pub fn find(id: &str) -> Option<&'static Skill> {
 }
 
 fn parse(raw: &str) -> Result<Skill, String> {
+    // `include_str!` embeds the file's literal on-disk bytes, and a Windows
+    // checkout with `core.autocrlf` gives those `\r\n` line endings --
+    // normalize once so the rest of this hand-rolled parser can assume `\n`
+    // the same way it would on any other platform.
+    let raw = raw.replace("\r\n", "\n");
     let body = raw
         .strip_prefix("---\n")
         .ok_or("skill file must start with a --- frontmatter fence")?;

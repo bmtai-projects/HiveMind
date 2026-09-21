@@ -138,7 +138,9 @@ fn dir_listing(root: &Path, workspace: &Workspace) -> String {
             break;
         }
         if let Ok(rel) = path.strip_prefix(&workspace_root) {
-            lines.push(rel.to_string_lossy().into_owned());
+            // Normalize to forward slashes so the listing is the same text
+            // on every platform, not just whichever one is rendering it.
+            lines.push(rel.to_string_lossy().replace('\\', "/"));
         }
     }
 

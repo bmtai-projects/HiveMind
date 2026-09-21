@@ -1,7 +1,4 @@
-
-
 use harness_types::{Message, Role};
-
 
 const TRIM_ABOVE_PERCENT: u64 = 50;
 const TRIM_TARGET_PERCENT: u64 = 30;
@@ -123,7 +120,6 @@ mod tests {
         Message::tool_result("call-1", name, "x".repeat(chars))
     }
 
-   
     fn trim(m: &mut [Message], estimated: u64, window: u64) -> Option<TrimReport> {
         trim_old_tool_results(m, estimated, window, 0)
     }
@@ -187,7 +183,6 @@ mod tests {
         );
         assert!(m.iter().all(|x| !x.content.starts_with(ELIDED_PREFIX)));
     }
-
 
     #[test]
     fn the_two_files_that_broke_a_real_task_now_fit_together() {

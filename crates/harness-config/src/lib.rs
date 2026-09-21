@@ -541,6 +541,16 @@ pub fn default_sessions_dir() -> PathBuf {
     PathBuf::from("hivemind-sessions")
 }
 
+/// Default review-report location: `~/.config/hivemind/reviews/`.
+/// Reports live outside the reviewed repository so a read-only review never
+/// changes `git status`, while still remaining local to the current user.
+pub fn default_reviews_dir() -> PathBuf {
+    if let Some(home) = dirs_home() {
+        return home.join(".config").join("hivemind").join("reviews");
+    }
+    PathBuf::from("hivemind-reviews")
+}
+
 /// Returns `None` on any failure (missing file, bad TOML, ...) rather than
 /// an error — the caller's next move either way is "fall back / tell the
 /// user to run `hivemind auth login`", so a granular error isn't useful
@@ -659,6 +669,7 @@ mod tests {
             default_config_path(),
             default_credentials_path(),
             default_sessions_dir(),
+            default_reviews_dir(),
         ] {
             assert!(
                 path.is_absolute(),
