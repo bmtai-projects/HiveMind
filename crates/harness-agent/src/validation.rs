@@ -1,5 +1,3 @@
-
-
 use std::collections::BTreeSet;
 
 use serde::Deserialize;
@@ -21,17 +19,14 @@ const LINT_MARKERS: &[&str] = &[
     "clippy", "lint", "eslint", "ruff", "flake8", "rubocop", "vet",
 ];
 
-
 const TEST_MARKERS: &[&str] = &[
     "test", "pytest", "jest", "vitest", "rspec", "phpunit", "gradle", "mvn", "verify",
 ];
-
 
 const SOURCE_EXTENSIONS: &[&str] = &[
     "rs", "ts", "tsx", "js", "jsx", "py", "go", "java", "rb", "php", "c", "cc", "cpp", "h", "hpp",
     "cs", "swift", "kt", "scala", "sh",
 ];
-
 
 const READ_ONLY_COMMANDS: &[&str] = &[
     "cat", "ls", "head", "tail", "grep", "rg", "find", "cd", "echo", "pwd", "which", "wc", "less",
@@ -50,12 +45,11 @@ struct ShellOnly {
     background: bool,
 }
 
-
 fn classify_command(command: &str, background: bool) -> Option<CheckKind> {
     if background {
         return None;
     }
-   
+
     let lowered = command.trim().to_lowercase();
     let normalized = lowered
         .replace("&&", ";")
@@ -103,7 +97,6 @@ fn is_source_file(path: &str) -> bool {
         .next()
         .is_some_and(|ext| SOURCE_EXTENSIONS.contains(&ext.to_lowercase().as_str()))
 }
-
 
 #[derive(Default)]
 pub(crate) struct RunLedger {
@@ -172,7 +165,6 @@ impl RunLedger {
         }
     }
 
-   
     pub(crate) fn unchecked_change_count(&self) -> Option<usize> {
         (!self.changed.is_empty() && !self.anything_ran()).then_some(self.changed.len())
     }
@@ -184,7 +176,7 @@ impl RunLedger {
         if let Some(changed) = self.unchecked_change_count() {
             return Some(Nudge::NothingRan { changed });
         }
-       
+
         if self.created_source.is_empty() {
             return None;
         }
@@ -193,7 +185,7 @@ impl RunLedger {
                 created: self.created_source.len(),
             });
         }
-        
+
         if !self.linted {
             return Some(Nudge::NewCodeNotLinted {
                 created: self.created_source.len(),
@@ -202,7 +194,6 @@ impl RunLedger {
         None
     }
 }
-
 
 pub(crate) const NOTHING_RAN_NUDGE: &str = "\
 <harness-note>
@@ -217,7 +208,6 @@ Before finishing:
   in one sentence and finish. Do not invent a command to satisfy this note.
 </harness-note>";
 
-
 pub(crate) const NEW_CODE_NEVER_RUN_NUDGE: &str = "\
 <harness-note>
 You wrote new code and compiled it, but nothing has executed it. Compiling
@@ -231,7 +221,6 @@ Before finishing:
 - If a test fails, fix it and re-run. Reporting a failure you introduced is
   not finishing.
 </harness-note>";
-
 
 pub(crate) const NEW_CODE_NOT_LINTED_NUDGE: &str = "\
 <harness-note>
@@ -299,7 +288,6 @@ mod tests {
         assert_eq!(l.unchecked_change_count(), None);
     }
 
-   
     #[test]
     fn checking_before_the_last_edit_does_not_count() {
         let mut l = RunLedger::default();
@@ -545,7 +533,6 @@ mod tests {
         assert_eq!(l.nudge_now(false), None);
     }
 
- 
     #[test]
     fn a_compile_after_a_test_does_not_un_run_the_test() {
         let mut l = RunLedger::default();

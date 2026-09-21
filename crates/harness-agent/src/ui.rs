@@ -6,7 +6,6 @@ use std::time::Duration;
 use harness_types::Usage;
 
 pub trait Ui: Send + Sync {
-    
     fn turn_started(&self);
     fn assistant_delta(&self, text: &str);
     fn reasoning_delta(&self, text: &str);
@@ -40,7 +39,6 @@ pub trait Ui: Send + Sync {
         tokens_before: u64,
         summary_cost_usd: Option<f64>,
     );
-
 
     fn stopped_for_budget(&self, spent_usd: f64, budget_usd: f64);
     fn stopped_for_context_limit(&self, estimated_tokens: u64, context_window: u64);

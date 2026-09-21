@@ -1,5 +1,3 @@
-
-
 use std::sync::{Arc, Mutex};
 const MAX_INTERJECTION_CHARS: usize = 25_000;
 #[derive(Clone, Default)]
