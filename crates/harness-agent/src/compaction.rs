@@ -287,15 +287,9 @@ async fn summarize(
         ],
         tools: Vec::new(),
         temperature: None,
-        // Five sections need more room than one paragraph did, and the
-        // ceiling matters: a summary cut off mid-section loses whichever
-        // sections come last, and "Next steps" is last precisely because
-        // it is the one the agent rereads first.
+
         max_tokens: Some(900),
         reasoning_effort: None,
-        // A summarization call builds a throwaway two-message prompt with
-        // no tools and no shared prefix -- there is nothing here a cache
-        // could ever hit, so a breakpoint would only add wire noise.
         cache_prompt_prefix: false,
     };
     let mut rx = client.stream(&req);
@@ -380,9 +374,7 @@ mod tests {
         assert_eq!(edited_paths(&msgs), vec!["new.rs", "old.rs"]);
     }
 
-    /// The whole point of computing this rather than asking for it: a
-    /// summarizer told to be brief drops file paths, and the harness
-    /// already knows them exactly.
+   
     #[test]
     fn the_file_section_is_appended_to_whatever_the_summarizer_returned() {
         let out = with_edited_files("## Goal\nShip it.", &edits(&["src/main.rs"]));
