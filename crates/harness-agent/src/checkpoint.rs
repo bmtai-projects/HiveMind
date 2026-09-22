@@ -13,22 +13,7 @@ use std::path::PathBuf;
 use harness_tools::Workspace;
 use harness_types::{Message, ToolCall};
 use serde::Deserialize;
-
-/// Cap on how many turns back `/undo` can reach. An in-memory-only design
-/// needs a smaller bound than a durable, multi-session store would: the
-/// real cost here is holding full file contents as strings for the whole
-/// REPL session's lifetime, not disk space.
 pub const MAX_CHECKPOINTS: usize = 20;
-
-/// The tool names that participate in checkpointing. Matches grok-build's
-/// own scope exactly: shell-driven file changes aren't checkpointed there
-/// either — only the dedicated file-edit tools.
-///
-/// Defined in `validation` and shared rather than kept per-module: the same
-/// list decides what `/undo` can restore, what has to be checked before a
-/// run ends, and which files a compaction summary reports — and a tool
-/// added to one copy but not the others would get some fraction of that
-/// silently.
 use crate::validation::MUTATING_TOOLS;
 
 #[derive(Deserialize)]
@@ -36,17 +21,13 @@ struct PathOnly {
     path: String,
 }
 
-/// A file's content immediately before the turn that's about to run.
-/// `before: None` means the file didn't exist yet — restoring it means
-/// deleting whatever the turn created.
+
 struct FileSnapshot {
     path: PathBuf,
     before: Option<String>,
 }
 
-/// Everything needed to undo one user turn: where the conversation was
-/// before it started, and every file it's about to touch (or did touch,
-/// once the turn completes) in its pre-turn state.
+
 pub struct Checkpoint {
     /// The user's input for this turn, for the `/undo` confirmation
     /// message. Not used for restore logic.
@@ -77,15 +58,7 @@ impl Checkpoint {
         }
     }
 
-    /// Inspects one turn's batch of tool calls and, for any `edit_file`/
-    /// `write_file` call whose path hasn't already been captured in this
-    /// checkpoint, records that path's current on-disk content (or its
-    /// absence) *before* the batch is dispatched.
-    ///
-    /// Snapshotting a file whose edit then fails validation and never
-    /// actually writes is harmless -- just one wasted read in that case --
-    /// and is the accepted tradeoff against the complexity of only
-    /// snapshotting after confirming success under concurrent dispatch.
+   
     pub async fn capture(&mut self, workspace: &Workspace, calls: &[ToolCall]) {
         for call in calls {
             if !MUTATING_TOOLS.contains(&call.name.as_str()) {
@@ -109,26 +82,13 @@ impl Checkpoint {
     }
 }
 
-/// One file the session has touched, paired with how it looked before the
-/// session touched it. `before: None` means the session created it.
+
 pub struct OriginalState {
     pub path: PathBuf,
     pub before: Option<String>,
 }
 
-/// Every file the session has changed, each paired with its state *before
-/// the earliest turn that touched it* — which is what "what has this
-/// session done to my workspace" actually means.
-///
-/// Walks oldest checkpoint first and keeps the first snapshot seen per
-/// path, mirroring the first-touch-wins rule inside a single checkpoint.
-/// Taking the newest instead would describe only the last turn's edit and
-/// silently hide everything before it.
-///
-/// Bounded by the same [`MAX_CHECKPOINTS`] window as `/undo`: a file
-/// changed more than 20 turns ago has aged out of the in-memory history and
-/// cannot be reported here. Callers that show this to a user should say so
-/// rather than implying the list is exhaustive.
+
 pub fn original_states(checkpoints: &[Checkpoint]) -> Vec<OriginalState> {
     let mut seen: Vec<OriginalState> = Vec::new();
     for cp in checkpoints {
@@ -156,20 +116,7 @@ pub struct UndoReport {
     pub messages_truncated_to: usize,
 }
 
-/// Pops and restores the most recent `n` checkpoints (clamped to however
-/// many actually exist). `messages` is truncated in place; files are
-/// written back to disk directly.
-///
-/// Implemented as a straightforward repeated single-pop, not a batch/merge
-/// pass over all `n` at once -- and that's provably equivalent to the
-/// "correct" composed result: each successive truncate can only shrink
-/// `messages` further, so after `n` pops its length is exactly the oldest
-/// of the `n` checkpoints' `message_len_before`; each write to a given
-/// path is overwritten by every subsequent (older) pop that also touched
-/// it, so after `n` pops every file sits at its state from the *oldest*
-/// checkpoint among the `n` that touched it. No path -> snapshot merge map
-/// needed: repeated overwrite already converges to the last (oldest)
-/// writer.
+
 pub async fn undo(
     checkpoints: &mut Vec<Checkpoint>,
     messages: &mut Vec<Message>,
@@ -233,11 +180,7 @@ mod tests {
     use serde_json::value::RawValue;
 
     fn ws() -> Workspace {
-        // A counter, not a timestamp: tests run concurrently as separate
-        // threads in one process, and a nanosecond-resolution timestamp is
-        // not actually a safe uniqueness guarantee under thread scheduling
-        // jitter on every host -- confirmed flaky here, two tests collided
-        // on the same directory and each saw the other's file content.
+      
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!(
