@@ -668,6 +668,9 @@ mod tests {
     /// backgrounded process inherits those pipes, so the call used to block
     /// for the background job's whole lifetime (a 120s timeout in the real
     /// session that prompted this). The shell exits immediately; so must we.
+    ///
+    /// Unix-only: `cmd.exe` reads `&` as a sequential separator, not backgrounding.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_trailing_ampersand_no_longer_blocks_until_the_background_job_ends() {
         let started = std::time::Instant::now();
