@@ -247,6 +247,13 @@ impl Tool for ReadFile {
     async fn execute(&self, args: &RawValue) -> Result<ToolResult, ToolError> {
         let a: ReadArgs = serde_json::from_str(args.get())?;
         let p = self.0.resolve(&a.path)?;
+        // Windows reports a directory read as "Access is denied", which misleads.
+        if tokio::fs::metadata(&p).await.is_ok_and(|m| m.is_dir()) {
+            return Err(ToolError::Message(format!(
+                "{} is a directory, not a file -- use list_dir to see what is in it",
+                a.path
+            )));
+        }
         let bytes = tokio::fs::read(&p).await?;
         let text = String::from_utf8_lossy(&bytes);
         // Fingerprint the *whole* file, on every path through this function:

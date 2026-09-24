@@ -25,6 +25,8 @@ reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 open = { workspace = true }
+# Real terminal width, so rendered lines never wrap and strand un-erasable text.
+terminal_size = { workspace = true }
 # `hivemind update`: replaces the currently-running executable in place.
 # Hand-rolling this is a trap on Windows specifically -- it locks a running
 # .exe against in-place overwrite, and this crate already implements the
