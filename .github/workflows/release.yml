@@ -11,7 +11,32 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Gate: a tag must clear the same checks as a push to main. Without this,
+  # `build` starts immediately and v1.9.18 published from a commit whose CI
+  # run was failing. Kept identical to ci.yml's `check` job on purpose.
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - name: fmt
+        run: cargo fmt --all -- --check
+
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: test
+        run: cargo test --workspace
+
+      - name: build (release)
+        run: cargo build --workspace --release
+
   build:
+    needs: check
     strategy:
       fail-fast: false
       matrix:
