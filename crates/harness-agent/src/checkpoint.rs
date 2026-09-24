@@ -21,12 +21,10 @@ struct PathOnly {
     path: String,
 }
 
-
 struct FileSnapshot {
     path: PathBuf,
     before: Option<String>,
 }
-
 
 pub struct Checkpoint {
     /// The user's input for this turn, for the `/undo` confirmation
@@ -58,7 +56,6 @@ impl Checkpoint {
         }
     }
 
-   
     pub async fn capture(&mut self, workspace: &Workspace, calls: &[ToolCall]) {
         for call in calls {
             if !MUTATING_TOOLS.contains(&call.name.as_str()) {
@@ -82,12 +79,10 @@ impl Checkpoint {
     }
 }
 
-
 pub struct OriginalState {
     pub path: PathBuf,
     pub before: Option<String>,
 }
-
 
 pub fn original_states(checkpoints: &[Checkpoint]) -> Vec<OriginalState> {
     let mut seen: Vec<OriginalState> = Vec::new();
@@ -115,7 +110,6 @@ pub struct UndoReport {
     pub files_removed: usize,
     pub messages_truncated_to: usize,
 }
-
 
 pub async fn undo(
     checkpoints: &mut Vec<Checkpoint>,
@@ -180,7 +174,6 @@ mod tests {
     use serde_json::value::RawValue;
 
     fn ws() -> Workspace {
-      
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!(
