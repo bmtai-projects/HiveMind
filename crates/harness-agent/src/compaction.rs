@@ -374,7 +374,6 @@ mod tests {
         assert_eq!(edited_paths(&msgs), vec!["new.rs", "old.rs"]);
     }
 
-   
     #[test]
     fn the_file_section_is_appended_to_whatever_the_summarizer_returned() {
         let out = with_edited_files("## Goal\nShip it.", &edits(&["src/main.rs"]));
