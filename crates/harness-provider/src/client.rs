@@ -21,12 +21,12 @@ pub type EventStream = UnboundedReceiver<Result<StreamEvent, ProviderError>>;
 pub type RetryHook = Arc<dyn Fn(u32, u32, Duration, &ProviderError) + Send + Sync>;
 
 /// Streaming Chat Completions client. Holds one [`reqwest::Client`] — cloning
-/// `DeepSeekClient` clones an `Arc`-backed handle to the same connection
+/// `ChatClient` clones an `Arc`-backed handle to the same connection
 /// pool, so every request (including retries and concurrent tool-triggered
 /// escalation calls) reuses keep-alive HTTP/2 connections rather than
 /// paying a fresh TLS handshake each time.
 #[derive(Clone)]
-pub struct DeepSeekClient {
+pub struct ChatClient {
     http: Client,
     base_url: Arc<str>,
     api_key: Arc<str>,
@@ -34,7 +34,7 @@ pub struct DeepSeekClient {
     on_retry: Option<RetryHook>,
 }
 
-impl DeepSeekClient {
+impl ChatClient {
     pub fn new(base_url: impl Into<String>, api_key: impl Into<String>) -> Self {
         let http = Client::builder()
             .timeout(Duration::from_secs(300))
@@ -360,7 +360,7 @@ mod tests {
     }
 
     async fn collect(url: String) -> Vec<StreamEvent> {
-        let client = DeepSeekClient::new(url, "k");
+        let client = ChatClient::new(url, "k");
         let mut rx = client.stream(&req());
         let mut events = Vec::new();
         while let Some(e) = rx.recv().await {

@@ -239,8 +239,8 @@ pub(crate) struct WireUsage {
     pub completion_tokens: u64,
     #[serde(default)]
     pub total_tokens: u64,
-    /// DeepSeek's *native* context-caching fields, sent when talking to
-    /// DeepSeek's own API directly (the hosted backend's fallback path).
+    /// The DeepSeek-dialect spelling of context caching, carried when a key
+    /// talks to that vendor's API directly rather than through a gateway.
     #[serde(default)]
     pub prompt_cache_hit_tokens: Option<u64>,
     #[serde(default)]
@@ -263,10 +263,10 @@ pub(crate) struct WirePromptTokensDetails {
 
 impl WireUsage {
     /// Prompt tokens served from cache, from whichever dialect reported it.
-    /// DeepSeek's native field wins when both are present -- same
-    /// precedence the hosted backend's own billing uses
-    /// (`HiveMind-server/src/proxy/cost.ts`), so the client-side estimate
-    /// and the server-side charge can't disagree about what was cached.
+    /// The DeepSeek-dialect field wins when both are present. This
+    /// precedence must match whatever the billing side applies, or the
+    /// client's estimate and the actual charge disagree about what was
+    /// cached -- so change both together or neither.
     pub fn cache_hit_tokens(&self) -> Option<u64> {
         self.prompt_cache_hit_tokens
             .or_else(|| self.prompt_tokens_details.as_ref()?.cached_tokens)
