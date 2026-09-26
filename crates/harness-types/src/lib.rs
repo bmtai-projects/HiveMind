@@ -175,3 +175,107 @@ pub enum StreamEvent {
     ToolCallStarted(String),
     Done(Box<ChatResponse>),
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn constructors_set_the_role_and_leave_everything_else_empty() {
+        for (msg, role) in [
+            (Message::system("s"), Role::System),
+            (Message::user("u"), Role::User),
+            (Message::assistant("a"), Role::Assistant),
+        ] {
+            assert_eq!(msg.role, role);
+            assert!(msg.reasoning.is_empty());
+            assert!(msg.tool_calls.is_empty());
+            assert!(msg.tool_call_id.is_none());
+            assert!(msg.name.is_none());
+        }
+        assert_eq!(Message::user("hi").content, "hi");
+    }
+
+    #[test]
+    fn tool_result_carries_the_call_id_and_tool_name() {
+        let msg = Message::tool_result("call_1", "read_file", "contents");
+        assert_eq!(msg.role, Role::Tool);
+        assert_eq!(msg.tool_call_id.as_deref(), Some("call_1"));
+        assert_eq!(msg.name.as_deref(), Some("read_file"));
+        assert_eq!(msg.content, "contents");
+    }
+
+    #[test]
+    fn empty_optional_fields_are_left_off_the_wire() {
+        let value = serde_json::to_value(Message::user("hi")).unwrap();
+        assert_eq!(value, json!({"role": "user", "content": "hi"}));
+    }
+
+    #[test]
+    fn a_message_with_tool_calls_round_trips_with_raw_args_intact() {
+        let mut msg = Message::assistant("");
+        msg.tool_calls.push(ToolCall {
+            id: "c0".into(),
+            name: "search".into(),
+            args: RawValue::from_string(r#"{"q":"x","n":3}"#.into()).unwrap(),
+        });
+        let text = serde_json::to_string(&msg).unwrap();
+        // Empty content is omitted, not sent as "".
+        assert!(!text.contains("\"content\""), "{text}");
+
+        let back: Message = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.role, Role::Assistant);
+        assert_eq!(back.tool_calls.len(), 1);
+        assert_eq!(back.tool_calls[0].name, "search");
+        assert_eq!(back.tool_calls[0].args.get(), r#"{"q":"x","n":3}"#);
+    }
+
+    #[test]
+    fn missing_optional_fields_deserialize_to_defaults() {
+        let msg: Message = serde_json::from_value(json!({"role": "tool"})).unwrap();
+        assert_eq!(msg.role, Role::Tool);
+        assert!(msg.content.is_empty());
+        assert!(msg.tool_calls.is_empty());
+        assert!(msg.tool_call_id.is_none());
+    }
+
+    #[test]
+    fn roles_serialize_as_snake_case() {
+        for (role, name) in [
+            (Role::System, "system"),
+            (Role::User, "user"),
+            (Role::Assistant, "assistant"),
+            (Role::Tool, "tool"),
+        ] {
+            assert_eq!(serde_json::to_value(role).unwrap(), json!(name));
+        }
+    }
+
+    fn usage(hit: Option<u64>, miss: Option<u64>) -> Usage {
+        Usage {
+            cache_hit_tokens: hit,
+            cache_miss_tokens: miss,
+            ..Usage::default()
+        }
+    }
+
+    #[test]
+    fn cache_hit_rate_is_hits_over_hits_plus_misses() {
+        assert_eq!(usage(Some(75), Some(25)).cache_hit_rate(), Some(0.75));
+        assert_eq!(usage(Some(10), Some(0)).cache_hit_rate(), Some(1.0));
+        assert_eq!(usage(Some(0), Some(10)).cache_hit_rate(), Some(0.0));
+    }
+
+    #[test]
+    fn cache_hit_rate_is_unknown_without_hit_data_or_tokens() {
+        // No hit figure at all: the provider didn't report caching.
+        assert_eq!(usage(None, Some(100)).cache_hit_rate(), None);
+        assert_eq!(usage(None, None).cache_hit_rate(), None);
+        // Reported, but nothing to divide by.
+        assert_eq!(usage(Some(0), Some(0)).cache_hit_rate(), None);
+        assert_eq!(usage(Some(0), None).cache_hit_rate(), None);
+        // Hits reported without misses: treat misses as zero.
+        assert_eq!(usage(Some(5), None).cache_hit_rate(), Some(1.0));
+    }
+}
