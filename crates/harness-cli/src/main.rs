@@ -51,7 +51,7 @@ use ui::TermUi;
 /// Kept as its own constant because it fixes a correctness problem, not
 /// just a branding one. With no name in the prompt the model filled the gap
 /// from its training priors and answered "who created you?" with
-/// "Anthropic" -- while `hivemind` actually routes to DeepSeek. It was not
+/// "Anthropic", which is not who serves the `hivemind` alias. It was not
 /// leaking a true fact, it was inventing a false attribution, and it did
 /// the same generic hand-waving for "what model are you?".
 ///

@@ -19,11 +19,16 @@ key at whatever their provider supports.
 > guess. Naming the upstream vendor in user-facing copy undoes that on
 > purpose-built work, so don't.
 
-> **This repo is source-only and private.** Compiled binaries are published
-> to the public [`HiveMind-releases`](https://github.com/BibhabenduMukherjee/HiveMind-releases)
-> repo, which has no source in it — that's where the public install command
-> lives. See [Distributing a release](#distributing-a-release) for how the
-> two repos connect.
+> **This repo is the source. Compiled binaries live elsewhere** — they are
+> published to [`HiveMind-releases`](https://github.com/BibhabenduMukherjee/HiveMind-releases),
+> which carries no source, and that is where the install command points. See
+> [Distributing a release](#distributing-a-release) for how the two connect.
+> The hosted backend (auth, billing, the model proxy) is a separate private
+> service; nothing here depends on seeing it, and BYOK skips it entirely.
+
+New here? [CONTRIBUTING.md](CONTRIBUTING.md) has the build, the test commands,
+and the one architectural rule that matters. Security reports go through
+[SECURITY.md](SECURITY.md), not public issues.
 
 ## Why it's cheap
 
@@ -52,14 +57,17 @@ single source of truth, so quoting numbers here would just rot. See
 
 ### Install
 
-Public install command (no source access needed — this is what goes in
-user-facing docs):
+Install command (this is what goes in user-facing docs):
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/BibhabenduMukherjee/HiveMind-releases/main/install.sh | bash
+curl -fsSL https://hivemind.bmtai.in/install.sh | bash
 ```
 
-If you have access to this (private) repo, build from source instead:
+```powershell
+irm https://hivemind.bmtai.in/install.ps1 | iex
+```
+
+Or build from source:
 
 ```sh
 git clone https://github.com/BibhabenduMukherjee/HiveMind.git
@@ -228,6 +236,20 @@ existing seam:
 - **Explicit `anthropic-style` cache breakpoints** — wired up and gated per-model by `needs_explicit_cache_control`; most models cache automatically and must not be sent it.
 - **A `/cost` and `/tier` REPL command** — the pricing and tier machinery already exists in `harness-config`/`harness-cli/src/ui.rs`; this is UI wiring, not new logic.
 
+## Contributing
+
+Seven crates, about 33k lines, roughly 630 tests — small enough to read in a
+sitting. [CONTRIBUTING.md](CONTRIBUTING.md) covers the setup, the four commands
+CI runs, and the one rule that keeps it navigable: data flows one way and no
+crate reaches back up the stack. The [Roadmap](#roadmap) above is the honest
+list of what is scoped out and where the seams already are.
+
 ## License
 
-MIT — see [LICENSE](LICENSE).
+Dual-licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT license ([LICENSE-MIT](LICENSE-MIT))
+
+at your option. Contributions are dual-licensed the same way unless you state
+otherwise.

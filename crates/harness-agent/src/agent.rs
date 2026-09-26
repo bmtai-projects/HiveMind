@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use harness_config::{AgentPolicy, HookSpec, Resolved};
-use harness_provider::DeepSeekClient;
+use harness_provider::ChatClient;
 use harness_tools::{
     ArtifactStore, DEFAULT_ARTIFACT_THRESHOLD_BYTES, Registry, ToolResult, Workspace,
 };
@@ -174,7 +174,7 @@ fn compose_system_prompt(
 }
 
 pub struct Agent {
-    client: DeepSeekClient,
+    client: ChatClient,
     tools: Registry,
     policy: AgentPolicy,
     ui: Arc<dyn Ui>,
@@ -280,7 +280,7 @@ impl Agent {
         system_prompt: String,
     ) -> Self {
         let ui_for_retry = ui.clone();
-        let client = DeepSeekClient::new(
+        let client = ChatClient::new(
             resolved.endpoint.base_url.clone(),
             resolved.endpoint.api_key.clone(),
         )
