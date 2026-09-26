@@ -109,3 +109,77 @@ impl Prompt for HivePrompt {
         ))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn prompt(yolo: bool) -> HivePrompt {
+        HivePrompt {
+            model: "hivemind".to_string(),
+            yolo,
+        }
+    }
+
+    fn scratch(tag: &str) -> PathBuf {
+        let id = std::process::id();
+        std::env::temp_dir().join(format!("hivemind-input-{tag}-{id}"))
+    }
+
+    fn search(status: PromptHistorySearchStatus, term: &str) -> String {
+        let search = PromptHistorySearch::new(status, term.to_string());
+        prompt(false)
+            .render_prompt_history_search_indicator(search)
+            .into_owned()
+    }
+
+    #[test]
+    fn right_prompt_shows_the_model_and_approval_mode() {
+        let approve = prompt(false).render_prompt_right().into_owned();
+        let yolo = prompt(true).render_prompt_right().into_owned();
+        assert_eq!(approve, "\x1b[90mhivemind · approve\x1b[0m");
+        assert_eq!(yolo, "\x1b[90mhivemind · yolo\x1b[0m");
+    }
+
+    #[test]
+    fn left_prompt_is_empty_and_the_indicator_is_the_chevron() {
+        let p = prompt(false);
+        let indicator = p.render_prompt_indicator(PromptEditMode::Default);
+        assert_eq!(p.render_prompt_left(), "");
+        assert_eq!(indicator, "\x1b[1m\u{203a} \x1b[0m");
+        assert_eq!(p.render_prompt_multiline_indicator(), "\u{2026} ");
+    }
+
+    #[test]
+    fn history_search_indicator_marks_a_failing_search() {
+        let passing = search(PromptHistorySearchStatus::Passing, "cargo");
+        let failing = search(PromptHistorySearchStatus::Failing, "zzz");
+        assert_eq!(passing, "(reverse-search: cargo) ");
+        assert_eq!(failing, "(failing reverse-search: zzz) ");
+    }
+
+    #[test]
+    fn building_the_editor_creates_the_history_directory() {
+        let root = scratch("ok");
+        let history = root.join("nested").join("history.txt");
+        let _ = std::fs::remove_dir_all(&root);
+
+        let _editor = build_line_editor(&root, Some(history.clone()));
+        assert!(history.parent().unwrap().is_dir());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_unusable_history_path_degrades_instead_of_failing() {
+        // A path whose "parent" is a regular file can never hold a history
+        // file; the editor must still build, just without history.
+        let root = scratch("bad");
+        std::fs::create_dir_all(&root).unwrap();
+        let blocker = root.join("not-a-dir");
+        std::fs::write(&blocker, "x").unwrap();
+
+        let _editor = build_line_editor(&root, Some(blocker.join("history.txt")));
+        let _editor = build_line_editor(&root, None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
