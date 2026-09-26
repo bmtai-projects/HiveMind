@@ -732,7 +732,7 @@ async fn run(args: ActivateArgs) -> anyhow::Result<()> {
         &harness_config::default_credentials_path(),
         overrides,
     )?;
-    if args.web && !resolved.hosted {
+    if args.web && !resolved.backend.is_hosted() {
         anyhow::bail!("--web requires HiveMind hosted sign-in; run `hivemind auth login`");
     }
 
@@ -793,7 +793,7 @@ async fn run(args: ActivateArgs) -> anyhow::Result<()> {
     if read_program_available {
         registry.register(Arc::new(ReadProgram::new(ws.clone())));
     }
-    if resolved.hosted
+    if resolved.backend.is_hosted()
         && let Some(web_client) =
             HostedWebClient::new(&resolved.endpoint.base_url, &resolved.endpoint.api_key)
     {
@@ -807,7 +807,8 @@ async fn run(args: ActivateArgs) -> anyhow::Result<()> {
     // fallback, so a network failure degrades quality instead of failing
     // the task.
     let hosted_token = resolved
-        .hosted
+        .backend
+        .is_hosted()
         .then_some(resolved.endpoint.api_key.as_str());
     let pro = resolved.mode == harness_config::Mode::Pro;
     let progress_ui: harness_tools::ProgressSink = {
