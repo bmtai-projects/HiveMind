@@ -10,7 +10,14 @@ env:
 
 jobs:
   check:
-    runs-on: ubuntu-latest
+    strategy:
+      # Report both platforms. Cancelling Linux because Windows failed hides
+      # whether the problem is platform-specific, which is the one thing this
+      # matrix exists to tell us.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -18,7 +25,9 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
 
+      # Formatting is platform-independent, so it runs once.
       - name: fmt
+        if: runner.os == 'Linux'
         run: cargo fmt --all -- --check
 
       - name: clippy
