@@ -240,13 +240,52 @@ pub struct HookSpec {
     pub enforcement: bool,
 }
 
+/// Which kind of backend this session talks to.
+///
+/// An enum rather than a pair of bools: `hosted` and `local` as two flags
+/// would admit a fourth state that means nothing, and the markup, the web
+/// tools and Pro mode each key off exactly one of these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Backend {
+    /// HiveMind's own proxy. Markup applies; web tools and Pro mode exist.
+    Hosted,
+    /// The user's own key, straight to their provider. No markup.
+    Byok,
+    /// A keyless endpoint on the user's machine (Ollama, LM Studio,
+    /// llama.cpp). No markup, nothing billed, no network beyond localhost.
+    Local,
+}
+
+impl Backend {
+    /// True only for [`Backend::Hosted`]. Reads better than `== Hosted` at
+    /// the call sites that gate a hosted-only capability.
+    pub fn is_hosted(self) -> bool {
+        self == Backend::Hosted
+    }
+
+    /// Whether tokens on this backend cost the user money we quote.
+    pub fn is_billed(self) -> bool {
+        self != Backend::Local
+    }
+
+    /// Stable wire/display name. Part of the `--protocol json` contract, so
+    /// these strings are not free to rename.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Backend::Hosted => "hosted",
+            Backend::Byok => "byok",
+            Backend::Local => "local",
+        }
+    }
+}
+
 /// Fully resolved runtime configuration.
 #[derive(Debug, Clone)]
 pub struct Resolved {
     pub endpoint: Endpoint,
     pub default_model: String,
     pub mode: Mode,
-    pub hosted: bool,
+    pub backend: Backend,
     pub reasoning_effort: Option<String>,
     pub budget_usd: Option<f64>,
     pub policy: AgentPolicy,
@@ -394,31 +433,31 @@ pub fn resolve(
         .or_else(|| file.model.base_url.clone())
         .or_else(|| file.deepseek.base_url.clone());
 
-    let (api_key, base_url, hosted) = match explicit_key {
+    let (api_key, base_url, backend) = match explicit_key {
         Some(key) => (
             key,
             base_url_override.unwrap_or_else(|| "https://api.deepseek.com".to_string()),
-            false,
+            Backend::Byok,
         ),
         None => {
             let creds = load_hosted_credentials(credentials_path).ok_or(ConfigError::MissingKey)?;
             (
                 creds.access_token,
                 base_url_override.unwrap_or(creds.api_base),
-                true,
+                Backend::Hosted,
             )
         }
     };
 
     // Hosted mode defaults to the branded "hivemind" alias, which resolves
-    // to the full 7-model catalog server-side. BYOK talks to the upstream
+    // to the full catalog server-side. Every other backend talks to a
     // provider directly, so it needs a real provider-native id instead.
     let default_model = cli
         .model
         .or_else(|| file.model.model.clone())
         .or_else(|| file.deepseek.model.clone())
         .unwrap_or_else(|| {
-            if hosted {
+            if backend.is_hosted() {
                 "hivemind".to_string()
             } else {
                 "deepseek-v4-flash".to_string()
@@ -468,7 +507,7 @@ pub fn resolve(
         endpoint: Endpoint { base_url, api_key },
         default_model,
         mode,
-        hosted,
+        backend,
         reasoning_effort,
         budget_usd,
         policy,
@@ -730,7 +769,7 @@ mod tests {
         .unwrap();
         assert_eq!(resolved.endpoint.api_key, "sk-test");
         assert_eq!(resolved.default_model, "deepseek-v4-flash");
-        assert!(!resolved.hosted);
+        assert_eq!(resolved.backend, Backend::Byok);
     }
 
     #[test]
@@ -862,7 +901,7 @@ mod tests {
             "https://hivemind-server.example/v1"
         );
         assert_eq!(resolved.default_model, "hivemind");
-        assert!(resolved.hosted);
+        assert_eq!(resolved.backend, Backend::Hosted);
 
         std::fs::remove_dir_all(&dir).ok();
     }

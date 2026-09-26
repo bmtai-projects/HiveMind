@@ -3,6 +3,7 @@
 
 use std::time::Duration;
 
+use harness_config::Backend;
 use harness_types::Usage;
 
 pub trait Ui: Send + Sync {
@@ -20,7 +21,7 @@ pub trait Ui: Send + Sync {
         cost_usd: f64,
         session_cost_usd: f64,
     );
-    fn usage(&self, usage: &Usage, model_id: &str, hosted: bool, session_cost_usd: f64);
+    fn usage(&self, usage: &Usage, model_id: &str, backend: Backend, session_cost_usd: f64);
 
     /// Fired before each retry sleep (429/5xx/network hiccup).
     fn retrying(&self, attempt: u32, max: u32, delay: Duration, err: &str);
