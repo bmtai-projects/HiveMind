@@ -85,7 +85,9 @@ async fn login_with(
         match open::that(&start.verification_uri_complete) {
             Ok(()) => println!("Opening in your browser..."),
             Err(e) => {
-                println!("(couldn't open a browser automatically: {e} — open the URL above manually)")
+                println!(
+                    "(couldn't open a browser automatically: {e} — open the URL above manually)"
+                )
             }
         }
     }
@@ -291,7 +293,8 @@ mod tests {
         )
     }
 
-    const APPROVED: &str = r#"{"status":"approved","access_token":"tok-xyz","api_base":"https://api.example/v1"}"#;
+    const APPROVED: &str =
+        r#"{"status":"approved","access_token":"tok-xyz","api_base":"https://api.example/v1"}"#;
 
     #[tokio::test]
     async fn login_polls_until_approved_then_saves_the_returned_credentials() {
@@ -312,9 +315,16 @@ mod tests {
         assert_eq!(creds.api_base, "https://api.example/v1");
 
         let seen = seen.lock().unwrap();
-        let polls: Vec<_> = seen.iter().filter(|r| r.contains("/auth/device/poll")).collect();
+        let polls: Vec<_> = seen
+            .iter()
+            .filter(|r| r.contains("/auth/device/poll"))
+            .collect();
         assert_eq!(polls.len(), 3, "two pending polls, then the approving one");
-        assert!(polls.iter().all(|r| r.contains(r#""device_code":"dev-123""#)));
+        assert!(
+            polls
+                .iter()
+                .all(|r| r.contains(r#""device_code":"dev-123""#))
+        );
     }
 
     #[tokio::test]
@@ -369,7 +379,10 @@ mod tests {
     #[tokio::test]
     async fn status_reports_email_and_balance_using_the_stored_token() {
         let (base, seen) = serve(|path, _| match path {
-            "/v1/me" => (200, r#"{"email":"a@b.dev","balance_micros":1234567}"#.into()),
+            "/v1/me" => (
+                200,
+                r#"{"email":"a@b.dev","balance_micros":1234567}"#.into(),
+            ),
             _ => (404, "{}".into()),
         })
         .await;
@@ -379,7 +392,10 @@ mod tests {
         let msg = status_message(&creds_path.0).await.unwrap();
         assert_eq!(msg, "Signed in as a@b.dev\nBalance: $1.234567");
         let request = seen.lock().unwrap()[0].to_ascii_lowercase();
-        assert!(request.contains("authorization: bearer tok-abc"), "{request}");
+        assert!(
+            request.contains("authorization: bearer tok-abc"),
+            "{request}"
+        );
     }
 
     #[tokio::test]
