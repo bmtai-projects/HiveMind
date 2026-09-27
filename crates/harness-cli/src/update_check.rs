@@ -7,7 +7,14 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
-const RELEASES_REPO: &str = "BibhabenduMukherjee/HiveMind-releases";
+/// Where releases live. Compiled in rather than configurable on purpose:
+/// letting the environment redirect the update source would make it a way to
+/// serve someone a different binary.
+///
+/// Builds from before the move to the organisation have the old
+/// `BibhabenduMukherjee/HiveMind-releases` baked in, which is why
+/// `release.yml` still mirrors every release there.
+const RELEASES_REPO: &str = "bmtai-projects/HiveMind";
 const CHECK_TIMEOUT: Duration = Duration::from_millis(800);
 /// `hivemind update` is an explicit command a user typed and is actively
 /// waiting on, not a background startup courtesy -- worth a real timeout

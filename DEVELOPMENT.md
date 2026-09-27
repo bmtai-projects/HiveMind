@@ -28,7 +28,7 @@ HiveMind uses `rustls`, not OpenSSL.
 ## Get the code and build it
 
 ```sh
-git clone https://github.com/BibhabenduMukherjee/HiveMind.git
+git clone https://github.com/bmtai-projects/HiveMind.git
 cd HiveMind
 cargo build -p harness-cli
 ```
@@ -172,21 +172,28 @@ maintainers with write access.
 
 ## How it fits together
 
-- Source lives in this repository. Compiled downloads are published to the
-  separate public repository
-  [`HiveMind-releases`](https://github.com/BibhabenduMukherjee/HiveMind-releases),
-  which holds no source.
-- The website serves `https://hivemind.bmtai.in/install.sh` and `install.ps1`
-  by passing through the copies in `HiveMind-releases`. Those copies are the
-  source of truth.
+- Source and compiled downloads both live in this repository. Releases are
+  attached here, so there is no second repository to keep in step.
+- The install scripts, [`install.sh`](install.sh) and
+  [`install.ps1`](install.ps1), are in this repository too, which means they
+  are reviewed in pull requests like any other file. The website serves
+  `https://hivemind.bmtai.in/install.sh` and `install.ps1` by passing straight
+  through to the copies here.
 - Pushing a tag that starts with `v` runs
-  [`release.yml`](.github/workflows/release.yml). It has three stages, and each
-  waits for the one before: `check` (the same checks as CI), then `build` (five
-  platforms), then `release` (publishes). If `check` fails, nothing is
+  [`release.yml`](.github/workflows/release.yml). It has three stages, each
+  waiting for the one before: `check` (the same checks as CI), then `build`
+  (five platforms), then `release` (publishes). If `check` fails, nothing is
   published.
-- Publishing needs a repository secret named `RELEASES_REPO_TOKEN`: a token
-  that can create releases in `HiveMind-releases`. The default `GITHUB_TOKEN`
-  cannot write to another repository.
+- Publishing to this repository needs nothing but the built-in
+  `GITHUB_TOKEN`, which the workflow grants `contents: write`.
+- There is one exception. Binaries released **before** the move to the `bmtai`
+  organisation have the old `HiveMind-releases` address compiled into them and
+  ask that repository for updates. So `release.yml` also mirrors each release
+  there, and only that step needs the `RELEASES_REPO_TOKEN` secret, because
+  writing to another repository is outside `GITHUB_TOKEN`'s reach. Without the
+  mirror, those older installs would answer "you are up to date" forever. The
+  step can be deleted once anyone still on such a build is expected to
+  reinstall instead.
 
 ## Before you start
 
@@ -212,15 +219,15 @@ git commit -m "chore(release): vX.Y.Z"
 git push origin main
 
 # 4. Wait for CI to go green on that commit.
-gh run watch --repo BibhabenduMukherjee/HiveMind
+gh run watch --repo bmtai-projects/HiveMind
 
 # 5. Tag it. Pushing the tag starts the release.
 git tag vX.Y.Z
 git push origin vX.Y.Z
 
 # 6. Watch it. Expect about 10 to 15 minutes.
-gh run list --repo BibhabenduMukherjee/HiveMind --workflow Release --limit 1
-gh run watch <run-id> --repo BibhabenduMukherjee/HiveMind
+gh run list --repo bmtai-projects/HiveMind --workflow Release --limit 1
+gh run watch <run-id> --repo bmtai-projects/HiveMind
 ```
 
 Add only those two files in step 3. Using `git add -A` or `git commit -a`
@@ -231,10 +238,10 @@ before.
 
 ```sh
 # The real result. "success" is the only good answer.
-gh run view <run-id> --repo BibhabenduMukherjee/HiveMind --json status,conclusion --jq '{status, conclusion}'
+gh run view <run-id> --repo bmtai-projects/HiveMind --json status,conclusion --jq '{status, conclusion}'
 
 # Five archives plus SHA256SUMS.txt should be attached.
-gh release view vX.Y.Z --repo BibhabenduMukherjee/HiveMind-releases
+gh release view vX.Y.Z --repo bmtai-projects/HiveMind
 
 # The public installer works from scratch. Use a throwaway folder.
 HIVEMIND_INSTALL_DIR="$(mktemp -d)" bash -c "$(curl -fsSL https://hivemind.bmtai.in/install.sh)"
@@ -268,7 +275,7 @@ creating the release. Use a **classic** token with the `repo` scope, and set it
 without putting it in your shell history:
 
 ```sh
-gh secret set RELEASES_REPO_TOKEN --repo BibhabenduMukherjee/HiveMind
+gh secret set RELEASES_REPO_TOKEN --repo bmtai-projects/HiveMind
 ```
 
 Paste the token when asked. Do not pass it as an argument.
@@ -281,7 +288,7 @@ recreate the tag as shown above.
 **The installer looks wrong from `raw.githubusercontent.com`.** GitHub caches
 raw files for a few minutes after a push. Wait, or read it through the API,
 which skips the cache:
-`gh api repos/BibhabenduMukherjee/HiveMind-releases/contents/install.sh --jq .content | base64 -d`.
+`gh api repos/bmtai-projects/HiveMind/contents/install.sh --jq .content | base64 -d`.
 
 **`gh run watch` finished but you are unsure.** The command's own exit code
 only says the *watch* worked. Read the `conclusion` with the command in "Check

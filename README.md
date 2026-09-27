@@ -248,9 +248,8 @@ the moment to add the trait.
 
 The hosted service (accounts, billing, and the model proxy) is a separate
 private service. Nothing in this repository needs it, and the second and
-third ways to connect never talk to it. Ready-made downloads live in the public
-[HiveMind-releases](https://github.com/BibhabenduMukherjee/HiveMind-releases)
-repository, which holds no source.
+third ways to connect never talk to it. Ready-made downloads are attached to
+this repository's [releases](https://github.com/bmtai-projects/HiveMind/releases).
 
 ## Settings
 
