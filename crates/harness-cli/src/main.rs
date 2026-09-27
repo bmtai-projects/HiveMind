@@ -1881,3 +1881,78 @@ mod status_tests {
         assert_eq!(context_gauge(1_000, 0, 40), (0, 0));
     }
 }
+
+/// Error messages that suggest a command line must only name flags that
+/// really exist. `harness-config` writes those messages but cannot see
+/// clap's flag list, so the check belongs here.
+#[cfg(test)]
+mod error_message_tests {
+    use clap::CommandFactory;
+    use std::collections::HashSet;
+
+    /// Every `--flag` clap accepts, across the root and all subcommands.
+    fn known_long_flags() -> HashSet<String> {
+        fn walk(cmd: &clap::Command, out: &mut HashSet<String>) {
+            for arg in cmd.get_arguments() {
+                if let Some(long) = arg.get_long() {
+                    out.insert(format!("--{long}"));
+                }
+                for long in arg.get_all_aliases().unwrap_or_default() {
+                    out.insert(format!("--{long}"));
+                }
+            }
+            for sub in cmd.get_subcommands() {
+                walk(sub, out);
+            }
+        }
+        let mut out = HashSet::new();
+        walk(&super::Cli::command(), &mut out);
+        out
+    }
+
+    fn long_flags_mentioned_in(text: &str) -> Vec<String> {
+        text.split_whitespace()
+            .map(|tok| tok.trim_end_matches([',', '.', ';', ')', '`', ':']))
+            .filter(|tok| tok.starts_with("--") && tok.len() > 2)
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// The regression: this message advertised `--local`, which does not
+    /// exist, so following it printed "unexpected argument '--local' found".
+    #[test]
+    fn the_no_backend_message_only_names_flags_that_exist() {
+        let known = known_long_flags();
+        let text = harness_config::ConfigError::MissingKey.to_string();
+        let mentioned = long_flags_mentioned_in(&text);
+        assert!(
+            !mentioned.is_empty(),
+            "guard is vacuous -- the message names no flags at all:\n{text}"
+        );
+        for flag in mentioned {
+            assert!(
+                known.contains(&flag),
+                "the 'no backend configured' message tells the user to pass {flag}, \
+                 which clap does not accept. Message:\n{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_local_model_message_only_names_flags_that_exist() {
+        let known = known_long_flags();
+        let text = harness_config::ConfigError::MissingLocalModel.to_string();
+        for flag in long_flags_mentioned_in(&text) {
+            assert!(
+                known.contains(&flag),
+                "MissingLocalModel names {flag}, which clap does not accept. Message:\n{text}"
+            );
+        }
+    }
+
+    /// Guards the guard: a flag that is genuinely absent must be caught.
+    #[test]
+    fn a_nonexistent_flag_would_be_rejected() {
+        assert!(!known_long_flags().contains("--definitely-not-a-flag"));
+    }
+}
