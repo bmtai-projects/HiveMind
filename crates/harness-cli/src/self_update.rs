@@ -60,7 +60,7 @@ impl Drop for ScratchDir {
 pub async fn run() -> anyhow::Result<()> {
     let target = current_target().ok_or_else(|| {
         anyhow::anyhow!(
-            "no prebuilt binary for {}/{} -- see https://github.com/BibhabenduMukherjee/HiveMind-releases",
+            "no prebuilt binary for {}/{} -- see https://hivemind.bmtai.in",
             std::env::consts::OS,
             std::env::consts::ARCH
         )
@@ -114,7 +114,7 @@ pub async fn run() -> anyhow::Result<()> {
         anyhow::anyhow!(
             "{e}\n\nCould not replace the running binary in place -- this usually means it \
              lives somewhere that needs elevated permissions. Try again with sudo, or \
-             reinstall directly: https://github.com/BibhabenduMukherjee/HiveMind-releases"
+             reinstall directly: https://hivemind.bmtai.in"
         )
     })?;
 

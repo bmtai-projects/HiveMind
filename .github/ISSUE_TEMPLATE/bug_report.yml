@@ -10,7 +10,7 @@ body:
         **Please remove API keys and private code** from anything you paste.
 
         Found a security problem? Do not use this form. Follow the
-        [security policy](https://github.com/BibhabenduMukherjee/HiveMind/security/policy).
+        [security policy](https://github.com/bmtai-projects/HiveMind/security/policy).
   - type: textarea
     id: what-happened
     attributes:

@@ -1,7 +1,7 @@
 blank_issues_enabled: true
 contact_links:
   - name: Report a security problem
-    url: https://github.com/BibhabenduMukherjee/HiveMind/security/policy
+    url: https://github.com/bmtai-projects/HiveMind/security/policy
     about: Please do not open a public issue for a vulnerability. Follow the security policy.
   - name: Account or billing help
     url: https://hivemind.bmtai.in/contact

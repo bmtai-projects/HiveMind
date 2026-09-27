@@ -5,7 +5,7 @@
 **Please do not open a public issue for a security problem.**
 
 Report it privately through GitHub's
-[private vulnerability reporting](https://github.com/BibhabenduMukherjee/HiveMind/security/advisories/new),
+[private vulnerability reporting](https://github.com/bmtai-projects/HiveMind/security/advisories/new),
 or by email to mukherjee4004@gmail.com.
 
 Please include what you ran, what you observed, and `hivemind --version`. A
