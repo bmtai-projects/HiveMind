@@ -371,13 +371,16 @@ pub enum ConfigError {
         #[source]
         source: toml::de::Error,
     },
+    // Every option here must name a flag that exists today. An earlier
+    // version advertised `--local`, which does not, so the message told
+    // people to run something that fails.
     #[error(
         "no backend configured. Pick one:\n  \
-         hosted   `hivemind auth login`\n  \
-         your key set $HIVEMIND_API_KEY (or --api-key), plus --base-url for a \
-         non-default provider\n  \
-         local    --local for Ollama on 127.0.0.1:11434, or --base-url <url> \
-         for any OpenAI-compatible server"
+         hosted     `hivemind auth login`\n  \
+         your key   set $HIVEMIND_API_KEY (or --api-key), plus --base-url and \
+         --model for your provider\n  \
+         local      --base-url http://127.0.0.1:11434/v1 --model <name> for \
+         Ollama, or any OpenAI-compatible server"
     )]
     MissingKey,
     #[error(
