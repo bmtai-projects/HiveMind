@@ -240,13 +240,52 @@ pub struct HookSpec {
     pub enforcement: bool,
 }
 
+/// Which kind of backend this session talks to.
+///
+/// An enum rather than a pair of bools: `hosted` and `local` as two flags
+/// would admit a fourth state that means nothing, and the markup, the web
+/// tools and Pro mode each key off exactly one of these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Backend {
+    /// HiveMind's own proxy. Markup applies; web tools and Pro mode exist.
+    Hosted,
+    /// The user's own key, straight to their provider. No markup.
+    Byok,
+    /// A keyless endpoint on the user's machine (Ollama, LM Studio,
+    /// llama.cpp). No markup, nothing billed, no network beyond localhost.
+    Local,
+}
+
+impl Backend {
+    /// True only for [`Backend::Hosted`]. Reads better than `== Hosted` at
+    /// the call sites that gate a hosted-only capability.
+    pub fn is_hosted(self) -> bool {
+        self == Backend::Hosted
+    }
+
+    /// Whether tokens on this backend cost the user money we quote.
+    pub fn is_billed(self) -> bool {
+        self != Backend::Local
+    }
+
+    /// Stable wire/display name. Part of the `--protocol json` contract, so
+    /// these strings are not free to rename.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Backend::Hosted => "hosted",
+            Backend::Byok => "byok",
+            Backend::Local => "local",
+        }
+    }
+}
+
 /// Fully resolved runtime configuration.
 #[derive(Debug, Clone)]
 pub struct Resolved {
     pub endpoint: Endpoint,
     pub default_model: String,
     pub mode: Mode,
-    pub hosted: bool,
+    pub backend: Backend,
     pub reasoning_effort: Option<String>,
     pub budget_usd: Option<f64>,
     pub policy: AgentPolicy,
@@ -332,11 +371,24 @@ pub enum ConfigError {
         #[source]
         source: toml::de::Error,
     },
+    // Every option here must name a flag that exists today. An earlier
+    // version advertised `--local`, which does not, so the message told
+    // people to run something that fails.
     #[error(
-        "no HiveMind API key found — run `hivemind auth login`, set $HIVEMIND_API_KEY, pass \
-         --api-key, or add `api_key` under [model] in your config file"
+        "no backend configured. Pick one:\n  \
+         hosted     `hivemind auth login`\n  \
+         your key   set $HIVEMIND_API_KEY (or --api-key), plus --base-url and \
+         --model for your provider\n  \
+         local      --base-url http://127.0.0.1:11434/v1 --model <name> for \
+         Ollama, or any OpenAI-compatible server"
     )]
     MissingKey,
+    #[error(
+        "a local backend has no default model — pass --model <name> (or set \
+         `model` under [model] in your config file) with one your server has \
+         pulled, e.g. `ollama list`"
+    )]
+    MissingLocalModel,
     #[error("writing {path}: {source}")]
     Write {
         path: String,
@@ -394,36 +446,57 @@ pub fn resolve(
         .or_else(|| file.model.base_url.clone())
         .or_else(|| file.deepseek.base_url.clone());
 
-    let (api_key, base_url, hosted) = match explicit_key {
+    // Three-way, in order of how explicit the user was:
+    //
+    //   a key           -> Byok, whatever endpoint they named
+    //   no key, a URL   -> Local; a keyless endpoint is a real configuration,
+    //                      not a mistake, so this must not demand credentials
+    //   neither         -> Hosted if signed in, else explain all three
+    //
+    // The middle arm is the whole point: previously "no key" meant "you must
+    // be hosted", which made Ollama impossible to express without inventing
+    // a fake key.
+    let (api_key, base_url, backend) = match explicit_key {
+        // An explicit key is BYOK regardless of what else is configured.
         Some(key) => (
             key,
             base_url_override.unwrap_or_else(|| "https://api.deepseek.com".to_string()),
-            false,
+            Backend::Byok,
         ),
-        None => {
-            let creds = load_hosted_credentials(credentials_path).ok_or(ConfigError::MissingKey)?;
-            (
+        None => match load_hosted_credentials(credentials_path) {
+            // Signed in. `--base-url` still applies, which is how a
+            // non-production deployment gets pointed at.
+            Some(creds) => (
                 creds.access_token,
                 base_url_override.unwrap_or(creds.api_base),
-                true,
-            )
-        }
+                Backend::Hosted,
+            ),
+            // Not signed in, but an endpoint was named. Previously this was
+            // an error, which made a keyless server impossible to express
+            // without inventing a fake key.
+            None => match base_url_override {
+                Some(url) => (String::new(), url, Backend::Local),
+                None => return Err(ConfigError::MissingKey),
+            },
+        },
     };
 
     // Hosted mode defaults to the branded "hivemind" alias, which resolves
-    // to the full 7-model catalog server-side. BYOK talks to the upstream
+    // to the full catalog server-side. Every other backend talks to a
     // provider directly, so it needs a real provider-native id instead.
-    let default_model = cli
+    // A local server's model names are whatever the user pulled, so there is
+    // nothing safe to guess: inventing one produces a confusing 404 from the
+    // provider instead of a usable message.
+    let configured_model = cli
         .model
         .or_else(|| file.model.model.clone())
-        .or_else(|| file.deepseek.model.clone())
-        .unwrap_or_else(|| {
-            if hosted {
-                "hivemind".to_string()
-            } else {
-                "deepseek-v4-flash".to_string()
-            }
-        });
+        .or_else(|| file.deepseek.model.clone());
+    let default_model = match (configured_model, backend) {
+        (Some(m), _) => m,
+        (None, Backend::Hosted) => "hivemind".to_string(),
+        (None, Backend::Byok) => "deepseek-v4-flash".to_string(),
+        (None, Backend::Local) => return Err(ConfigError::MissingLocalModel),
+    };
 
     let reasoning_effort = cli
         .reasoning_effort
@@ -468,7 +541,7 @@ pub fn resolve(
         endpoint: Endpoint { base_url, api_key },
         default_model,
         mode,
-        hosted,
+        backend,
         reasoning_effort,
         budget_usd,
         policy,
@@ -711,6 +784,55 @@ mod tests {
         assert!(matches!(result, Err(ConfigError::MissingKey)));
     }
 
+    /// The keyless branch. A base_url with no key and no credentials is a
+    /// local server, not a misconfiguration.
+    #[test]
+    fn a_base_url_without_any_key_resolves_to_a_local_backend() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("HIVEMIND_API_KEY");
+            std::env::remove_var("DEEPSEEK_API_KEY");
+        };
+        let cli = CliOverrides {
+            base_url: Some("http://127.0.0.1:11434/v1".into()),
+            model: Some("qwen3-coder".into()),
+            ..Default::default()
+        };
+        let resolved = resolve(
+            Path::new("/nonexistent/config.toml"),
+            Path::new("/nonexistent/credentials.toml"),
+            cli,
+        )
+        .unwrap();
+        assert_eq!(resolved.backend, Backend::Local);
+        assert_eq!(resolved.endpoint.base_url, "http://127.0.0.1:11434/v1");
+        assert!(
+            resolved.endpoint.api_key.is_empty(),
+            "a local backend must not fabricate a key"
+        );
+    }
+
+    /// Guards the reason this is an error rather than a guess: the server's
+    /// model names are whatever the user pulled.
+    #[test]
+    fn a_local_backend_without_a_model_says_so_instead_of_guessing() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("HIVEMIND_API_KEY");
+            std::env::remove_var("DEEPSEEK_API_KEY");
+        };
+        let cli = CliOverrides {
+            base_url: Some("http://127.0.0.1:11434/v1".into()),
+            ..Default::default()
+        };
+        let result = resolve(
+            Path::new("/nonexistent/config.toml"),
+            Path::new("/nonexistent/credentials.toml"),
+            cli,
+        );
+        assert!(matches!(result, Err(ConfigError::MissingLocalModel)));
+    }
+
     #[test]
     fn cli_key_wins_without_env() {
         let _guard = ENV_LOCK.lock().unwrap();
@@ -730,7 +852,7 @@ mod tests {
         .unwrap();
         assert_eq!(resolved.endpoint.api_key, "sk-test");
         assert_eq!(resolved.default_model, "deepseek-v4-flash");
-        assert!(!resolved.hosted);
+        assert_eq!(resolved.backend, Backend::Byok);
     }
 
     #[test]
@@ -862,7 +984,7 @@ mod tests {
             "https://hivemind-server.example/v1"
         );
         assert_eq!(resolved.default_model, "hivemind");
-        assert!(resolved.hosted);
+        assert_eq!(resolved.backend, Backend::Hosted);
 
         std::fs::remove_dir_all(&dir).ok();
     }

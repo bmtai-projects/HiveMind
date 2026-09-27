@@ -1,230 +1,299 @@
 # Development
 
-Build, test, and release commands for `hivemind`, plus the errors actually
-hit while building this repo — not a generic checklist, real mistakes with
-their real fixes.
+How to build, test, and run HiveMind on your own machine.
 
-Run everything from the repo root: `/Users/soulknower/Documents/projects/HiveMind`.
+- **Part 1** is for everyone who wants to change the code.
+- **Part 2** is only for maintainers who publish releases. You can ignore it.
 
-## Prerequisites (one-time)
+---
+
+# Part 1: Working on the code
+
+## What you need
+
+- **Git.**
+- **Rust, the latest stable version.** Install it with [rustup](https://rustup.rs).
+  The project uses the 2024 edition, so a Rust from an old system package may
+  not compile it. The file `rust-toolchain.toml` asks for `stable`, and rustup
+  reads it for you.
+- **A C toolchain**, which Rust needs to link programs:
+  - Windows: Visual Studio Build Tools with the "Desktop development with C++"
+    option.
+  - macOS: run `xcode-select --install`.
+  - Linux: `build-essential` on Debian and Ubuntu, or your distro's version.
+
+You do **not** need an API key, an account, or OpenSSL to build and test.
+HiveMind uses `rustls`, not OpenSSL.
+
+## Get the code and build it
 
 ```sh
-brew install rust        # gives cargo + rustc
-brew install gh          # GitHub CLI
-gh auth status           # confirm you're logged in as BibhabenduMukherjee
+git clone https://github.com/BibhabenduMukherjee/HiveMind.git
+cd HiveMind
+cargo build -p harness-cli
 ```
 
-## Build
+If you are working from your own fork, clone that instead. The first build
+downloads and compiles every dependency, so it takes a few minutes. Later
+builds are fast.
+
+Run what you built:
 
 ```sh
-cargo build -p harness-cli              # fast, unoptimized, for iterating
-cargo build --release -p harness-cli    # optimized binary, what actually ships
-
-# Check a single crate without building anything (fastest feedback loop):
-cargo check -p harness-agent            # swap the crate name as needed
-
-# Full workspace build (slower — prefer -p <crate> while iterating):
-cargo build --workspace
+./target/debug/hivemind --version         # macOS and Linux
+.\target\debug\hivemind.exe --version     # Windows PowerShell
+cargo run -p harness-cli -- --version     # any system; everything after -- goes to hivemind
 ```
 
-Binary lands at `target/debug/hivemind` or `target/release/hivemind`.
-
-## Test
-
-Run all four every time before committing — this is the actual gate CI
-enforces (`.github/workflows/ci.yml`), so failing any of these locally means
-CI will fail too:
+A few more build commands:
 
 ```sh
-cargo fmt --all                                      # auto-formats in place
-cargo fmt --all -- --check                            # CI's version: fails instead of fixing
-cargo clippy --workspace --all-targets -- -D warnings # CI treats warnings as errors
-cargo test --workspace
+cargo check -p harness-agent              # type-check one crate only, the fastest feedback
+cargo build --release -p harness-cli      # optimized build; slower, and rarely needed
 ```
 
-### Manual end-to-end check
+## The checks to run before a pull request
 
-Unit tests don't cover the live network path or the interactive terminal.
-Before a release, actually run it:
+These are the same commands CI runs. If they pass on your machine, CI should
+pass too.
 
 ```sh
-export DEEPSEEK_API_KEY=sk-...
-./target/release/hivemind activate -p "list the files here and summarize one"
+cargo fmt --all                                        # fixes formatting in place
+cargo clippy --workspace --all-targets -- -D warnings  # lint; warnings count as errors
+cargo test --workspace                                 # every test
+cargo build --workspace --release                      # CI also does a release build
 ```
 
-For the interactive REPL (banner, `@` file completion, slash commands), you
-have to eyeball it yourself — there's no way to script-verify a raw-mode
-terminal UI:
+Three tips:
+
+- To see formatting problems **without** changing files, run
+  `cargo fmt --all -- --check`. That is what CI runs.
+- The checks stop at the first failure. A formatting mistake hides everything
+  after it, so a red CI run that finishes in seconds is almost always
+  formatting. Fix that first.
+- To run a single test, give part of its name:
+  `cargo test -p harness-config a_base_url`.
+
+Which operating systems CI covers is written in
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml). If you use a system CI
+does not cover, running the tests yourself is the only way to catch problems
+that appear there.
+
+## Which checks need a paid API?
+
+None of the checks above do.
+
+| What you run | Needs an API key or account? |
+|---|---|
+| `cargo fmt`, `cargo clippy`, `cargo build` | No |
+| `cargo test --workspace` | **No.** The tests use fake servers on your own machine, and none reads a real key. The whole suite passes from a fresh clone with no keys and an empty home folder. |
+| `cargo test --workspace -- --ignored` | Not paid, but they need extras. The diagram tests need `mmdc` (Mermaid CLI) installed. Two others audit the real repository checkout and are meant to be run by hand. Skip these unless you are changing those tools. |
+| Running `hivemind activate` yourself | Needs **some** model: the hosted service (paid balance), your own key, or a free model on your own machine. See below. |
+| `hivemind review` on real changes | Needs a model, same as above. With nothing to review it needs nothing. |
+
+## Running HiveMind while you develop, for free
+
+You can point HiveMind at a model on your own machine. With
+[Ollama](https://ollama.com), for example:
 
 ```sh
-./target/release/hivemind activate
-# try: @<tab> for file completion, /help, /compact, /tier pro, /cost, Ctrl-D
+ollama pull <a model that supports tool calling>
+ollama list                                # shows the exact names you can use
+./target/debug/hivemind activate --base-url http://127.0.0.1:11434/v1 --model <name from ollama list>
 ```
 
-## Try your own build without cutting a release
+Two things to watch: sign out of the hosted service first (`hivemind auth
+logout`), because while you are signed in `--base-url` keeps using your
+account. And use a model that supports tool calling, or the agent cannot read
+or edit files. The [README](README.md#3-a-model-on-your-own-machine-no-key-no-cost)
+explains the details.
+
+To try your build, run it from `target/`. Do not copy it over your installed
+`hivemind`. `hivemind update` would replace it with the latest release anyway.
+
+The terminal screen cannot be checked by a script, so look at it yourself when
+you change it. Start a session and try `/help`, `/cost`, `/compact`, typing `@`
+and pressing Tab to complete a file name, and Ctrl-D to leave.
+
+## Where to look
+
+| To change... | Start in |
+|---|---|
+| The command line, the startup flow | `crates/harness-cli/src/main.rs` |
+| Slash commands like `/help` and `/undo` | `crates/harness-cli/src/commands.rs` |
+| How the terminal looks | `crates/harness-cli/src/ui.rs` |
+| The agent loop | `crates/harness-agent/src/agent.rs` (`Agent::run`) |
+| A tool the agent can use | `crates/harness-tools/src/`, plus where tools are registered in `crates/harness-cli/src/main.rs` |
+| Talking to the model | `crates/harness-provider/src/` |
+| Config keys and defaults | `crates/harness-config/src/lib.rs`, and `config.example.toml` |
+| Skills | `crates/harness-agent/skills/*.md`, listed in `crates/harness-agent/src/skills.rs` |
+| Safety presets (`hivemind hooks`) | `crates/harness-cli/src/hook_presets.rs` |
+| Code review | `crates/harness-review/`, and `crates/harness-agent/src/review_orchestrator.rs` |
+
+The [README](README.md#how-it-is-built) explains how the crates fit together.
+
+## Common problems
+
+**A clippy error you do not understand.** Read the `help:` line under it.
+Rust usually shows the fix. For example, the lint
+`manual_pattern_char_comparison` wants `s.trim_end_matches(['a', 'b'])` instead
+of a closure.
+
+**`no method named ... found` for something that exists.** The trait that
+provides the method is probably not imported. Add the `use` line the compiler
+suggests.
+
+**Windows: `linking with link.exe failed` and `link: extra operand`.** Git for
+Windows ships a Unix tool that is also called `link`, and it can be picked up
+instead of Microsoft's linker when Visual Studio's C++ tools cannot be found.
+Install "Desktop development with C++" from the Visual Studio Build Tools, and
+build from PowerShell or a Developer Command Prompt.
+
+**Windows: a test fails but CI is green.** CI may not cover your system. A test
+that uses `sleep`, a trailing `&`, or other Unix shell features only makes
+sense on Unix, so it should be marked `#[cfg(unix)]`. `cmd.exe` treats `&` as
+"run the next command after this one", not "run in the background".
+
+**`Cargo.lock` conflicts after a rebase.** Do not edit it by hand. Take either
+version, then run `cargo check --workspace` and it will fix itself.
+
+**`warning: LF will be replaced by CRLF`.** This is Git talking about line
+endings on Windows. It is harmless.
+
+**`error: workdir "...": The system cannot find the path`.** The folder you
+gave to `--workdir` must already exist.
+
+---
+
+# Part 2: Releasing (maintainers only)
+
+Regular contributors do not need any of this. Releases are published by
+maintainers with write access.
+
+## How it fits together
+
+- Source lives in this repository. Compiled downloads are published to the
+  separate public repository
+  [`HiveMind-releases`](https://github.com/BibhabenduMukherjee/HiveMind-releases),
+  which holds no source.
+- The website serves `https://hivemind.bmtai.in/install.sh` and `install.ps1`
+  by passing through the copies in `HiveMind-releases`. Those copies are the
+  source of truth.
+- Pushing a tag that starts with `v` runs
+  [`release.yml`](.github/workflows/release.yml). It has three stages, and each
+  waits for the one before: `check` (the same checks as CI), then `build` (five
+  platforms), then `release` (publishes). If `check` fails, nothing is
+  published.
+- Publishing needs a repository secret named `RELEASES_REPO_TOKEN`: a token
+  that can create releases in `HiveMind-releases`. The default `GITHUB_TOKEN`
+  cannot write to another repository.
+
+## Before you start
+
+- You can push to `main` and push tags.
+- The [GitHub CLI](https://cli.github.com) is installed and signed in:
+  `gh auth status`.
+- **Version numbers only go up.** `hivemind update` offers a release only if
+  its number is higher than the one running, and that check is already inside
+  every installed copy. A lower number would leave people stuck.
+
+## Steps
 
 ```sh
-cp target/release/hivemind ~/.local/bin/hivemind
-hivemind activate
-```
+# 1. Be sure main is green. Then bump the version: edit `version` under
+#    [workspace.package] in the root Cargo.toml.
 
-If `command not found: hivemind` after this, your shell cached an old PATH
-lookup — run `hash -r` or open a new terminal tab. (`~/.local/bin` should
-already be on PATH via `~/.zshrc`; check with `echo $PATH | tr ':' '\n' |
-grep local/bin` if unsure.)
+# 2. Let Cargo update the lock file to match.
+cargo check --workspace
 
-## Release
-
-This repo (`HiveMind`, private, source) never publishes to itself — release
-binaries go to the public `BibhabenduMukherjee/HiveMind-releases` repo,
-which has no source in it. The cross-repo publish needs the
-`RELEASES_REPO_TOKEN` secret (see [Common errors](#common-errors) if it's
-missing or expired).
-
-```sh
-# 1. Bump the version if this is a real release (breaking change = bump).
-#    Edit `version = "..."` in the root Cargo.toml under [workspace.package].
-
-# 2. Run the full test gate (see above) — don't skip this.
-
-# 3. Commit and push to main first.
-git add -A
-git commit -m "..."
+# 3. Commit those two files, and nothing else.
+git add Cargo.toml Cargo.lock
+git commit -m "chore(release): vX.Y.Z"
 git push origin main
 
-# 4. Tag and push the tag — THIS triggers the release build.
-git tag v0.3.0
-git push origin v0.3.0
+# 4. Wait for CI to go green on that commit.
+gh run watch --repo BibhabenduMukherjee/HiveMind
 
-# 5. Watch it (5-target cross-compile matrix, ~2-3 min):
-gh run list --repo BibhabenduMukherjee/HiveMind --limit 1
-gh run watch <run-id>
+# 5. Tag it. Pushing the tag starts the release.
+git tag vX.Y.Z
+git push origin vX.Y.Z
 
-# 6. Verify the ACTUAL conclusion, not just that the watch command exited:
-gh run view <run-id> --repo BibhabenduMukherjee/HiveMind \
-  --json status,conclusion,jobs --jq '{status, conclusion}'
-
-# 7. Confirm the release landed in the public repo with all 5 assets:
-gh release view v0.3.0 --repo BibhabenduMukherjee/HiveMind-releases
-
-# 8. Prove the public install actually works (fresh dir, no cached state):
-rm -rf /tmp/install_check && mkdir -p /tmp/install_check
-HIVEMIND_INSTALL_DIR=/tmp/install_check bash -c \
-  "$(curl -fsSL https://raw.githubusercontent.com/BibhabenduMukherjee/HiveMind-releases/main/install.sh)"
-/tmp/install_check/hivemind --version
+# 6. Watch it. Expect about 10 to 15 minutes.
+gh run list --repo BibhabenduMukherjee/HiveMind --workflow Release --limit 1
+gh run watch <run-id> --repo BibhabenduMukherjee/HiveMind
 ```
 
-### If a tagged run fails and you need to retry
+Add only those two files in step 3. Using `git add -A` or `git commit -a`
+can sweep unrelated edits into a release commit, and that has broken a release
+before.
 
-Deleting and recreating a tag is normal here — don't be afraid of it, this
-repo has no other collaborators sharing tags with you.
+## Check that it worked
 
 ```sh
-git tag -d v0.3.0                              # local
-git push origin --delete v0.3.0                # remote
-# fix whatever broke, commit, push to main, THEN:
-git tag v0.3.0                                 # recreates at current HEAD
-git push origin v0.3.0
-git rev-parse v0.3.0 HEAD                       # should print the SAME sha twice
+# The real result. "success" is the only good answer.
+gh run view <run-id> --repo BibhabenduMukherjee/HiveMind --json status,conclusion --jq '{status, conclusion}'
+
+# Five archives plus SHA256SUMS.txt should be attached.
+gh release view vX.Y.Z --repo BibhabenduMukherjee/HiveMind-releases
+
+# The public installer works from scratch. Use a throwaway folder.
+HIVEMIND_INSTALL_DIR="$(mktemp -d)" bash -c "$(curl -fsSL https://hivemind.bmtai.in/install.sh)"
 ```
 
-That last check matters — see the stale-tag error below.
+On Windows, set `$env:HIVEMIND_INSTALL_DIR` to a throwaway folder and run
+`irm https://hivemind.bmtai.in/install.ps1 | iex`.
 
-## Common errors
+## If a release fails
 
-Real ones, hit while building this repo, in the order you're likely to hit
-them.
+If the run failed before anything was published, you can remove the tag and
+try again:
 
-### `error: this manual char comparison can be written more succinctly` (clippy)
-Clippy's `manual_pattern_char_comparison` lint. Fix: pass an array of chars
-instead of a closure —
-`s.trim_end_matches(|c: char| matches!(c, 'a' | 'b'))` becomes
-`s.trim_end_matches(['a', 'b'])`.
+```sh
+git tag -d vX.Y.Z                       # local
+git push origin --delete vX.Y.Z         # remote
+# fix the problem, commit, push to main, wait for green, then tag again
+git tag vX.Y.Z
+git push origin vX.Y.Z
+git rev-parse vX.Y.Z HEAD               # must print the SAME hash twice
+```
 
-### `no method named 'with_name' found for struct 'ColumnarMenu'`
-A trait method that isn't in scope — the trait itself (`MenuBuilder` for
-reedline, but this pattern applies generally) needs an explicit `use`. Rust
-usually tells you the exact fix in the error's `help:` line; read it before
-guessing.
+If a release **was** published, never reuse its number. People may already have
+it. Publish the next patch version instead.
 
-### `GitHub release failed with status: 403` — `Resource not accessible by personal access token`
-Hit twice: once on the auto-generate-release-notes call, once on
-create-a-release itself, both with a **fine-grained** PAT that had
-`Contents: Read and write`. This is a real GitHub platform gap, not a scope
-you got wrong — fine-grained PATs don't reliably support the Releases API.
+## Maintainer problems, and their fixes
 
-**Fix:** use a **classic** PAT (github.com/settings/tokens/new, classic —
-not fine-grained) with just the `repo` scope, then:
+**`403 Resource not accessible by personal access token` when publishing.**
+A fine-grained token failed here, both when generating release notes and when
+creating the release. Use a **classic** token with the `repo` scope, and set it
+without putting it in your shell history:
+
 ```sh
 gh secret set RELEASES_REPO_TOKEN --repo BibhabenduMukherjee/HiveMind
-# paste the token when prompted — don't pass it inline as an argument,
-# that puts it in your shell history
 ```
 
-### `bash: tmp: unbound variable` at the very end of `install.sh` (even on success)
-A `local` variable set inside a function, referenced by a `trap ... EXIT`
-set in that same function, goes out of scope the instant the function
-returns — and the EXIT trap fires *after* that return. Under `set -u` that's
-fatal, even though everything the script was supposed to do already
-succeeded. Fix: make the trap's variable a plain script-global, not
-`local`. (Already fixed in `install.sh`; noting the pattern in case it gets
-reintroduced.)
+Paste the token when asked. Do not pass it as an argument.
 
-### Tag still points at the old commit after you amended/rewrote history
-`git push origin v0.3.0` doesn't error if the tag already exists remotely
-pointing at the SAME name — but if you rewrote history locally (amend,
-rebase, squash) without moving the tag first, you'll silently push the
-*old* commit's tag again. Always check before trusting a tag push:
-```sh
-git rev-parse v0.3.0    # what the tag points at
-git rev-parse HEAD      # what you meant to release
-```
-If they don't match: `git tag -d v0.3.0 && git tag v0.3.0` (recreates at
-current HEAD), then push.
+**The tag points at an old commit after you rewrote history.** Pushing a tag
+that already exists does not warn you. Before trusting a tag push, check that
+`git rev-parse vX.Y.Z` and `git rev-parse HEAD` match. If not, delete and
+recreate the tag as shown above.
 
-### `install.sh` works via `gh`/direct fetch but not via the public `raw.githubusercontent.com` URL
-GitHub's raw-content CDN caches for a few minutes after a push. Not a bug —
-just wait ~2-3 minutes after pushing to `main` before testing the public
-curl command, or check via the API first (`gh api
-repos/OWNER/REPO/contents/install.sh --jq '.content' | base64 -d`, which
-bypasses the CDN) to confirm the fix is really live before blaming the code.
+**The installer looks wrong from `raw.githubusercontent.com`.** GitHub caches
+raw files for a few minutes after a push. Wait, or read it through the API,
+which skips the cache:
+`gh api repos/BibhabenduMukherjee/HiveMind-releases/contents/install.sh --jq .content | base64 -d`.
 
-### `gh run watch` exits 0 but the release didn't actually happen
-`gh run watch --exit-status` reports the *workflow's* conclusion, but
-piping through other commands or reading a background task's "exit code 0"
-notification can make it look like success when only the *watch command
-itself* exited cleanly. Always double check the real conclusion:
-```sh
-gh run view <run-id> --repo BibhabenduMukherjee/HiveMind \
-  --json status,conclusion --jq '{status, conclusion}'
-```
-`"conclusion":"success"` is the only thing that actually means success.
+**`gh run watch` finished but you are unsure.** The command's own exit code
+only says the *watch* worked. Read the `conclusion` with the command in "Check
+that it worked".
 
-### Cargo.lock conflicts or looks stale after bumping the workspace version
-Don't hand-edit `Cargo.lock`. Just rebuild — `cargo build` regenerates the
-affected entries automatically:
-```sh
-cargo build --release -p harness-cli
-git add Cargo.lock
-```
+**`unbound variable` at the very end of `install.sh`.** A `local` variable used
+by an `EXIT` trap is already gone when the trap runs, and `set -u` treats that
+as fatal even though the install succeeded. Make the variable script-global.
+This is already fixed. It is written down in case it comes back.
 
-### `workdir: No such file or directory` when running `hivemind activate`
-`--workdir` (default `.`) must exist and be canonicalizable *before*
-startup — it's not created for you. `mkdir -p` it first, or don't pass a
-`--workdir` that doesn't exist yet.
-
-### A live commit shows the wrong author (e.g. a machine/company identity instead of yours)
-Local `git config` on a shared or freshly-provisioned machine may not match
-who you actually are. Check before committing anything that matters:
-```sh
-git log -1 --format="%an <%ae>"
-```
-Override per-commit without touching global config:
-```sh
-GIT_AUTHOR_NAME="Bibhabendu Mukherjee" GIT_AUTHOR_EMAIL="mukherjee4004@gmail.com" \
-GIT_COMMITTER_NAME="Bibhabendu Mukherjee" GIT_COMMITTER_EMAIL="mukherjee4004@gmail.com" \
-git commit -m "..."
-```
-To fix an already-made commit that hasn't been shared with anyone else yet:
-`git commit --amend --reset-author` with the same env vars (`--reset-author`
-is required — plain `--amend` keeps the old author).
+**A commit shows the wrong author.** A new machine may not have your identity
+set. Check with `git log -1 --format="%an <%ae>"`. Set it for this repository
+only with `git config user.name "Your Name"` and
+`git config user.email "you@example.com"`. To fix a commit you have not shared
+yet, run `git commit --amend --reset-author`.

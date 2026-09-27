@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use harness_config::Resolved;
+use harness_config::{Backend, Resolved};
 use harness_review::{
     CandidateRequest, CandidateSubmission, ReviewEngineError, ReviewSampler, SampledCandidates,
     SampledValidation, UsageSummary, ValidationRequest, ValidationSubmission,
@@ -529,7 +529,7 @@ impl Ui for SamplingUi {
         ));
     }
 
-    fn usage(&self, usage: &Usage, model_id: &str, hosted: bool, _session_cost_usd: f64) {
+    fn usage(&self, usage: &Usage, model_id: &str, backend: Backend, _session_cost_usd: f64) {
         let mut total = self.usage.lock().expect("sampling usage mutex poisoned");
         if !total.models.iter().any(|model| model == model_id) {
             total.models.push(model_id.to_string());
@@ -540,7 +540,7 @@ impl Ui for SamplingUi {
             .saturating_add(usage.completion_tokens);
         total.total_tokens = total.total_tokens.saturating_add(usage.total_tokens);
         total.saw_usage = true;
-        match estimate_cost_usd(usage, model_id, hosted) {
+        match estimate_cost_usd(usage, model_id, backend) {
             Some(cost) if !total.cost_unknown => {
                 total.estimated_cost_usd = Some(total.estimated_cost_usd.unwrap_or(0.0) + cost);
             }
@@ -657,7 +657,7 @@ mod tests {
                 cache_miss_tokens: None,
             },
             "hivemind",
-            false,
+            Backend::Byok,
             0.0,
         );
 

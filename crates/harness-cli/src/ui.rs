@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use harness_agent::{Ui, estimate_cost_usd};
+use harness_config::Backend;
 use harness_types::Usage;
 
 pub struct TermUi {
@@ -228,7 +229,7 @@ impl Ui for TermUi {
         ));
     }
 
-    fn usage(&self, usage: &Usage, model_id: &str, hosted: bool, session_cost_usd: f64) {
+    fn usage(&self, usage: &Usage, model_id: &str, backend: Backend, session_cost_usd: f64) {
         // Fires unconditionally, ahead of the early return below -- this is
         // the one guaranteed once-per-turn boundary, so it's the correct
         // place to re-arm the thinking indicator for the next turn.
@@ -252,7 +253,7 @@ impl Ui for TermUi {
         // Unrecognized model id (a BYOK user's own custom string, not in
         // KNOWN_MODELS) -- show token counts with no cost estimate rather
         // than a wrong or fabricated one.
-        let Some(turn_cost) = estimate_cost_usd(usage, model_id, hosted) else {
+        let Some(turn_cost) = estimate_cost_usd(usage, model_id, backend) else {
             self.emit_line(&format!(
                 "\x1b[90m  ↳ [{model_id}] {} in / {} out{cache_note}\x1b[0m",
                 usage.prompt_tokens, usage.completion_tokens,

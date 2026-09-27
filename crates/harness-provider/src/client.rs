@@ -21,12 +21,12 @@ pub type EventStream = UnboundedReceiver<Result<StreamEvent, ProviderError>>;
 pub type RetryHook = Arc<dyn Fn(u32, u32, Duration, &ProviderError) + Send + Sync>;
 
 /// Streaming Chat Completions client. Holds one [`reqwest::Client`] — cloning
-/// `DeepSeekClient` clones an `Arc`-backed handle to the same connection
+/// `ChatClient` clones an `Arc`-backed handle to the same connection
 /// pool, so every request (including retries and concurrent tool-triggered
 /// escalation calls) reuses keep-alive HTTP/2 connections rather than
 /// paying a fresh TLS handshake each time.
 #[derive(Clone)]
-pub struct DeepSeekClient {
+pub struct ChatClient {
     http: Client,
     base_url: Arc<str>,
     api_key: Arc<str>,
@@ -34,7 +34,7 @@ pub struct DeepSeekClient {
     on_retry: Option<RetryHook>,
 }
 
-impl DeepSeekClient {
+impl ChatClient {
     pub fn new(base_url: impl Into<String>, api_key: impl Into<String>) -> Self {
         let http = Client::builder()
             .timeout(Duration::from_secs(300))
@@ -165,12 +165,18 @@ impl DeepSeekClient {
         tx: &UnboundedSender<Result<StreamEvent, ProviderError>>,
     ) -> Result<(), ProviderError> {
         let url = format!("{}/chat/completions", self.base_url);
-        let resp = self
+        let mut req = self
             .http
             .post(&url)
             .header("Content-Type", "application/json")
-            .header("Accept", "text/event-stream")
-            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header("Accept", "text/event-stream");
+        // A keyless local server gets no Authorization header at all. Sending
+        // a bare `Bearer ` is not equivalent: Ollama ignores it, but a server
+        // that does parse the header rejects an empty credential.
+        if !self.api_key.is_empty() {
+            req = req.header("Authorization", format!("Bearer {}", self.api_key));
+        }
+        let resp = req
             .body(body)
             .send()
             .await
@@ -347,6 +353,56 @@ mod tests {
         format!("http://{addr}")
     }
 
+    /// Like `serve_once` but hands back what the client actually sent, so a
+    /// test can assert on headers rather than on our own intent.
+    async fn serve_capturing() -> (String, tokio::sync::oneshot::Receiver<String>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut scratch = [0u8; 4096];
+            let n = sock.read(&mut scratch).await.unwrap_or(0);
+            let _ = tx.send(String::from_utf8_lossy(&scratch[..n]).to_string());
+            let _ = sock
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\ndata: [DONE]\n\n",
+                )
+                .await;
+            let _ = sock.shutdown().await;
+        });
+        (format!("http://{addr}"), rx)
+    }
+
+    /// A keyless local server must see no Authorization header at all. A bare
+    /// `Bearer ` is not the same thing -- a server that parses the header
+    /// rejects an empty credential.
+    #[tokio::test]
+    async fn an_empty_key_sends_no_authorization_header() {
+        let (url, rx) = serve_capturing().await;
+        let client = ChatClient::new(url, "");
+        let mut stream = client.stream(&req());
+        while stream.recv().await.is_some() {}
+        let sent = rx.await.unwrap().to_lowercase();
+        assert!(
+            !sent.contains("authorization"),
+            "keyless request carried an auth header:\n{sent}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_present_key_is_still_sent_as_a_bearer_token() {
+        let (url, rx) = serve_capturing().await;
+        let client = ChatClient::new(url, "sk-abc");
+        let mut stream = client.stream(&req());
+        while stream.recv().await.is_some() {}
+        let sent = rx.await.unwrap();
+        assert!(
+            sent.to_lowercase().contains("authorization: bearer sk-abc"),
+            "expected a bearer token:\n{sent}"
+        );
+    }
+
     fn req() -> ChatRequest {
         ChatRequest {
             model: "test".into(),
@@ -360,7 +416,7 @@ mod tests {
     }
 
     async fn collect(url: String) -> Vec<StreamEvent> {
-        let client = DeepSeekClient::new(url, "k");
+        let client = ChatClient::new(url, "k");
         let mut rx = client.stream(&req());
         let mut events = Vec::new();
         while let Some(e) = rx.recv().await {

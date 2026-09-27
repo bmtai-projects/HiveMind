@@ -8,17 +8,14 @@
 //! completions` with a bearer token. Nothing here is specific to any one
 //! provider.
 //!
-//! [`DeepSeekClient`] keeps its name for historical reasons — it was the
-//! first backend wired up — and renaming a type used across four crates has
-//! not been worth the churn. It is not a statement of scope; a provider
-//! speaking a genuinely different wire format would be a new module behind
-//! the same [`DeepSeekClient::stream`] shape, not a rewrite.
+//! A provider speaking a genuinely different wire format would be a new
+//! module behind the same [`ChatClient::stream`] shape, not a rewrite.
 
 mod client;
 mod error;
 mod retry;
 mod wire;
 
-pub use client::{DeepSeekClient, EventStream, RetryHook};
+pub use client::{ChatClient, EventStream, RetryHook};
 pub use error::ProviderError;
 pub use retry::{DEFAULT_MAX_RETRIES, backoff_delay};

@@ -5,8 +5,8 @@
 
 use std::sync::Arc;
 
-use harness_config::{AgentPolicy, HookSpec, Resolved};
-use harness_provider::DeepSeekClient;
+use harness_config::{AgentPolicy, Backend, HookSpec, Resolved};
+use harness_provider::ChatClient;
 use harness_tools::{
     ArtifactStore, DEFAULT_ARTIFACT_THRESHOLD_BYTES, Registry, ToolResult, Workspace,
 };
@@ -174,7 +174,7 @@ fn compose_system_prompt(
 }
 
 pub struct Agent {
-    client: DeepSeekClient,
+    client: ChatClient,
     tools: Registry,
     policy: AgentPolicy,
     ui: Arc<dyn Ui>,
@@ -183,7 +183,7 @@ pub struct Agent {
     base_system_prompt: String,
     default_model: String,
     current_model: String,
-    hosted: bool,
+    backend: Backend,
     reasoning_effort: Option<String>,
     budget_usd: Option<f64>,
     session_cost_usd: f64,
@@ -280,7 +280,7 @@ impl Agent {
         system_prompt: String,
     ) -> Self {
         let ui_for_retry = ui.clone();
-        let client = DeepSeekClient::new(
+        let client = ChatClient::new(
             resolved.endpoint.base_url.clone(),
             resolved.endpoint.api_key.clone(),
         )
@@ -294,8 +294,9 @@ impl Agent {
             .map(|m| m.context_window)
             .unwrap_or(128_000);
 
-        let web_available =
-            resolved.hosted && tools.contains("web_search") && tools.contains("web_fetch");
+        let web_available = resolved.backend.is_hosted()
+            && tools.contains("web_search")
+            && tools.contains("web_fetch");
         Self {
             client,
             tools,
@@ -305,7 +306,7 @@ impl Agent {
             base_system_prompt: system_prompt,
             current_model: default_model.clone(),
             default_model,
-            hosted: resolved.hosted,
+            backend: resolved.backend,
             reasoning_effort: resolved.reasoning_effort,
             budget_usd: resolved.budget_usd,
             session_cost_usd: 0.0,
@@ -758,14 +759,14 @@ impl Agent {
                 .map(|m| m.context_window)
                 .unwrap_or(self.context_window);
             if let Some(cost) =
-                crate::cost::estimate_cost_usd(&resp.usage, &self.current_model, self.hosted)
+                crate::cost::estimate_cost_usd(&resp.usage, &self.current_model, self.backend)
             {
                 self.session_cost_usd += cost;
             }
             self.ui.usage(
                 &resp.usage,
                 &self.current_model,
-                self.hosted,
+                self.backend,
                 self.session_cost_usd,
             );
 
@@ -1304,7 +1305,7 @@ impl Agent {
         report: &crate::compaction::CompactionReport,
     ) -> Option<f64> {
         let usage = report.summary_usage.as_ref()?;
-        let cost = crate::cost::estimate_cost_usd(usage, &self.current_model, self.hosted)?;
+        let cost = crate::cost::estimate_cost_usd(usage, &self.current_model, self.backend)?;
         self.session_cost_usd += cost;
         Some(cost)
     }

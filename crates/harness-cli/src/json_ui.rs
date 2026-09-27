@@ -23,6 +23,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use harness_agent::Ui;
+use harness_config::Backend;
 use harness_types::Usage;
 use serde::Deserialize;
 use serde_json::json;
@@ -348,14 +349,17 @@ impl Ui for JsonUi {
         self.emit(event);
     }
 
-    fn usage(&self, usage: &Usage, model_id: &str, hosted: bool, session_cost_usd: f64) {
+    fn usage(&self, usage: &Usage, model_id: &str, backend: Backend, session_cost_usd: f64) {
         self.emit(json!({
             "type": "usage",
             "prompt_tokens": usage.prompt_tokens,
             "completion_tokens": usage.completion_tokens,
             "total_tokens": usage.total_tokens,
             "model": model_id,
-            "hosted": hosted,
+            // `hosted` predates `backend` and stays for the existing VS Code
+            // extension; `backend` is what distinguishes byok from local.
+            "hosted": backend.is_hosted(),
+            "backend": backend.as_str(),
             "session_cost_usd": session_cost_usd,
             // `null` (not 0) when the provider reported nothing -- "we don't
             // know" and "measured zero hits" are different facts, and a
