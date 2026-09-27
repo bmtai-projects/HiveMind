@@ -1,248 +1,291 @@
 # HiveMind
 
-A fast, cost-optimized coding agent — a from-scratch Rust harness in the
-shape of [grok-build](https://x.ai/cli), built around one goal: **make an
-agentic coding loop cheap enough to give away.** The CLI binary is called
-`hivemind`; you run it with `hivemind activate`.
+HiveMind is a coding agent that lives in your terminal. You describe a task in
+plain English. It reads your code, edits files, runs commands, and tells you
+what it did and what it cost.
 
-Seven models are selectable with `--model` / `/model`: `hivemind` — the
-cheap, fast default — plus six third-party coding models (`claude-sonnet-5`,
-`gpt-5.3-codex`, `gemini-3.1-pro`, `grok-build`, `qwen3-coder-plus`,
-`kimi-k2-code`) resold through the hosted proxy. BYOK users point their own
-key at whatever their provider supports.
+It is written in Rust, ships as one small program called `hivemind`, and is
+built around one goal: **make an agentic coding loop cheap enough to give
+away.**
 
-> **`hivemind` is a brand alias, not a passthrough.** Which upstream model
-> serves it is infrastructure, resolved server-side and deliberately not
-> exposed client-side — the proxy rewrites every stream chunk's `model`
-> field back to the alias (see `HiveMind-server/src/proxy/upstream.ts`), and
-> the agent's own `IDENTITY` prompt tells it to say so plainly rather than
-> guess. Naming the upstream vendor in user-facing copy undoes that on
-> purpose-built work, so don't.
+```text
+$ hivemind activate
+> add a --verbose flag to the CLI and update the tests
+```
 
-> **This repo is the source. Compiled binaries live elsewhere** — they are
-> published to [`HiveMind-releases`](https://github.com/BibhabenduMukherjee/HiveMind-releases),
-> which carries no source, and that is where the install command points. See
-> [Distributing a release](#distributing-a-release) for how the two connect.
-> The hosted backend (auth, billing, the model proxy) is a separate private
-> service; nothing here depends on seeing it, and BYOK skips it entirely.
+## What it does
 
-New here? [CONTRIBUTING.md](CONTRIBUTING.md) has the build, the test commands,
-and the one architectural rule that matters. Security reports go through
-[SECURITY.md](SECURITY.md), not public issues.
+- **Reads and edits your code.** It can search by exact text or by meaning,
+  read files, and change just the lines that need changing.
+- **Runs commands, with your permission.** It asks before every shell command
+  unless you turn that off.
+- **Shows the cost as it goes.** Every reply prints what that turn cost and
+  what the session has cost so far.
+- **Works with your choice of model.** Use HiveMind's own service, bring your
+  own API key, or point it at a model running on your own machine.
+- **Reviews code.** `hivemind review` looks at your Git changes and reports
+  problems, with evidence.
 
-## Why it's cheap
+## Install
 
-Model choice isn't what makes Cursor/Claude expensive — **re-sent context**
-is. Every turn of an agent loop resends the whole growing conversation, and
-by mid-session that's tens of thousands of tokens billed on every call. Two
-things close that gap almost entirely:
-
-1. **Prompt-prefix caching.** Cache-hit prompt tokens bill at roughly
-   **1/50th** the cache-miss rate. Keep the prefix (system prompt, tool
-   schemas) byte-stable turn to turn and most of a session's input tokens
-   land in that discount. Most providers do this automatically; the ones
-   that need an explicit breakpoint are flagged per-model by
-   `needs_explicit_cache_control` in the catalog.
-2. **Compaction.** Once a session's usage crosses a threshold, fold older
-   turns into one summary instead of re-sending (and re-billing) them
-   forever.
-
-On the default model that puts a full coding session in cents, not dollars.
-Real per-model rates live in `KNOWN_MODELS`
-([`harness-config/src/lib.rs`](crates/harness-config/src/lib.rs)) — the
-single source of truth, so quoting numbers here would just rot. See
-[Optimizations](#optimizations-implemented) for what's actually wired up.
-
-## Quick start
-
-### Install
-
-Install command (this is what goes in user-facing docs):
+macOS and Linux:
 
 ```sh
 curl -fsSL https://hivemind.bmtai.in/install.sh | bash
 ```
 
+Windows (PowerShell):
+
 ```powershell
 irm https://hivemind.bmtai.in/install.ps1 | iex
 ```
 
-Or build from source:
+The Windows installer adds `hivemind` to your PATH, so open a **new**
+PowerShell window afterwards. The macOS/Linux installer puts it in
+`~/.local/bin` and tells you what to add to your PATH if that folder is not
+already on it.
+
+Check that it worked:
 
 ```sh
-git clone https://github.com/BibhabenduMukherjee/HiveMind.git
-cd HiveMind
-cargo build --release -p harness-cli
-./target/release/hivemind --version
+hivemind --version
 ```
 
-### Run
+Later, `hivemind update` replaces your copy with the newest release.
+
+Prefer to build it yourself? See [DEVELOPMENT.md](DEVELOPMENT.md).
+
+## First run
+
+HiveMind needs a model to talk to. Pick **one** of these three ways.
+
+### 1. HiveMind's own service (easiest)
+
+No API key of your own. You sign in and pay from a prepaid balance. See the
+[pricing page](https://hivemind.bmtai.in/pricing).
 
 ```sh
-hivemind auth login                            # hosted: no provider key of your own
-# or, BYOK:
-export HIVEMIND_API_KEY=sk-...                 # $DEEPSEEK_API_KEY still works (legacy)
-
-hivemind activate                              # interactive REPL, on the default model
-hivemind activate -p "summarize src/main.rs"   # headless one-shot
-hivemind activate --model claude-sonnet-5      # start on a specific model
-hivemind activate --continue                   # resume the last session here
-hivemind models                                # what's selectable
+hivemind auth login     # opens your browser to sign in
+hivemind activate
 ```
 
-No config file is required. To customize models, thresholds, or a proxy
-`base_url`, copy [`config.example.toml`](config.example.toml) to
-`~/.config/hivemind/config.toml`.
+`hivemind auth status` shows whether you are signed in and what your balance
+is. Web search and Pro mode only work this way.
 
-## Optimizations implemented
+### 2. Your own API key
 
-Every one of these is real, wired-up behavior — not a roadmap item:
+Any provider that speaks the OpenAI-style chat API works, for example
+OpenRouter. Always pass `--base-url` and `--model` with your key.
 
-| Optimization | Where | Effect |
-|---|---|---|
-| **Prefix-stable requests + cache-hit visibility** | [`harness-cli/src/ui.rs`](crates/harness-cli/src/ui.rs), [`harness-provider/src/wire.rs`](crates/harness-provider/src/wire.rs) | Tool schemas serialize in sorted, deterministic order; the provider's `prompt_cache_hit_tokens`/`prompt_cache_miss_tokens` are parsed and shown live (`cache 92%`) so the win is visible, not assumed. |
-| **Context compaction** | [`harness-agent/src/compaction.rs`](crates/harness-agent/src/compaction.rs) | At `compaction_threshold_percent` (default 75%) of the context window, older turns are folded into one model-generated summary via a cheap model call — never silently truncated, never re-billed forever. |
-| **Anchored edits over full rewrites** | [`harness-tools/src/edit.rs`](crates/harness-tools/src/edit.rs) | `edit_file` replaces just an `old_string`→`new_string` span, so modifying a file emits tens of output tokens instead of re-emitting the whole thing. Output is the priciest token class (never cached), which makes this the largest single lever on a coding session's cost — and it can't corrupt untouched code, so fewer botched edits means fewer retry turns and less escalation. |
-| **Auto-escalation off the cheap default** | [`harness-agent/src/agent.rs`](crates/harness-agent/src/agent.rs) | Every task starts on the cheap default. If the model repeats an identical tool call or hits repeated tool errors (a doom-loop symptom), the harness escalates to `escalate_to_model` for that task only, then resets on the next input. Scoped to rescuing the default: it never fires once a user has explicitly picked a model, since that could be a much bigger cost jump than they expect. |
-| **Parallel tool dispatch** | [`harness-tools/src/tool.rs`](crates/harness-tools/src/tool.rs) | Multiple tool calls in one turn run concurrently via `tokio::JoinSet`, then are reassembled in original call order — concurrent latency, deterministic transcript. |
-| **Retry/backoff with jitter** | [`harness-provider/src/retry.rs`](crates/harness-provider/src/retry.rs) | 429/5xx/network errors retry with exponential backoff + jitter, honoring a server's `Retry-After` header, surfaced to the UI via a retry hook. |
-| **Connection reuse** | [`harness-provider/src/client.rs`](crates/harness-provider/src/client.rs) | One pooled `reqwest::Client` per process — every request, retry, and background summarization call reuses keep-alive HTTP connections. |
-| **Zero-clone request path** | [`harness-provider/src/client.rs`](crates/harness-provider/src/client.rs) | The provider borrows the conversation only long enough to serialize it; sending a turn never clones the (potentially large) message history. Retries resend a cheaply-refcounted `Bytes` body, not a re-copy. |
-| **Live cost readout** | [`harness-cli/src/ui.rs`](crates/harness-cli/src/ui.rs) | Every response line shows `$turn / $session` cost, computed from real usage × that model's pricing — the point of all of the above is a number you can watch stay small. |
-
-## Architecture
-
-```
-crates/
-  harness-types      provider-neutral wire model (Message, ToolCall, Usage, StreamEvent)
-  harness-config     config.toml + env resolution: model catalog, keys, policy
-  harness-provider   the streaming client: SSE decode, retries, connection reuse
-  harness-tools      the Tool trait, registry, parallel dispatch, fs + shell builtins
-  harness-agent      the sample<->tools loop: compaction, tiering/escalation, doom-loop guard
-  harness-cli        the `hivemind` binary (activate subcommand): clap args, REPL/headless, terminal UI, cost display
+```sh
+export HIVEMIND_API_KEY=<your key>          # Windows PowerShell: $env:HIVEMIND_API_KEY = "<your key>"
+hivemind activate --base-url https://openrouter.ai/api/v1 --model <a model id your provider uses>
 ```
 
-Six small crates instead of grok-build's ~70 — same layering, deliberately
-compact. Data flows one way: `harness-cli` builds a `Registry` (tools) and a
-`Resolved` config, hands both to `harness-agent::Agent`, which drives
-`harness-provider` and streams events back through a UI trait the CLI
-implements. No crate reaches back up the stack.
+> **Do not skip `--base-url`.** If you give a key but no address, HiveMind
+> sends the key to its built-in default, `https://api.deepseek.com`, which is
+> only right if the key is for that service.
 
-### Provider abstraction, kept honest
+### 3. A model on your own machine (no key, no cost)
 
-There's no `Provider` trait today — `Agent` is concretely typed against a
-single client, on purpose. Every model in the catalog is reached over the
-same OpenAI-compatible Chat Completions dialect (hosted models via the
-proxy, BYOK straight to the vendor), so one client covers all of them and a
-trait would be an abstraction with one implementation. A provider speaking a
-genuinely different wire format means: define its dialect in a new module
-(mirroring [`harness-provider/src/wire.rs`](crates/harness-provider/src/wire.rs)),
-then introduce the trait `Agent` needs at that point. Not before.
+This works with any server that speaks the OpenAI-style chat API, such as
+Ollama, which serves one at `http://localhost:11434/v1` by default.
 
-The client type is still named `DeepSeekClient` — a historical name from
-when that was the only backend, not a statement of scope. It speaks the
-generic dialect described above.
+```sh
+hivemind auth logout      # only if you were signed in to the hosted service
+hivemind activate --base-url http://127.0.0.1:11434/v1 --model <a model you have pulled>
+```
 
-## Tools
+Things to know:
 
-Seven built-ins, all workspace-confined (`--workdir`, default `.`):
+- HiveMind has no default local model. Use `ollama list` to see yours.
+- Pick a model that supports tool calling. Without it the agent cannot read or
+  edit files.
+- No prices are known for your own model, so no cost is shown.
+- Your code and prompts stay on your machine, but HiveMind is not fully
+  offline. Every time `hivemind activate` starts, it asks GitHub whether a
+  newer release exists. That is one small web request that gives up after
+  under a second, and there is no setting to turn it off yet.
+- If you are still signed in, `--base-url` on its own keeps using your hosted
+  account and **sends it your sign-in token**. Sign out first.
 
-- `read_file`, `write_file`, `list_dir` — path-escape-checked against the
-  workspace root.
-- `edit_file` — exact `old_string`→`new_string` replacement in an existing
-  file. The model rewrites only the changed span instead of re-emitting the
-  whole file, so a one-line change costs tens of output tokens, not thousands
-  — and can't corrupt the parts it never re-typed. The system prompt steers
-  modifications here; `write_file` is for creating new files.
-- `search` — read-only, workspace-confined literal content search returning
-  `path:line: text` hits. Needs no approval (it only reads), so the model
-  locates code in one cheap turn without a shell round-trip or a `grep`/`rg`
-  dependency, skipping `.git`/`target`/`node_modules` and large/binary files.
-- `semantic_search` — ranked *similarity* search (the retrieval half of a
-  "modern agent"): the repo is chunked and embedded into an incrementally
-  cached vector index, the query is embedded, and the closest chunks come back
-  as `path:startLine-endLine` ranges. Lets the model find code by concept, not
-  just exact string. The default embedder is local and dependency-free
-  (feature-hashing — lexical/fuzzy, ships lean); it's behind an `Embedder`
-  trait so a real neural model (e.g. `fastembed`/BGE) drops in without
-  touching the index or tool. See [`semantic.rs`](crates/harness-tools/src/semantic.rs).
-- `run_shell` — gated by an interactive `[y/N]` approval prompt by default;
-  `--yolo` or headless (`-p`) mode auto-approves. Runs under a timeout with
-  `kill_on_drop` so a cancelled/timed-out command can't orphan a process.
+### Then try it
 
-## Flags
+```sh
+hivemind activate                                            # interactive session
+hivemind activate -p "summarize what this project does"      # one question, then exit
+hivemind activate --continue                                 # pick up your last session here
+```
 
-All of these are flags on `hivemind activate`, e.g.
-`hivemind activate --model claude-sonnet-5`. `hivemind activate --help` is
-the authoritative list; this table is a summary.
+Inside a session, type `/help` to see every command, and `@path/to/file` to
+hand a file to the model directly.
 
-| Flag | Meaning |
+## What works today
+
+**Everyday use**
+
+- Interactive sessions and one-shot prompts (`-p`).
+- Saved sessions you can come back to: `--continue`, `--resume <id>`, and
+  `hivemind sessions`.
+- `/undo` restores files the agent edited or wrote. It does **not** undo
+  shell commands, and it only remembers the current session.
+- `/diff`, `/status`, `/context`, `/model`, `/reasoning`, `/skill`, `/cost`,
+  `/budget`, `/compact`.
+- `@path` mentions that put a file's contents straight into your message.
+- `hivemind review`: reads your Git changes (`--staged`, `--base`, `--commit`,
+  `--range`) and reports problems. It never edits your repository. It needs a
+  model, so set one up as above first.
+
+**Tools the agent can use**
+
+| Tool | What it does |
 |---|---|
-| `-p, --prompt` | Run one prompt headlessly (auto-approves shell), then exit. |
-| `--workdir` | Workspace root. Default `.`. |
-| `--config` | Config file path. Default `~/.config/hivemind/config.toml`. |
-| `--model` | Model to start on. `hivemind models` lists what's selectable. |
-| `--api-key` / `--base-url` | Override resolved endpoint (e.g. point at a proxy or local mock). |
-| `--yolo` | Auto-approve all shell commands. Off by default. |
-| `--reasoning-effort` | Thinking depth on models that support it. Opt-in: slower and pricier. |
-| `--show-reasoning` | Also dump the raw reasoning text, on models that emit it. |
-| `--budget` | Hard USD cap for the session. Stops at a turn boundary, never mid-edit. |
-| `--mode` | `standard` (default, local and free) or `pro` (hosted embeddings, billed). |
-| `--continue` | Resume the most recent session for this workspace. |
-| `--resume <ID>` | Resume one specific session (see `hivemind sessions`). |
-| `--protocol json` | Speak NDJSON on stdin/stdout instead of the REPL — what the VS Code extension uses. |
+| `read_file`, `list_dir`, `project_map` | Look at files and the shape of the project |
+| `search` | Find exact text |
+| `semantic_search` | Find code by meaning. Runs locally. |
+| `read_program` | Several read-only lookups in one step (turned off if you have hooks configured) |
+| `edit_file` | Change one exact piece of a file |
+| `write_file` | Create a new file |
+| `run_shell` | Run a command, after you approve it |
+| `todo_write` | Keep a visible checklist for bigger jobs |
+| `create_pdf`, `create_spreadsheet`, `create_diagram` | Make documents |
+| `read_artifact` | Read back a large result that was saved to disk |
+| `web_search`, `web_fetch` | Hosted service only, and off until you turn on `--web` |
 
-## Development
+**Safety and control**
 
-```sh
-cargo check -p <crate>              # target one crate; faster than a full build
-cargo test --workspace
-cargo clippy --workspace --all-targets -- -D warnings
-cargo fmt --all
+- Files are confined to your working folder (`--workdir`, default: the current
+  folder).
+- Shell commands ask `[y/N]` first. `--yolo`, or the headless `-p` mode, skips
+  the question, so use them carefully.
+- Safety rules you can switch on with one command, such as "never force-push"
+  or "only write inside `src/`": `hivemind hooks list`, then
+  `hivemind hooks enable <name>`. You can also write your own in the config
+  file.
+- A spending cap: `--budget 0.50`, or `/budget` inside a session. It stops at
+  the end of a turn, never in the middle of an edit.
+- Four built-in skills that tune the agent for one kind of job: `hivemind skills`.
+
+**For editors and other tools**
+
+- `hivemind activate --protocol json` talks in JSON lines over stdin and
+  stdout, so an editor or script can drive HiveMind.
+
+## What is planned
+
+These do **not** exist yet. Some are good places to help; see
+[docs/community-tasks.md](docs/community-tasks.md) for small starting points.
+
+- **An easier way to use a local model**, with a `--local` flag, and a
+  `hivemind models` that asks your server what it has. Today `hivemind models`
+  only prints the built-in list.
+- **MCP support**, to plug in outside tool servers.
+- **A `/tier` command** to switch between standard and Pro mode inside a
+  session. Today you choose with `--mode` when you start.
+- **A real neural embedding model for local `semantic_search`.** Today the
+  local one matches on words, not meaning. Pro mode on the hosted service
+  already uses a stronger, hosted one.
+- **Support for providers that do not use the OpenAI-style chat API.**
+
+## Why it is cheap
+
+Most of what a coding agent costs is not the model. It is **re-sending the
+whole conversation** on every turn. A few things fix most of that:
+
+| What | How it helps | Where to read the code |
+|---|---|---|
+| **Stable prompt prefix** | The start of every request stays identical, so providers that cache can charge the cheap "cached" rate for it. Cached input costs a small fraction of normal input on providers that support it. HiveMind shows the cache hit rate live. | [`wire.rs`](crates/harness-provider/src/wire.rs), [`tool.rs`](crates/harness-tools/src/tool.rs) |
+| **Compaction** | When a session fills 75% of the model's memory (you can change that), older turns are folded into one summary instead of being re-sent forever. | [`compaction.rs`](crates/harness-agent/src/compaction.rs) |
+| **Small edits** | `edit_file` swaps one exact piece of text instead of rewriting the whole file. Output tokens are the most expensive kind, so this saves the most. | [`edit.rs`](crates/harness-tools/src/edit.rs) |
+| **Big results go to disk** | A huge command output is saved as a file, and the conversation keeps a short preview and a handle. `read_artifact` fetches more if needed. | [`artifact.rs`](crates/harness-tools/src/artifact.rs) |
+| **Cheap first, stronger only when stuck** | On the hosted service, a task starts on the cheap default model. If the agent repeats itself or keeps hitting errors, it switches to a stronger model for that task only. | [`agent.rs`](crates/harness-agent/src/agent.rs) |
+| **Parallel tools** | When the model asks for several tools at once, they run at the same time. Results are put back in order. | [`tool.rs`](crates/harness-tools/src/tool.rs) |
+| **Retries with backoff** | Rate limits and network hiccups are retried with growing, randomized waits, and a server's `Retry-After` is respected. | [`retry.rs`](crates/harness-provider/src/retry.rs) |
+| **Reused connections, no copies** | One connection pool for the whole run, and the conversation is not copied to send a turn. | [`client.rs`](crates/harness-provider/src/client.rs) |
+| **Live cost readout** | Every reply prints what that turn and the session cost. | [`ui.rs`](crates/harness-cli/src/ui.rs) |
+
+## How it is built
+
+HiveMind is a Rust workspace of seven small crates:
+
+```text
+crates/
+  harness-types      the shared shapes: Message, ToolCall, Usage, StreamEvent
+  harness-config     config file and environment: model catalog, keys, settings
+  harness-provider   talks to the model: streaming, retries, connection reuse
+  harness-tools      the Tool trait and every built-in tool
+  harness-review     Git diff and review report types (no other crate needed)
+  harness-agent      the loop: model -> tools -> model, plus compaction and undo
+  harness-cli        the `hivemind` program: arguments, terminal, cost display
 ```
 
-## Distributing a release
+Who depends on whom (an arrow means "uses"):
 
-```sh
-git tag v0.1.0
-git push origin v0.1.0              # triggers .github/workflows/release.yml
+```text
+harness-cli ──► harness-agent ──► harness-provider ──► harness-types
+     │               │      └────► harness-tools ─────► harness-types
+     │               └───────────► harness-review
+     └──► harness-config  (the agent uses it too)
 ```
 
-Builds macOS (x86_64/aarch64), Linux (x86_64/aarch64), and Windows (x86_64)
-binaries, then **publishes them to the public `HiveMind-releases` repo**, not
-this one — see `.github/workflows/release.yml`. That cross-repo publish
-needs a secret this repo doesn't manage automatically:
+Only the main arrows are drawn. The CLI also uses `harness-tools`,
+`harness-provider`, `harness-review`, and `harness-types` directly. You can
+see the exact list in each crate's `Cargo.toml`.
 
-- **`RELEASES_REPO_TOKEN`** — a PAT with `Contents: Read and write` scoped
-  to `BibhabenduMukherjee/HiveMind-releases`, added under this repo's
-  *Settings > Secrets and variables > Actions*. Without it, the `release`
-  job's publish step fails with a permissions error — the default
-  `GITHUB_TOKEN` can't write to a different repo.
+**The one rule:** arrows only point down. `harness-cli` builds the tools and
+the settings and hands them to `harness_agent::Agent`. The agent talks to the
+model and reports progress back through a `Ui` trait that the CLI implements.
+(A trait is Rust's word for an interface: a list of things a type promises to
+do.) No lower crate reaches back up. That is what lets you change one crate
+without understanding the others.
 
-`HiveMind-releases/install.sh` downloads whichever asset matches the
-caller's platform. Both the workflow and the installer have been run
-end-to-end against real GitHub infrastructure, not just written and hoped.
+One client, [`ChatClient`](crates/harness-provider/src/client.rs), speaks the
+OpenAI-style chat API to every backend. There is no `Provider` trait yet, on
+purpose: with only one client it would just add a layer for nothing. If a
+provider ever needs a different request and response format, it would get its
+own module, like [`wire.rs`](crates/harness-provider/src/wire.rs), and that is
+the moment to add the trait.
 
-## Roadmap
+The hosted service (accounts, billing, and the model proxy) is a separate
+private service. Nothing in this repository needs it, and the second and
+third ways to connect never talk to it. Ready-made downloads live in the public
+[HiveMind-releases](https://github.com/BibhabenduMukherjee/HiveMind-releases)
+repository, which holds no source.
 
-Scoped out of this pass on purpose — natural next additions, each behind an
-existing seam:
+## Settings
 
-- **A second provider** (OpenAI/Anthropic/xAI) — see [Provider abstraction](#provider-abstraction-kept-honest).
-- **Undo stack for edits** — `edit_file` (shipped) already scopes each change to a span; a per-session undo/redo over file writes is the natural follow-on.
-- **Neural `semantic_search`** — the retrieval pipeline (chunk/index/cosine/cache) is shipped behind an `Embedder` trait with a lean local default; swapping in a real embedding model (`fastembed`/BGE locally, or a hosted embeddings API) behind a cargo feature makes it truly semantic. Persist the index to disk to skip the cold-start rebuild.
-- **MCP client** — mount external tool servers.
-- **Session persistence** — `Agent::history()` already exposes the full transcript; save/resume is a serialization layer away.
-- **Explicit `anthropic-style` cache breakpoints** — wired up and gated per-model by `needs_explicit_cache_control`; most models cache automatically and must not be sent it.
-- **A `/cost` and `/tier` REPL command** — the pricing and tier machinery already exists in `harness-config`/`harness-cli/src/ui.rs`; this is UI wiring, not new logic.
+You do not need a config file. To change defaults, copy
+[`config.example.toml`](config.example.toml) to
+`~/.config/hivemind/config.toml` (on Windows that is
+`%USERPROFILE%\.config\hivemind\config.toml`). Every setting there is optional
+and explained in comments.
+
+`hivemind activate --help` lists every flag. The most useful:
+
+| Flag | What it does |
+|---|---|
+| `-p, --prompt` | Run one prompt and exit |
+| `--model` | Start on a specific model |
+| `--budget` | Stop once estimated spend reaches this many USD |
+| `--continue` / `--resume <id>` | Return to a saved session |
+| `--skill` | Start with a skill selected |
+| `--yolo` | Do not ask before running shell commands |
 
 ## Contributing
 
-Seven crates, about 33k lines, roughly 630 tests — small enough to read in a
-sitting. [CONTRIBUTING.md](CONTRIBUTING.md) covers the setup, the four commands
-CI runs, and the one rule that keeps it navigable: data flows one way and no
-crate reaches back up the stack. The [Roadmap](#roadmap) above is the honest
-list of what is scoped out and where the seams already are.
+Contributions of every size are welcome, and you do not need to be a Rust
+expert. Bug reports, clearer docs, new tests, and small fixes all help.
+
+- **New here?** Read [CONTRIBUTING.md](CONTRIBUTING.md). It covers choosing a
+  task, making a change, checking it, and opening a pull request.
+- **Want a small first task?** Start with
+  [docs/community-tasks.md](docs/community-tasks.md), or look for the
+  `good first issue` label.
+- **Setting up your machine?** [DEVELOPMENT.md](DEVELOPMENT.md) has the build
+  and test commands. Every check runs without a paid API key.
+- **Found a bug or have a question?** Open an issue. There is a form for each.
+- **Found a security problem?** Please do not open a public issue. Follow
+  [SECURITY.md](SECURITY.md).
 
 ## License
 
@@ -251,5 +294,5 @@ Dual-licensed under either of
 - Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
 - MIT license ([LICENSE-MIT](LICENSE-MIT))
 
-at your option. Contributions are dual-licensed the same way unless you state
+at your option. Contributions are dual-licensed the same way unless you say
 otherwise.

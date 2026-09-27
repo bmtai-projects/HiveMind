@@ -1,0 +1,29 @@
+name: Question
+description: Ask how something works, or how to get started. No question is too small.
+labels: ["question"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for asking. Before you post, it may help to look through the
+        existing issues and the
+        [README](https://github.com/BibhabenduMukherjee/HiveMind/blob/main/README.md).
+
+        For problems with your HiveMind account or billing, please use the
+        [contact page](https://hivemind.bmtai.in/contact) instead.
+  - type: textarea
+    id: goal
+    attributes:
+      label: What are you trying to do?
+    validations:
+      required: true
+  - type: textarea
+    id: tried
+    attributes:
+      label: What have you tried so far?
+      description: Commands you ran, or pages you read. It is fine if the answer is "nothing yet".
+  - type: input
+    id: version
+    attributes:
+      label: HiveMind version (optional)
+      description: Run `hivemind --version` if it is relevant to your question.
