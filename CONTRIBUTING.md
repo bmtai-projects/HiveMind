@@ -1,34 +1,65 @@
 # Contributing to HiveMind
 
-Thanks for looking. HiveMind is about 33,000 lines of Rust across seven small
-crates, with around 630 tests. That is deliberately small enough to read in a
-sitting, so you should not need permission or a design doc to start.
+Thank you for wanting to help. HiveMind is a small project on purpose. A few
+small crates, lots of tests, and code you can read in a sitting. You do not
+need to be a Rust expert, and you do not need anyone's permission to start with
+something small.
 
-## Getting set up
+## Ways to help
 
-```sh
-git clone https://github.com/BibhabenduMukherjee/HiveMind.git
-cd HiveMind
-cargo build -p harness-cli
-./target/debug/hivemind --version
-```
+Every one of these counts as a real contribution:
 
-Rust stable, pinned by `rust-toolchain.toml` — no other system dependencies.
+- **Report a bug.** Something broke or surprised you? Tell us.
+- **Improve the docs.** Fix a confusing sentence, a wrong command, or a typo.
+- **Add a test.** Tests are what let people change code safely.
+- **Fix something small.** An unclear error message, a stale number, a missing
+  check.
+- **Try it on your system** and tell us what happened, especially on Windows,
+  macOS, or with a local model.
+- **Ask a question.** If something was hard to understand, that is useful to
+  know.
 
-To run it you need either a hosted account (`hivemind auth login`) or your own
-provider key:
+## Choose something to work on
 
-```sh
-export HIVEMIND_API_KEY=sk-...          # any OpenAI-compatible provider
-hivemind activate --base-url https://your-provider/v1
-```
+1. **Want a small first task?** Look in
+   [docs/community-tasks.md](docs/community-tasks.md), or for issues labeled
+   `good first issue`. Each one names the files to open and says how you will
+   know you are done. Issues labeled `help wanted` are a bit bigger.
+2. **Have your own idea?** For a small fix (a typo, a clearer message, a missing
+   test), go ahead and open a pull request. For anything bigger, such as a new
+   feature, a change to how the agent behaves, or a new dependency, **open an
+   issue first** and describe what you want to do. It saves you effort if the
+   idea does not fit.
+3. **Tell us you are on it.** Comment on the issue, so two people do not do the
+   same job. If your plans change, say so and someone else can take it.
 
-You do **not** need an account to build, test, or work on most of the code.
+## Make a change
 
-## Before you open a PR
+1. **Fork** the repository on GitHub, then clone your fork.
+2. **Set up your machine.** [DEVELOPMENT.md](DEVELOPMENT.md) has every step. The
+   short version:
 
-These four are exactly what CI runs, so running them locally means no
-surprises:
+   ```sh
+   cargo build -p harness-cli
+   ```
+
+3. **Make a branch** for your change:
+
+   ```sh
+   git switch -c my-change
+   ```
+
+4. **Make the change.** Keep it small and about one thing. A small pull request
+   is reviewed faster and is easier to get right.
+5. **Check it** (next section).
+6. **Commit.** Start with a short line that says what the change does, like
+   "Show a clear error when the working folder is missing". Add a few lines
+   about *why* if it is not obvious.
+7. **Push** your branch and open a pull request.
+
+## Check it
+
+Run these four before you open a pull request. They are exactly what CI runs.
 
 ```sh
 cargo fmt --all
@@ -37,90 +68,98 @@ cargo test --workspace
 cargo build --workspace --release
 ```
 
-Clippy warnings are errors here. That is not fussiness — it is what keeps a
-codebase this small readable by people who did not write it.
+**All four work without an API key or any paid account.** The tests use fake
+servers on your own machine. See [DEVELOPMENT.md](DEVELOPMENT.md) for the
+details, and for what to do if a check fails.
 
-While you are iterating, `cargo check -p <crate>` on the one crate you touched
-is much faster than a workspace build.
+Formatting runs first, and a failure there hides everything after it. If CI
+finishes in a few seconds and is red, it is almost always formatting. Run
+`cargo fmt --all` and push again.
 
-## How the code is laid out
-
-```
-crates/
-  harness-types      provider-neutral wire model: Message, ToolCall, Usage, StreamEvent
-  harness-config     config.toml + env resolution: model catalog, keys, policy
-  harness-provider   the streaming client: SSE decode, retries, connection reuse
-  harness-tools      the Tool trait, registry, parallel dispatch, fs + shell builtins
-  harness-review     evidence-backed local code review
-  harness-agent      the sample<->tools loop: compaction, escalation, doom-loop guard
-  harness-cli        the `hivemind` binary: args, REPL, terminal UI, cost display
-```
-
-**Data flows one way, and this is the one rule we care about most.**
-`harness-cli` builds a tool `Registry` and a resolved config, hands both to
-`harness_agent::Agent`, which drives `harness-provider` and streams events back
-through a `Ui` trait the CLI implements. **No crate reaches back up the stack.**
-
-That constraint is why the codebase stays navigable, and it is why you can fix
-something in one crate without understanding the other six. A PR that adds an
-upward dependency will be asked to turn it into a trait the lower crate owns.
-
-## What we are looking for
-
-The Roadmap in [README.md](README.md) is the honest list of what is scoped out
-and why — each item sits behind a seam that already exists. Good first
-contributions tend to be:
-
-- A new tool implementing the `Tool` trait in `harness-tools`
-- A provider dialect, if you need one that is not OpenAI-compatible (add a
-  module mirroring `harness-provider/src/wire.rs`, then introduce the trait
-  `Agent` needs at that point — not before)
-- Anything in the Roadmap
-- Fixing something that annoyed you while using it
-
-If you are planning something large, open an issue first so you do not spend a
-weekend on an approach we would push back on.
-
-## Tests
-
-Roughly 630 of them, and they are the reason you can change code you do not
-fully understand yet. Please add one for a bug you fix — a test that fails
-before your change and passes after is the most useful thing in a PR.
-
-Test names here read as sentences describing the behaviour, not the function
-under test:
+**Please add a test when you fix a bug.** A test that fails before your change
+and passes after it is the most useful thing a pull request can contain. Name
+tests as sentences that say what should be true, so the name alone explains a
+failure:
 
 ```rust
 #[test]
-fn a_ranged_read_prefers_the_note_slice_file_appended() { … }
+fn a_base_url_without_any_key_resolves_to_a_local_backend() { ... }
 ```
 
-That is a real convention, not a style whim: when one fails in CI, the name
-alone should tell you what broke.
+Some tests only make sense on Unix, for example ones that use `sleep` or a
+trailing `&`. Mark those `#[cfg(unix)]`. CI may not run on your system, so if
+you use Windows or macOS, running the tests yourself is how you catch problems
+there.
 
-A few tests are `#[cfg(unix)]` because they assert POSIX shell semantics —
-`cmd.exe` reads `&` as a sequential separator rather than backgrounding, so
-those cases genuinely do not apply on Windows. CI runs Linux only, so if you
-develop on Windows, do run the suite locally; you may find something CI cannot
-see.
+## Open a pull request
 
-## Cost is a correctness property
+- A template appears when you open the pull request. It is short. Fill in what
+  changed and why.
+- If your change fixes an issue, write `Fixes #123` so it closes by itself.
+- **CI must be green.** If it is red, open the failed step and read the message.
+  Most of the time it is formatting or a clippy warning.
+- **Unfinished is fine.** Open a draft pull request any time you want early
+  feedback or are unsure about the direction.
 
-Unusually for a coding agent, **making a change more expensive counts as a
-regression.** Prompt prefixes must stay byte-stable turn to turn or prompt
-caching silently stops working, and tool descriptions are re-sent on every
-turn of every session, so words added there are billed forever. If your change
-touches the prompt, the tool schemas, or the number of turns a task takes,
-please say so in the PR.
+**What happens next.** A maintainer reads your pull request and may ask for
+changes. That is normal. It is not a rejection, and it happens to everyone. Push
+more commits to the same branch to update it. When it looks good, a maintainer
+merges it. Reviews are done by people in their own time, so please be patient.
+A polite nudge after about a week is fine.
 
-## Reporting bugs
+## Ask questions
 
-Open an issue with what you ran, what happened, and `hivemind --version`. For
-anything security-related, read [SECURITY.md](SECURITY.md) first — please do
-not open a public issue for a vulnerability.
+There are no silly questions here. If you are stuck or something is unclear:
 
-## Licensing of contributions
+- **Open an issue and choose "Question".** There is a short form for it. Say
+  what you are trying to do and what you have tried.
+- Look through existing issues first. Someone may have asked already.
+- **Trouble with your HiveMind account or billing** is a different matter. That
+  goes to hivemind@bmtai.in, not to the issue tracker.
+- **Security problems** go through [SECURITY.md](SECURITY.md), never in a public
+  issue.
+
+## Reporting a bug
+
+Open an issue and choose **Bug report**. The form asks for the few things that
+help most: what happened, what you expected, the steps to reproduce it, and the
+output of `hivemind --version`. Before you paste anything, remove API keys and
+private code.
+
+## How the code is organized
+
+There are seven crates. The [README](README.md#how-it-is-built) has the picture.
+You only need to remember one rule:
+
+> **Data flows one way. A crate may use crates below it, and never crates above
+> it.** `harness-cli` builds the tools and settings and gives them to
+> `harness-agent`, which talks to the model. Nothing lower reaches back up.
+
+That rule is why you can fix something in one crate without understanding the
+other six. A change that adds an upward dependency will be asked to turn it into
+a trait that the lower crate owns.
+
+## Things worth knowing
+
+- **Cost is part of correctness.** HiveMind exists to be cheap, so making it
+  more expensive counts as a regression. The start of every request must stay
+  identical from turn to turn, or provider caching stops working. Tool
+  descriptions are sent on **every turn of every session**, so extra words there
+  cost real money. If your change touches the prompt, the tool descriptions, or
+  how many turns a task takes, please say so in the pull request.
+- **Comments should be short.** Prefer a clear name over a comment. When you do
+  comment, say *why*, not *what*.
+- **Formatting is not a debate.** `rustfmt` decides, and clippy warnings are
+  errors.
+
+## Be kind
+
+Be patient with newcomers, assume good intentions, and give feedback on the
+code, never on the person. If someone is being unkind, tell a maintainer by
+opening an issue or writing to hivemind@bmtai.in.
+
+## License
 
 Contributions are dual-licensed under Apache-2.0 or MIT, at the user's option,
-matching the project. By opening a pull request you agree your contribution
-may be distributed under both, unless you say otherwise.
+the same as the project. By opening a pull request you agree that your
+contribution may be distributed under both, unless you say otherwise.
