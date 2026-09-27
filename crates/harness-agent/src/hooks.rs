@@ -209,13 +209,23 @@ mod tests {
         }
     }
 
+    /// Deliberately far longer than any hook here needs. These commands exit
+    /// immediately, so a generous ceiling costs nothing -- but `bash -lc` is a
+    /// *login* shell, which sources /etc/profile and every /etc/profile.d
+    /// script before running anything. On a loaded CI runner that startup
+    /// alone exceeded the 2s this used to allow, and the timeout branch of an
+    /// enforcement hook denies, so unrelated tests failed with "hook timed
+    /// out". The two tests that actually measure the timeout set their own
+    /// short value.
+    const GENEROUS_TIMEOUT_MS: u64 = 30_000;
+
     fn spec(event: HookEvent, matcher: Option<Vec<&str>>, command: &str) -> HookSpec {
         HookSpec {
             name: "test-hook".to_string(),
             event,
             matcher: matcher.map(|v| v.into_iter().map(String::from).collect()),
             command: command.to_string(),
-            timeout_ms: 2_000,
+            timeout_ms: GENEROUS_TIMEOUT_MS,
             enforcement: false,
         }
     }
@@ -229,9 +239,9 @@ mod tests {
     }
 
     #[cfg(windows)]
-    const SLEEP_LONGER_THAN_ANY_TIMEOUT: &str = "ping -n 6 127.0.0.1 > nul";
+    const SLEEP_PAST_THE_SHORT_TIMEOUT: &str = "ping -n 6 127.0.0.1 > nul";
     #[cfg(not(windows))]
-    const SLEEP_LONGER_THAN_ANY_TIMEOUT: &str = "sleep 5";
+    const SLEEP_PAST_THE_SHORT_TIMEOUT: &str = "sleep 5";
 
     #[cfg(windows)]
     const ECHO_JSON_DENY: &str = r#"echo {"decision":"deny","reason":"nope"}"#;
@@ -284,7 +294,7 @@ mod tests {
     async fn timeout_fails_open() {
         let hooks = vec![HookSpec {
             timeout_ms: 100,
-            ..spec(HookEvent::PreToolUse, None, SLEEP_LONGER_THAN_ANY_TIMEOUT)
+            ..spec(HookEvent::PreToolUse, None, SLEEP_PAST_THE_SHORT_TIMEOUT)
         }];
         let decision =
             run_pre_tool_use(&hooks, &call("run_shell", serde_json::json!({})), ".").await;
@@ -332,7 +342,7 @@ mod tests {
     async fn a_timed_out_enforcement_hook_denies() {
         let hooks = vec![HookSpec {
             timeout_ms: 100,
-            ..enforcing(SLEEP_LONGER_THAN_ANY_TIMEOUT)
+            ..enforcing(SLEEP_PAST_THE_SHORT_TIMEOUT)
         }];
         let decision =
             run_pre_tool_use(&hooks, &call("run_shell", serde_json::json!({})), ".").await;
