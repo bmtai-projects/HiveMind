@@ -197,7 +197,11 @@ maintainers with write access.
 
 ## Before you start
 
-- You can push to `main` and push tags.
+- You can push tags. Nobody can push straight to `main` any more, including
+  maintainers -- `main` is protected and requires every change, release
+  commits included, to land through a pull request. See
+  [Why a PR for a two-file commit](#why-a-pr-for-a-two-file-commit) if that
+  feels like overkill.
 - The [GitHub CLI](https://cli.github.com) is installed and signed in:
   `gh auth status`.
 - **Version numbers only go up.** `hivemind update` offers a release only if
@@ -213,15 +217,18 @@ maintainers with write access.
 # 2. Let Cargo update the lock file to match.
 cargo check --workspace
 
-# 3. Commit those two files, and nothing else.
+# 3. Commit those two files, and nothing else, on a branch.
+git checkout -b release/vX.Y.Z
 git add Cargo.toml Cargo.lock
 git commit -m "chore(release): vX.Y.Z"
-git push origin main
+git push -u origin release/vX.Y.Z
 
-# 4. Wait for CI to go green on that commit.
-gh run watch --repo bmtai-projects/HiveMind
+# 4. Open the PR and merge it once CI is green.
+gh pr create --title "chore(release): vX.Y.Z" --body "Version bump."
+gh pr merge --merge
 
-# 5. Tag it. Pushing the tag starts the release.
+# 5. Pull the merge commit, then tag it. Pushing the tag starts the release.
+git checkout main && git pull
 git tag vX.Y.Z
 git push origin vX.Y.Z
 
@@ -233,6 +240,17 @@ gh run watch <run-id> --repo bmtai-projects/HiveMind
 Add only those two files in step 3. Using `git add -A` or `git commit -a`
 can sweep unrelated edits into a release commit, and that has broken a release
 before.
+
+### Why a PR for a two-file commit
+
+Before `main` was protected, a release commit went straight there with
+`git push origin main`. Skipping the PR step here would be genuinely fine on
+its own -- but a branch that lets a two-file version bump through direct-push
+also lets any other direct push through, from anyone with write access. The
+protection can't tell "trusted maintainer, boring commit" from anything else;
+it can only be on or off. This project chose on, for everyone, no exceptions
+-- confirmed by testing it against the repo owner's own push, which GitHub
+rejected with `GH006: Protected branch update failed`.
 
 ## Check that it worked
 
