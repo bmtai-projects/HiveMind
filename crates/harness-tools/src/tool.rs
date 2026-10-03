@@ -148,6 +148,9 @@ impl From<String> for ToolResult {
 }
 
 /// A single capability the model can invoke.
+// async_trait's expansion already returns a must_use boxed future; newer
+// clippy flags the macro's own must_use as redundant. Nothing here to fix.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait Tool: Send + Sync {
     fn name(&self) -> &str;

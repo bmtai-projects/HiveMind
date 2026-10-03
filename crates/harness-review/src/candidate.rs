@@ -148,6 +148,9 @@ pub enum ReviewEngineError {
 /// Provider-neutral model boundary. Provider JSON extraction, retries, and
 /// transport errors belong in the adapter; deterministic evidence checks,
 /// verdict application, ranking, and report construction stay here.
+// async_trait's expansion already returns a must_use boxed future; newer
+// clippy flags the macro's own must_use as redundant. Nothing here to fix.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait ReviewSampler: Send + Sync {
     async fn sample_candidates(
