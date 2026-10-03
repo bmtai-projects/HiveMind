@@ -28,6 +28,7 @@ const RAW: &[&str] = &[
     include_str!("../skills/code-review.md"),
     include_str!("../skills/test-writing.md"),
     include_str!("../skills/debugging-root-cause.md"),
+    include_str!("../skills/documentation.md"),
 ];
 
 static SKILLS: LazyLock<Vec<Skill>> = LazyLock::new(|| {
@@ -122,7 +123,7 @@ mod tests {
     }
 
     #[test]
-    fn the_expected_four_skills_ship() {
+    fn the_expected_five_skills_ship() {
         let ids: Vec<&str> = all().iter().map(|s| s.id.as_str()).collect();
         assert_eq!(
             ids,
@@ -130,7 +131,8 @@ mod tests {
                 "frontend-design",
                 "code-review",
                 "test-writing",
-                "debugging-root-cause"
+                "debugging-root-cause",
+                "documentation"
             ]
         );
     }
