@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use harness_config::{AgentPolicy, Backend, HookSpec, Resolved};
-use harness_provider::ChatClient;
+use harness_provider::{ChatClient, ProviderError};
 use harness_tools::{
     ArtifactStore, DEFAULT_ARTIFACT_THRESHOLD_BYTES, Registry, ToolResult, Workspace,
 };
@@ -925,6 +925,24 @@ impl Agent {
         checkpoint::undo(&mut self.checkpoints, &mut self.messages, n).await
     }
 
+    /// A transport-level failure (DNS, connection refused, timeout) against
+    /// the Hosted backend means hivemind-server itself is unreachable --
+    /// distinct from a 4xx/5xx it actually returned. Points at the BYOK and
+    /// local escape hatches, neither of which needs the server at all.
+    fn wrap_provider_error(&self, err: ProviderError) -> anyhow::Error {
+        if self.backend.is_hosted() && is_connectivity_failure(&err) {
+            anyhow::anyhow!(
+                "{err}\n\nhivemind-server appears to be unreachable. You can keep \
+                 working without it: your own provider key (--api-key, with \
+                 --base-url and --model), or a local model (--base-url \
+                 http://127.0.0.1:11434/v1 --model <name> for Ollama, or any \
+                 OpenAI-compatible server)."
+            )
+        } else {
+            err.into()
+        }
+    }
+
     async fn drain_stream(
         &self,
         rx: &mut harness_provider::EventStream,
@@ -940,7 +958,8 @@ impl Agent {
                 first_token_emitted = true;
                 t.emit("first_provider_token_received");
             }
-            match event? {
+            let event = event.map_err(|e| self.wrap_provider_error(e))?;
+            match event {
                 StreamEvent::TextDelta(t) => {
                     if let Some(t) = self.tracer.as_ref()
                         && !first_visible_emitted
@@ -1315,6 +1334,17 @@ fn is_web_tool(name: &str) -> bool {
     matches!(name, "web_search" | "web_fetch")
 }
 
+/// Transport-level, not a response the server actually sent -- an auth or
+/// rate-limit error means hivemind-server is up and answering, so it gets no
+/// "server unreachable" hint.
+fn is_connectivity_failure(err: &ProviderError) -> bool {
+    match err {
+        ProviderError::Request(_) | ProviderError::IncompleteStream => true,
+        ProviderError::RetriesExhausted(_, inner) => is_connectivity_failure(inner),
+        ProviderError::Http { .. } => false,
+    }
+}
+
 fn incomplete_tool_group_start(messages: &[Message]) -> Option<usize> {
     let idx = messages
         .iter()
@@ -1494,6 +1524,44 @@ mod tests {
             Message::assistant("hello"),
         ];
         assert_eq!(incomplete_tool_group_start(&msgs), None);
+    }
+
+    /// Transport failures (DNS, connection refused) are what "hivemind-server
+    /// is down" actually looks like -- an HTTP response, even a bad one,
+    /// means the server is up and answering.
+    #[test]
+    fn connectivity_failure_is_transport_level_not_a_server_response() {
+        assert!(is_connectivity_failure(&ProviderError::Request(
+            "connection refused".into()
+        )));
+        assert!(is_connectivity_failure(&ProviderError::IncompleteStream));
+        assert!(!is_connectivity_failure(&ProviderError::Http {
+            status: 401,
+            body: String::new(),
+            retry_after_secs: None,
+        }));
+    }
+
+    /// Exhausted retries must inherit the classification of what every
+    /// attempt actually failed with, not be treated as a third kind of
+    /// error.
+    #[test]
+    fn exhausted_retries_inherit_the_last_errors_classification() {
+        let transport = ProviderError::RetriesExhausted(
+            6,
+            Box::new(ProviderError::Request("dns error".into())),
+        );
+        assert!(is_connectivity_failure(&transport));
+
+        let server_side = ProviderError::RetriesExhausted(
+            6,
+            Box::new(ProviderError::Http {
+                status: 503,
+                body: String::new(),
+                retry_after_secs: None,
+            }),
+        );
+        assert!(!is_connectivity_failure(&server_side));
     }
 
     #[test]
