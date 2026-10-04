@@ -4,15 +4,41 @@
 use std::time::Duration;
 
 use harness_config::Backend;
+use harness_tools::{FileChange, ToolStatus};
 use harness_types::Usage;
 
+/// The authoritative end state of one specific tool call. Rich hosts use it
+/// to present concurrent calls correctly; older hosts continue through the
+/// text-only callback below.
+pub struct ToolEvent<'a> {
+    pub call_id: &'a str,
+    pub name: &'a str,
+    pub result: &'a str,
+    pub status: ToolStatus,
+    pub changed_files: &'a [FileChange],
+    pub cost_usd: f64,
+    pub session_cost_usd: f64,
+}
+
 pub trait Ui: Send + Sync {
+    /// Diagnostics outside the model conversation. A full-screen host can
+    /// route these into its own event stream instead of corrupting the
+    /// terminal.
+    fn diagnostic(&self, message: &str) {
+        eprintln!("{message}");
+    }
     fn turn_started(&self);
     fn assistant_delta(&self, text: &str);
     fn reasoning_delta(&self, text: &str);
     fn assistant_done(&self);
     fn tool_call_pending(&self, _name: &str) {}
     fn tool_start(&self, name: &str, args: &str);
+    /// Rich lifecycle notification for hosts that can tell concurrent calls
+    /// apart. `tool_start` remains the compatibility surface for hosts that
+    /// only render text.
+    fn tool_start_detailed(&self, _call_id: &str, name: &str, args: &str) {
+        self.tool_start(name, args);
+    }
     fn tool_end(
         &self,
         name: &str,
@@ -21,6 +47,17 @@ pub trait Ui: Send + Sync {
         cost_usd: f64,
         session_cost_usd: f64,
     );
+    /// Preserves a tool's real status and changed-file record for capable
+    /// hosts, without changing the model-facing transcript or JSON protocol.
+    fn tool_end_detailed(&self, event: ToolEvent<'_>) {
+        self.tool_end(
+            event.name,
+            event.result,
+            event.status.is_failure(),
+            event.cost_usd,
+            event.session_cost_usd,
+        );
+    }
     fn usage(&self, usage: &Usage, model_id: &str, backend: Backend, session_cost_usd: f64);
 
     /// Fired before each retry sleep (429/5xx/network hiccup).

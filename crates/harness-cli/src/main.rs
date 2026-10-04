@@ -23,6 +23,8 @@ mod json_ui;
 mod mentions;
 mod review;
 mod self_update;
+mod setup;
+mod tui;
 mod ui;
 mod update_check;
 
@@ -44,6 +46,7 @@ use harness_tools::{
 use input::HivePrompt;
 use json_ui::JsonUi;
 use review::ReviewArgs;
+use tui::{TuiBridge, TuiConfig};
 use ui::TermUi;
 
 /// The agent's own identity paragraph.
@@ -358,6 +361,16 @@ enum Protocol {
     Json,
 }
 
+/// Human-facing terminal interface. Ratatui is the default now that it's
+/// had a real session on it; the plain Reedline REPL stays available as
+/// `--ui plain` for terminals that don't get along with raw mode (some SSH
+/// setups, unusual multiplexers).
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum UiMode {
+    Plain,
+    Tui,
+}
+
 #[derive(Args)]
 struct ActivateArgs {
     /// Run one prompt headlessly (auto-approves shell), then exit.
@@ -369,6 +382,12 @@ struct ActivateArgs {
     /// `json_ui` for the wire format.
     #[arg(long, value_enum)]
     protocol: Option<Protocol>,
+
+    /// Interactive terminal interface. Defaults to `tui`; pass `plain` for
+    /// the old line-at-a-time Reedline REPL. Ignored (never an error) under
+    /// `--prompt`/`--protocol`, which have no interactive terminal to own.
+    #[arg(long, value_enum, conflicts_with = "protocol")]
+    ui: Option<UiMode>,
 
     /// Workspace root the agent operates in.
     #[arg(long, default_value = ".")]
@@ -391,6 +410,13 @@ struct ActivateArgs {
     /// Override the model API base URL (e.g. to point at a proxy or mock).
     #[arg(long)]
     base_url: Option<String>,
+
+    /// Wire dialect for a BYOK key: "anthropic"/"claude" for Anthropic's
+    /// own Messages API, anything else (the default) for the OpenAI Chat
+    /// Completions dialect every other provider here speaks. Has no effect
+    /// on Hosted or Local, which are always OpenAI-compatible.
+    #[arg(long)]
+    dialect: Option<String>,
 
     /// Auto-approve all shell commands. Dangerous; off by default.
     #[arg(long)]
@@ -726,12 +752,42 @@ async fn run(args: ActivateArgs) -> anyhow::Result<()> {
         reasoning_effort: args.reasoning_effort.clone(),
         budget_usd: args.budget,
         mode: args.mode.as_deref().and_then(harness_config::Mode::parse),
+        dialect: args
+            .dialect
+            .as_deref()
+            .and_then(harness_config::Dialect::parse),
     };
-    let resolved = harness_config::resolve(
-        &config_path,
-        &harness_config::default_credentials_path(),
-        overrides,
-    )?;
+    let headless = args.prompt.is_some();
+    let protocol_json = matches!(args.protocol, Some(Protocol::Json));
+    // `tui` is the default for an interactive session; headless/json modes
+    // own no terminal to put it on, so the default silently steps aside
+    // there -- only an *explicit* `--ui tui` alongside them is an error,
+    // since that's a real contradiction worth surfacing rather than
+    // quietly ignoring what was asked for.
+    let tui_enabled = match args.ui {
+        Some(UiMode::Tui) => {
+            if headless || protocol_json {
+                anyhow::bail!(
+                    "--ui tui is interactive; remove --prompt/--protocol to use the terminal interface"
+                );
+            }
+            true
+        }
+        Some(UiMode::Plain) => false,
+        None => !headless && !protocol_json,
+    };
+    let credentials_path = harness_config::default_credentials_path();
+    let resolved = match harness_config::resolve(&config_path, &credentials_path, overrides.clone())
+    {
+        // Nothing configured yet, and there's a human here to ask -- never
+        // under `--prompt`/`--protocol json`, which a host drives
+        // programmatically and can't answer an interactive prompt.
+        Err(harness_config::ConfigError::MissingKey) if !headless && !protocol_json => {
+            setup::run(&config_path).await?;
+            harness_config::resolve(&config_path, &credentials_path, overrides)?
+        }
+        other => other?,
+    };
     if args.web && !resolved.backend.is_hosted() {
         anyhow::bail!("--web requires HiveMind hosted sign-in; run `hivemind auth login`");
     }
@@ -740,8 +796,6 @@ async fn run(args: ActivateArgs) -> anyhow::Result<()> {
         .workdir
         .canonicalize()
         .map_err(|e| anyhow::anyhow!("workdir {:?}: {e}", args.workdir))?;
-    let headless = args.prompt.is_some();
-    let protocol_json = matches!(args.protocol, Some(Protocol::Json));
 
     // Constructed up front, before any tool is registered, so a tool that
     // needs to report progress (below) can route through whichever Ui this
@@ -750,8 +804,9 @@ async fn run(args: ActivateArgs) -> anyhow::Result<()> {
     // via --protocol json) is meant to go through. Exactly one of these is
     // ever `Some`; `TermUi::new`'s inputs are both already available here.
     let json_ui: Option<Arc<JsonUi>> = protocol_json.then(|| Arc::new(JsonUi::new()));
-    let term_ui: Option<Arc<TermUi>> =
-        (!protocol_json).then(|| Arc::new(TermUi::new(args.show_reasoning, resolved.budget_usd)));
+    let term_ui: Option<Arc<TermUi>> = (!protocol_json && !tui_enabled)
+        .then(|| Arc::new(TermUi::new(args.show_reasoning, resolved.budget_usd)));
+    let tui_bridge: Option<Arc<TuiBridge>> = tui_enabled.then(|| Arc::new(TuiBridge::new()));
 
     // Latency tracer -- created once, shared across whatever Agent instances
     // this session constructs. Built *before* the context load below so that
@@ -814,10 +869,13 @@ async fn run(args: ActivateArgs) -> anyhow::Result<()> {
     let progress_ui: harness_tools::ProgressSink = {
         let json_ui = json_ui.clone();
         let term_ui = term_ui.clone();
+        let tui_bridge = tui_bridge.clone();
         Arc::new(move |msg: &str| {
             if let Some(j) = &json_ui {
                 j.tool_progress("semantic_search", msg);
             } else if let Some(t) = &term_ui {
+                t.tool_progress("semantic_search", msg);
+            } else if let Some(t) = &tui_bridge {
                 t.tool_progress("semantic_search", msg);
             }
         })
@@ -862,6 +920,13 @@ async fn run(args: ActivateArgs) -> anyhow::Result<()> {
             let json_ui = json_ui.clone();
             bash = bash.with_approval(Arc::new(move |cmd: &str| {
                 json_ui.request_shell_approval(cmd)
+            }));
+        }
+    } else if let Some(tui_bridge) = &tui_bridge {
+        if !args.yolo {
+            let tui_bridge = tui_bridge.clone();
+            bash = bash.with_approval(Arc::new(move |cmd: &str| {
+                tui_bridge.request_shell_approval(cmd)
             }));
         }
     } else if !args.yolo && !headless {
@@ -915,6 +980,54 @@ async fn run(args: ActivateArgs) -> anyhow::Result<()> {
             agent.set_skill(Some(skill)).map_err(anyhow::Error::msg)?;
         }
         return run_json_protocol(&mut agent, ws, json_ui).await;
+    }
+
+    if let Some(tui_bridge) = tui_bridge {
+        let mut agent = Agent::new(
+            resolved.clone(),
+            registry,
+            ws.clone(),
+            tui_bridge.clone(),
+            system_prompt(project_conventions.as_deref(), read_program_available),
+        );
+        agent.warm_connection();
+        if let Some(tracer) = latency_tracer.clone() {
+            agent.enable_tracing(tracer);
+        }
+        if resolved.policy.artifact_threshold_bytes > 0 {
+            agent.enable_artifacts(
+                (*artifact_store).clone(),
+                resolved.policy.artifact_threshold_bytes,
+            );
+        }
+        // No banner announcement, same reasoning as the json branch above:
+        // the TUI owns the alternate screen, so a plain println! here would
+        // corrupt it before the event loop even starts.
+        attach_or_restore_session(
+            &mut agent,
+            &args,
+            store,
+            workspace.clone(),
+            false,
+            project_conventions.as_deref(),
+            read_program_available,
+        )?;
+        if args.web {
+            agent.set_web_enabled(true).map_err(anyhow::Error::msg)?;
+        }
+        if let Some(skill) = &args.skill {
+            agent.set_skill(Some(skill)).map_err(anyhow::Error::msg)?;
+        }
+        return tui::run(
+            agent,
+            ws,
+            tui_bridge,
+            TuiConfig {
+                workdir,
+                workspace_label: workspace,
+            },
+        )
+        .await;
     }
 
     let ui = term_ui.expect("interactive mode always constructs a TermUi above");

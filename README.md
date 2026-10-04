@@ -115,6 +115,7 @@ Things to know:
 hivemind activate                                            # interactive session
 hivemind activate -p "summarize what this project does"      # one question, then exit
 hivemind activate --continue                                 # pick up your last session here
+hivemind activate --ui plain                                 # the old line-at-a-time REPL instead
 ```
 
 Inside a session, type `/help` to see every command, and `@path/to/file` to
@@ -165,6 +166,24 @@ hand a file to the model directly.
 - A spending cap: `--budget 0.50`, or `/budget` inside a session. It stops at
   the end of a turn, never in the middle of an edit.
 - Four built-in skills that tune the agent for one kind of job: `hivemind skills`.
+
+**A full-screen terminal interface**
+
+`hivemind activate` opens a Ratatui-based full-screen interface by default.
+`--ui plain` switches back to the plain line-at-a-time REPL, for terminals
+that don't get along with raw mode (some SSH setups, unusual multiplexers).
+Neither can be combined with `--protocol json` or headless `--prompt`.
+
+The screen shows the live conversation, the model's `todo_write` checklist,
+individual tool calls, changed files, real usage, and saved sessions and
+reviews. Shell commands use the same approval policy as the plain REPL: a
+panel shows the exact command, and `[Y]`/`[N]` approves or denies it.
+
+Useful keys: `Enter` sends, `Shift+Enter` adds a line, `Ctrl+C` interrupts,
+`Ctrl+L` clears the local display, `Ctrl+S` toggles the side panel, `Tab`
+opens a tool's details, `F1`/`F2`/`F3` switch Work/Sessions/Reviews, and
+`Ctrl+P` opens the command palette. The same slash commands as the plain
+REPL work here too.
 
 **For editors and other tools**
 
@@ -271,6 +290,7 @@ and explained in comments.
 | `--continue` / `--resume <id>` | Return to a saved session |
 | `--skill` | Start with a skill selected |
 | `--yolo` | Do not ask before running shell commands |
+| `--ui plain` | Use the old line-at-a-time REPL instead of the full-screen interface |
 
 ## Contributing
 
