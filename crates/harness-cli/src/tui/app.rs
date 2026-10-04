@@ -9,6 +9,37 @@ use super::events::UiEvent;
 const MAX_CONVERSATION_LINES: usize = 4_000;
 const MAX_TOOL_CARDS: usize = 200;
 
+/// Listed as you type `/` -- VS Code's terminal swallows Ctrl+P and F1.
+pub(crate) const SLASH_COMMANDS: &[(&str, &str)] = &[
+    ("/help", "list commands"),
+    ("/model", "<id>  switch model"),
+    ("/reasoning", "<level|off>"),
+    ("/budget", "<amount|off>"),
+    ("/web", "<on|off>"),
+    ("/skill", "off  clear the active skill"),
+    ("/compact", "summarize older context"),
+    ("/undo", "[n]  undo recent turns"),
+    ("/cost", "spend so far"),
+    ("/status", "session status"),
+    ("/work", "conversation view"),
+    ("/sessions", "saved sessions"),
+    ("/reviews", "saved reviews"),
+    ("/clear", "clear this screen"),
+    ("/exit", "quit"),
+];
+
+/// Commands matching what's typed so far, while still typing the name.
+pub(crate) fn slash_matches(composer: &str) -> Vec<(&'static str, &'static str)> {
+    if !composer.starts_with('/') || composer.contains(char::is_whitespace) {
+        return Vec::new();
+    }
+    SLASH_COMMANDS
+        .iter()
+        .copied()
+        .filter(|(name, _)| name.starts_with(composer))
+        .collect()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum View {
     Work,
@@ -196,12 +227,13 @@ impl App {
             UiEvent::TurnStarted => self.run_state = RunState::Working,
             UiEvent::AssistantDelta(text) => self.append_assistant_delta(&text),
             UiEvent::AssistantDone => self.assistant_stream_open = false,
-            UiEvent::ToolPending { name } => self.push_notice(format!("Preparing {name}")),
             UiEvent::ToolStarted {
                 call_id,
                 name,
                 args,
             } => {
+                // Auto-follow only if the newest call was selected, so browsing isn't interrupted.
+                let following = self.selected_tool + 1 >= self.tools.len();
                 self.tools.push_back(ToolCard {
                     call_id,
                     name,
@@ -210,7 +242,9 @@ impl App {
                     state: ToolState::Running,
                 });
                 self.trim_tools();
-                self.selected_tool = self.tools.len().saturating_sub(1);
+                if following {
+                    self.selected_tool = self.tools.len().saturating_sub(1);
+                }
             }
             UiEvent::ToolFinished {
                 call_id,
@@ -389,12 +423,20 @@ impl App {
         self.trim_conversation();
     }
 
+    /// One dim line per notice, so status chatter doesn't crowd out replies.
     fn push_notice(&mut self, message: String) {
         self.notices.push_back(message.clone());
         while self.notices.len() > 8 {
             self.notices.pop_front();
         }
-        self.push_message(ConversationKind::Notice, &message);
+        self.assistant_stream_open = false;
+        for line in message.lines() {
+            self.conversation.push_back(ConversationLine {
+                text: format!("· {line}"),
+                kind: ConversationKind::Notice,
+            });
+        }
+        self.trim_conversation();
     }
 
     fn record_changes(&mut self, changes: Vec<FileChange>) {
@@ -429,6 +471,8 @@ impl App {
     fn trim_tools(&mut self) {
         while self.tools.len() > MAX_TOOL_CARDS {
             self.tools.pop_front();
+            // Keep pointing at the same card after the front shifts away.
+            self.selected_tool = self.selected_tool.saturating_sub(1);
         }
     }
 }

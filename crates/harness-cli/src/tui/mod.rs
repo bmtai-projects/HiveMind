@@ -184,9 +184,8 @@ async fn handle_input(
 
             if app.palette_visible {
                 match key.code {
-                    KeyCode::Esc | KeyCode::Char('p')
-                        if key.modifiers.contains(KeyModifiers::CONTROL) =>
-                    {
+                    KeyCode::Esc => app.palette_visible = false,
+                    KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         app.palette_visible = false;
                     }
                     KeyCode::F(1) => {
@@ -228,10 +227,22 @@ async fn handle_input(
                 KeyCode::F(1) => app.view = View::Work,
                 KeyCode::F(2) => app.view = View::Sessions,
                 KeyCode::F(3) => app.view = View::Reviews,
-                KeyCode::Tab => {
-                    app.details_visible = !app.details_visible;
-                    app.select_next_tool(key.modifiers.contains(KeyModifiers::SHIFT));
+                KeyCode::Tab | KeyCode::BackTab => {
+                    // While typing a command name, Tab completes it.
+                    if let Some((name, _)) = app::slash_matches(&app.composer).first() {
+                        app.composer = format!("{name} ");
+                    } else if !app.tools.is_empty() {
+                        // Opening details shows the current call first;
+                        // further presses browse, and the list scrolls along.
+                        if app.details_visible {
+                            let backwards = key.code == KeyCode::BackTab
+                                || key.modifiers.contains(KeyModifiers::SHIFT);
+                            app.select_next_tool(backwards);
+                        }
+                        app.details_visible = true;
+                    }
                 }
+                KeyCode::Esc => app.details_visible = false,
                 KeyCode::Up | KeyCode::PageUp => {
                     app.conversation_scroll = app.conversation_scroll.saturating_add(5)
                 }
@@ -282,15 +293,27 @@ async fn handle_command(
     let command = parts.next().unwrap_or_default();
     let argument = parts.next();
     match command {
-        "/help" => app.apply(events::UiEvent::Notice(
-            "TUI commands: /model <id>, /reasoning <level|off>, /budget <amount|off>, /web <on|off>, /skill off, /cost, /status, /clear, /exit".into(),
-        )),
+        "/help" => {
+            let list: Vec<String> = app::SLASH_COMMANDS
+                .iter()
+                .map(|(name, what)| format!("{name}  {what}"))
+                .collect();
+            app.apply(events::UiEvent::Notice(list.join("\n")));
+        }
+        "/work" => app.view = View::Work,
+        "/sessions" => app.view = View::Sessions,
+        "/reviews" => app.view = View::Reviews,
         "/model" => match argument {
             Some(model) => {
                 app.model = model.to_string();
-                let _ = controller.send(ControllerCommand::SetModel(model.to_string())).await;
+                let _ = controller
+                    .send(ControllerCommand::SetModel(model.to_string()))
+                    .await;
             }
-            None => app.apply(events::UiEvent::Notice(format!("Active model: {}", app.model))),
+            None => app.apply(events::UiEvent::Notice(format!(
+                "Active model: {}",
+                app.model
+            ))),
         },
         "/reasoning" => match argument {
             Some("off") => {
@@ -309,31 +332,43 @@ async fn handle_command(
             }
             Some(value) => match value.parse::<f64>() {
                 Ok(value) if value > 0.0 => {
-                    let _ = controller.send(ControllerCommand::SetBudget(Some(value))).await;
+                    let _ = controller
+                        .send(ControllerCommand::SetBudget(Some(value)))
+                        .await;
                 }
-                _ => app.apply(events::UiEvent::Notice("Budget must be a positive number".into())),
+                _ => app.apply(events::UiEvent::Notice(
+                    "Budget must be a positive number".into(),
+                )),
             },
             None => app.apply(events::UiEvent::Notice("Set an amount or use off".into())),
         },
         "/web" => match argument {
-            Some("on") => { let _ = controller.send(ControllerCommand::SetWeb(true)).await; }
+            Some("on") => {
+                let _ = controller.send(ControllerCommand::SetWeb(true)).await;
+            }
             Some("off") => {
                 let _ = controller.send(ControllerCommand::SetWeb(false)).await;
             }
             _ => app.apply(events::UiEvent::Notice("Use /web on or /web off".into())),
         },
-        "/skill" if argument == Some("off") => { let _ = controller.send(ControllerCommand::ClearSkill).await; }
-        "/compact" => { let _ = controller.send(ControllerCommand::Compact).await; }
+        "/skill" if argument == Some("off") => {
+            let _ = controller.send(ControllerCommand::ClearSkill).await;
+        }
+        "/compact" => {
+            let _ = controller.send(ControllerCommand::Compact).await;
+        }
         "/undo" => {
             let count = argument.and_then(|value| value.parse().ok()).unwrap_or(1);
             let _ = controller.send(ControllerCommand::Undo(count)).await;
         }
-        "/cost" | "/status" => { let _ = controller.send(ControllerCommand::Status).await; }
+        "/cost" | "/status" => {
+            let _ = controller.send(ControllerCommand::Status).await;
+        }
         "/clear" => app.clear_local_conversation(),
         "/exit" => return InputOutcome::Quit,
-        _ => app.apply(events::UiEvent::Notice(
-            "This TUI supports /help for its available command set.".into(),
-        )),
+        _ => app.apply(events::UiEvent::Notice(format!(
+            "Unknown command {command} -- type / to see the list"
+        ))),
     }
     app.composer.clear();
     InputOutcome::Continue

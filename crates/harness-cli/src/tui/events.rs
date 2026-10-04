@@ -18,9 +18,6 @@ pub(crate) enum UiEvent {
     TurnStarted,
     AssistantDelta(String),
     AssistantDone,
-    ToolPending {
-        name: String,
-    },
     ToolStarted {
         call_id: String,
         name: String,
@@ -55,10 +52,7 @@ pub(crate) enum UiEvent {
 
 impl UiEvent {
     fn is_droppable(&self) -> bool {
-        matches!(
-            self,
-            Self::AssistantDelta(_) | Self::ToolPending { .. } | Self::Notice(_)
-        )
+        matches!(self, Self::AssistantDelta(_) | Self::Notice(_))
     }
 
     fn is_stream_delta(&self) -> bool {
@@ -205,17 +199,8 @@ impl Ui for TuiBridge {
         self.queue.push(UiEvent::AssistantDone);
     }
 
-    fn tool_call_pending(&self, name: &str) {
-        self.queue.push(UiEvent::ToolPending {
-            name: name.to_string(),
-        });
-    }
-
-    fn tool_start(&self, name: &str, args: &str) {
-        self.queue.push(UiEvent::ToolPending {
-            name: format!("{name} {args}"),
-        });
-    }
+    // Unused: `tool_start_detailed` below adds the tool card instead.
+    fn tool_start(&self, _name: &str, _args: &str) {}
 
     fn tool_start_detailed(&self, call_id: &str, name: &str, args: &str) {
         self.queue.push(UiEvent::ToolStarted {

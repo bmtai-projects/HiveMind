@@ -2,9 +2,9 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 
-use super::app::{App, ConversationKind, RunState, TodoState, ToolState, View};
+use super::app::{App, ConversationKind, RunState, TodoState, ToolState, View, slash_matches};
 
 const BORDER: Color = Color::Rgb(83, 101, 119);
 const MUTED: Color = Color::Rgb(159, 173, 189);
@@ -16,16 +16,15 @@ const RED: Color = Color::Rgb(246, 120, 111);
 pub(crate) fn draw(frame: &mut Frame, app: &App) {
     let area = frame.area();
     let compact = area.width < 108 || area.height < 28;
+    let composer_rows = wrap_rows(&app.composer, area.width.saturating_sub(2) as usize)
+        .len()
+        .clamp(3, 6) as u16;
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
             Constraint::Min(8),
-            Constraint::Length(if app.composer.lines().count() > 2 {
-                7
-            } else {
-                5
-            }),
+            Constraint::Length(composer_rows + 2),
             Constraint::Length(1),
         ])
         .split(area);
@@ -44,6 +43,9 @@ pub(crate) fn draw(frame: &mut Frame, app: &App) {
     render_composer(frame, app, chunks[2]);
     render_footer(frame, app, chunks[3], compact);
 
+    if app.approval.is_none() && !app.palette_visible {
+        render_slash_hints(frame, app, chunks[2]);
+    }
     if let Some(approval) = &app.approval {
         render_approval(frame, approval.command.as_str());
     } else if app.palette_visible {
@@ -168,36 +170,61 @@ fn render_tasks(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_tools(frame: &mut Frame, app: &App, area: Rect) {
-    let mut items = Vec::new();
-    for (index, tool) in app.tools.iter().enumerate().rev().take(8) {
-        let style = tool_style(tool.state);
-        let marker = if index == app.selected_tool && app.details_visible {
-            "›"
-        } else {
-            " "
-        };
-        items.push(ListItem::new(vec![
-            Line::from(vec![
-                Span::styled(format!("{marker} {} ", tool.state.symbol()), style),
-                Span::styled(
-                    tool.name.clone(),
-                    Style::default().add_modifier(Modifier::BOLD),
+    let block = boxed(format!(" Tools ({})  Tab browse ", app.tools.len()));
+    if app.tools.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                "No tools have run",
+                Style::default().fg(MUTED),
+            ))
+            .block(block),
+            area,
+        );
+        return;
+    }
+    let detail_width = (area.width as usize).saturating_sub(7);
+    let items: Vec<ListItem<'static>> = app
+        .tools
+        .iter()
+        .map(|tool| {
+            let style = tool_style(tool.state);
+            ListItem::new(vec![
+                Line::from(vec![
+                    Span::styled(format!("{} ", tool.state.symbol()), style),
+                    Span::styled(
+                        tool.name.clone(),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(format!("  {}", tool.state.label()), style),
+                ]),
+                Line::styled(
+                    format!("  {}", shorten(&tool_summary(&tool.args), detail_width)),
+                    Style::default().fg(MUTED),
                 ),
-                Span::styled(format!("  {}", tool.state.label()), style),
-            ]),
-            Line::styled(shorten(&tool.call_id, 42), Style::default().fg(MUTED)),
-        ]));
+            ])
+        })
+        .collect();
+    // Stateful so ratatui keeps the selected call scrolled into view.
+    let mut state = ListState::default().with_selected(Some(
+        app.selected_tool.min(app.tools.len().saturating_sub(1)),
+    ));
+    let list = List::new(items)
+        .block(block)
+        .highlight_style(Style::default().bg(Color::Rgb(38, 50, 62)))
+        .highlight_symbol("›");
+    frame.render_stateful_widget(list, area, &mut state);
+}
+
+/// The argument that identifies a call: its command, path, or query.
+fn tool_summary(args: &str) -> String {
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(args) {
+        for key in ["command", "path", "pattern", "query", "url"] {
+            if let Some(text) = value.get(key).and_then(|v| v.as_str()) {
+                return text.lines().next().unwrap_or_default().to_string();
+            }
+        }
     }
-    if items.is_empty() {
-        items.push(ListItem::new(Line::styled(
-            "No tools have run",
-            Style::default().fg(MUTED),
-        )));
-    }
-    frame.render_widget(
-        List::new(items).block(boxed(" Tools  [Tab] details ")),
-        area,
-    );
+    args.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn render_changes(frame: &mut Frame, app: &App, area: Rect) {
@@ -301,33 +328,120 @@ fn render_reviews(frame: &mut Frame, app: &App, area: Rect) {
 fn render_composer(frame: &mut Frame, app: &App, area: Rect) {
     let title = match app.view {
         View::Work => " Message HiveMind ",
-        View::Sessions => " Message HiveMind (F1 for work) ",
-        View::Reviews => " Message HiveMind (F1 for work) ",
+        View::Sessions | View::Reviews => " Message HiveMind  (/work to go back) ",
     };
-    let content = if app.composer.is_empty() {
-        "Ask HiveMind to work on your code…".to_string()
-    } else {
-        app.composer.clone()
-    };
-    let style = if app.composer.is_empty() {
-        Style::default().fg(MUTED)
-    } else {
-        Style::default().fg(Color::White)
-    };
+    let block = boxed(title).border_style(Style::default().fg(ACCENT));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    // Approval and the palette take the keyboard, so no cursor there.
+    let wants_cursor = app.approval.is_none() && !app.palette_visible;
+
+    if app.composer.is_empty() {
+        frame.render_widget(
+            Paragraph::new("Ask HiveMind to work on your code…   type / for commands")
+                .style(Style::default().fg(MUTED)),
+            inner,
+        );
+        if wants_cursor {
+            frame.set_cursor_position((inner.x, inner.y));
+        }
+        return;
+    }
+
+    // Hard-wrapped and bottom-scrolled so the cursor lands where the next character appears.
+    let rows = wrap_rows(&app.composer, inner.width as usize);
+    let start = rows.len().saturating_sub(inner.height as usize);
+    let visible: Vec<Line<'static>> = rows[start..].iter().map(|r| Line::raw(r.clone())).collect();
     frame.render_widget(
-        Paragraph::new(content)
-            .style(style)
-            .block(boxed(title).border_style(Style::default().fg(ACCENT)))
-            .wrap(Wrap { trim: false }),
+        Paragraph::new(Text::from(visible)).style(Style::default().fg(Color::White)),
+        inner,
+    );
+    if wants_cursor && let Some(last) = rows.last() {
+        let col = display_width(last) as u16;
+        let row = (rows.len() - start - 1) as u16;
+        frame.set_cursor_position((
+            inner.x + col.min(inner.width.saturating_sub(1)),
+            inner.y + row,
+        ));
+    }
+}
+
+/// Live list of matching commands while a `/` name is being typed.
+fn render_slash_hints(frame: &mut Frame, app: &App, composer: Rect) {
+    let matches = slash_matches(&app.composer);
+    if matches.is_empty() {
+        return;
+    }
+    let shown = matches.len().min(8);
+    let height = shown as u16 + 2;
+    if composer.y < height {
+        return;
+    }
+    let area = Rect::new(
+        composer.x + 1,
+        composer.y - height,
+        composer.width.saturating_sub(2).min(54),
+        height,
+    );
+    let items: Vec<ListItem<'static>> = matches
+        .iter()
+        .take(shown)
+        .map(|(name, what)| {
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    format!("{name:<12}"),
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(*what, Style::default().fg(MUTED)),
+            ]))
+        })
+        .collect();
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        List::new(items)
+            .block(boxed(" Commands  Tab completes ").border_style(Style::default().fg(ACCENT))),
         area,
     );
 }
 
+fn char_width(ch: char) -> usize {
+    let mut buf = [0u8; 4];
+    Span::raw(&*ch.encode_utf8(&mut buf)).width()
+}
+
+fn display_width(text: &str) -> usize {
+    Span::raw(text).width()
+}
+
+/// Hard-wraps at `width` columns; a full last row gets an empty one for the cursor.
+fn wrap_rows(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut rows = Vec::new();
+    for line in text.split('\n') {
+        let mut row = String::new();
+        let mut used = 0;
+        for ch in line.chars() {
+            let w = char_width(ch);
+            if used + w > width && !row.is_empty() {
+                rows.push(std::mem::take(&mut row));
+                used = 0;
+            }
+            row.push(ch);
+            used += w;
+        }
+        rows.push(row);
+    }
+    if rows.last().is_some_and(|r| display_width(r) >= width) {
+        rows.push(String::new());
+    }
+    rows
+}
+
 fn render_footer(frame: &mut Frame, app: &App, area: Rect, compact: bool) {
     let text = if compact {
-        "Enter send  Shift+Enter line  Ctrl+C interrupt  Ctrl+P commands"
+        "Enter send  / commands  Tab tools  Ctrl+C stop"
     } else {
-        "Enter send  Shift+Enter line  Ctrl+C interrupt  Ctrl+L clear  Ctrl+S panel  Tab details  F1 work  F2 sessions  F3 reviews  Ctrl+P commands"
+        "Enter send  / commands  Tab tools  Esc close  Up/Down scroll  Ctrl+C stop  Ctrl+S panel  Ctrl+L clear"
     };
     let usage = if app.prompt_tokens + app.completion_tokens > 0 {
         format!(
@@ -379,13 +493,12 @@ fn render_palette(frame: &mut Frame) {
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         ),
         Line::raw(""),
-        Line::raw("F1  Work view"),
-        Line::raw("F2  Saved sessions"),
-        Line::raw("F3  Saved reviews"),
+        Line::raw("F1 / /work      Work view"),
+        Line::raw("F2 / /sessions  Saved sessions"),
+        Line::raw("F3 / /reviews   Saved reviews"),
         Line::raw("Ctrl+L  Clear this screen"),
         Line::raw("Ctrl+S  Toggle side panel"),
-        Line::raw("/model <id>  Change model"),
-        Line::raw("/reasoning <level|off>, /budget <amount|off>, /web <on|off>"),
+        Line::raw("Type / in the message box for every command"),
         Line::styled("Esc closes this panel", Style::default().fg(MUTED)),
     ]);
     frame.render_widget(
@@ -424,7 +537,7 @@ fn render_tool_details(frame: &mut Frame, app: &App) {
         Line::raw(output),
         Line::raw(""),
         Line::styled(
-            "Tab closes details; Up/Down scroll the conversation.",
+            "Tab next · Shift+Tab previous · Esc close",
             Style::default().fg(MUTED),
         ),
     ]);
@@ -501,6 +614,77 @@ mod tests {
         let backend = TestBackend::new(60, 20);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| draw(frame, &app)).unwrap();
+    }
+
+    fn screen(terminal: &Terminal<TestBackend>) -> String {
+        let buffer = terminal.backend().buffer();
+        let mut out = String::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                out.push_str(buffer[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    #[test]
+    fn the_cursor_sits_right_after_the_typed_text() {
+        let mut app = App::new("work".into(), "model".into(), &[], Vec::new(), Vec::new());
+        app.composer = "hello".into();
+        let mut terminal = Terminal::new(TestBackend::new(140, 42)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let cursor = terminal.get_cursor_position().unwrap();
+        // Composer box starts at column 0, so text begins at 1; "hello" is 5 wide.
+        assert_eq!(cursor.x, 6);
+    }
+
+    #[test]
+    fn a_full_row_moves_the_cursor_to_the_next_one() {
+        assert_eq!(
+            wrap_rows("abcd", 4),
+            vec!["abcd".to_string(), String::new()]
+        );
+        assert_eq!(
+            wrap_rows("abcdef", 4),
+            vec!["abcd".to_string(), "ef".to_string()]
+        );
+        assert_eq!(wrap_rows("ab\ncd", 10).len(), 2);
+    }
+
+    #[test]
+    fn the_tools_list_scrolls_to_an_old_selected_call() {
+        let mut app = App::new("work".into(), "model".into(), &[], Vec::new(), Vec::new());
+        for i in 0..30 {
+            app.apply(super::super::events::UiEvent::ToolStarted {
+                call_id: format!("c{i}"),
+                name: "read_file".into(),
+                args: format!(r#"{{"path":"file_{i:02}.rs"}}"#),
+            });
+        }
+        app.selected_tool = 2;
+        let mut terminal = Terminal::new(TestBackend::new(140, 42)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let text = screen(&terminal);
+        assert!(
+            text.contains("file_02.rs"),
+            "selected call must be scrolled into view"
+        );
+        assert!(
+            !text.contains("call_"),
+            "opaque call ids should not be shown"
+        );
+    }
+
+    #[test]
+    fn typing_a_slash_lists_matching_commands() {
+        let mut app = App::new("work".into(), "model".into(), &[], Vec::new(), Vec::new());
+        app.composer = "/se".into();
+        let mut terminal = Terminal::new(TestBackend::new(140, 42)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let text = screen(&terminal);
+        assert!(text.contains("/sessions"));
+        assert!(!text.contains("/model"), "only matches are listed");
     }
 
     #[test]
