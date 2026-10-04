@@ -222,6 +222,7 @@ async fn run_inner(
                 reasoning_effort: args.reasoning_effort.clone(),
                 budget_usd: args.budget,
                 mode: None,
+                dialect: None,
             },
         )?;
         let sampler = AgentReviewSampler::new(resolved, workdir.clone())

@@ -33,7 +33,7 @@
 //! produce. The model is asked only for the things that genuinely require
 //! reading the conversation: intent, constraints, decisions, dead ends.
 
-use harness_provider::{ChatClient, ProviderError};
+use harness_provider::{Provider, ProviderError};
 use harness_types::{ChatRequest, Message, Role, StreamEvent, Usage};
 use serde::Deserialize;
 
@@ -75,7 +75,7 @@ pub async fn maybe_compact(
     total_tokens: u64,
     context_window: u64,
     policy: &CompactionPolicy,
-    summarizer: &ChatClient,
+    summarizer: &dyn Provider,
     summarizer_model: &str,
 ) -> Option<CompactionReport> {
     if context_window == 0 || total_tokens == 0 {
@@ -275,7 +275,7 @@ Be brief inside each section. Do not add sections, preamble, or closing \
 remarks. Do not list edited files -- that is recorded separately.";
 
 async fn summarize(
-    client: &ChatClient,
+    client: &dyn Provider,
     model: &str,
     transcript: &str,
 ) -> Result<(String, Usage), ProviderError> {

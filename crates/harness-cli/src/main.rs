@@ -23,6 +23,7 @@ mod json_ui;
 mod mentions;
 mod review;
 mod self_update;
+mod setup;
 mod ui;
 mod update_check;
 
@@ -392,6 +393,13 @@ struct ActivateArgs {
     #[arg(long)]
     base_url: Option<String>,
 
+    /// Wire dialect for a BYOK key: "anthropic"/"claude" for Anthropic's
+    /// own Messages API, anything else (the default) for the OpenAI Chat
+    /// Completions dialect every other provider here speaks. Has no effect
+    /// on Hosted or Local, which are always OpenAI-compatible.
+    #[arg(long)]
+    dialect: Option<String>,
+
     /// Auto-approve all shell commands. Dangerous; off by default.
     #[arg(long)]
     yolo: bool,
@@ -726,12 +734,25 @@ async fn run(args: ActivateArgs) -> anyhow::Result<()> {
         reasoning_effort: args.reasoning_effort.clone(),
         budget_usd: args.budget,
         mode: args.mode.as_deref().and_then(harness_config::Mode::parse),
+        dialect: args
+            .dialect
+            .as_deref()
+            .and_then(harness_config::Dialect::parse),
     };
-    let resolved = harness_config::resolve(
-        &config_path,
-        &harness_config::default_credentials_path(),
-        overrides,
-    )?;
+    let headless = args.prompt.is_some();
+    let protocol_json = matches!(args.protocol, Some(Protocol::Json));
+    let credentials_path = harness_config::default_credentials_path();
+    let resolved = match harness_config::resolve(&config_path, &credentials_path, overrides.clone())
+    {
+        // Nothing configured yet, and there's a human here to ask -- never
+        // under `--prompt`/`--protocol json`, which a host drives
+        // programmatically and can't answer an interactive prompt.
+        Err(harness_config::ConfigError::MissingKey) if !headless && !protocol_json => {
+            setup::run(&config_path).await?;
+            harness_config::resolve(&config_path, &credentials_path, overrides)?
+        }
+        other => other?,
+    };
     if args.web && !resolved.backend.is_hosted() {
         anyhow::bail!("--web requires HiveMind hosted sign-in; run `hivemind auth login`");
     }
@@ -740,8 +761,6 @@ async fn run(args: ActivateArgs) -> anyhow::Result<()> {
         .workdir
         .canonicalize()
         .map_err(|e| anyhow::anyhow!("workdir {:?}: {e}", args.workdir))?;
-    let headless = args.prompt.is_some();
-    let protocol_json = matches!(args.protocol, Some(Protocol::Json));
 
     // Constructed up front, before any tool is registered, so a tool that
     // needs to report progress (below) can route through whichever Ui this
