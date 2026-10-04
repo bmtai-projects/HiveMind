@@ -206,6 +206,8 @@ whole conversation** on every turn. A few things fix most of that:
 
 ## How it is built
 
+Follow one request from Enter to the answer in [How a turn works](docs/how-a-turn-works.md).
+
 HiveMind is a Rust workspace of seven small crates:
 
 ```text
