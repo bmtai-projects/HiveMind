@@ -466,7 +466,8 @@ impl Agent {
             title: derive_title(&self.messages),
         };
         if let Err(e) = p.store.save(&record) {
-            eprintln!("\x1b[33mwarning: could not save session: {e}\x1b[0m");
+            self.ui
+                .diagnostic(&format!("warning: could not save session: {e}"));
         }
     }
 
@@ -1031,7 +1032,8 @@ impl Agent {
                 first_tool_traced = true;
                 t.emit("first_tool_call_started");
             }
-            self.ui.tool_start(&call.name, call.args.get());
+            self.ui
+                .tool_start_detailed(&call.id, &call.name, call.args.get());
         }
 
         let workspace_root = self.workspace.root.to_string_lossy().into_owned();
@@ -1041,8 +1043,15 @@ impl Agent {
                 HookDecision::Allow => allowed.push(call),
                 HookDecision::Deny { reason, hook_name } => {
                     let result = format!("ERROR: blocked by hook '{hook_name}': {reason}");
-                    self.ui
-                        .tool_end(&call.name, &result, true, 0.0, self.session_cost_usd);
+                    self.ui.tool_end_detailed(crate::ToolEvent {
+                        call_id: &call.id,
+                        name: &call.name,
+                        result: &result,
+                        status: harness_tools::ToolStatus::Denied,
+                        changed_files: &[],
+                        cost_usd: 0.0,
+                        session_cost_usd: self.session_cost_usd,
+                    });
                     self.messages
                         .push(Message::tool_result(call.id, call.name, result));
                 }
@@ -1054,8 +1063,15 @@ impl Agent {
             if is_web_tool(&call.name) {
                 if self.web_operations_remaining == 0 {
                     let result = "ERROR: web operation quota exhausted for this user request (maximum 3); use the sources already gathered and answer now";
-                    self.ui
-                        .tool_end(&call.name, result, true, 0.0, self.session_cost_usd);
+                    self.ui.tool_end_detailed(crate::ToolEvent {
+                        call_id: &call.id,
+                        name: &call.name,
+                        result,
+                        status: harness_tools::ToolStatus::Denied,
+                        changed_files: &[],
+                        cost_usd: 0.0,
+                        session_cost_usd: self.session_cost_usd,
+                    });
                     self.messages.push(Message::tool_result(
                         call.id,
                         call.name,
@@ -1102,13 +1118,15 @@ impl Agent {
             self.run_ledger
                 .record(&call.name, &call.args, is_error, &created);
             self.session_cost_usd += result.cost_usd;
-            self.ui.tool_end(
-                &call.name,
-                &result.summary,
-                is_error,
-                result.cost_usd,
-                self.session_cost_usd,
-            );
+            self.ui.tool_end_detailed(crate::ToolEvent {
+                call_id: &call.id,
+                name: &call.name,
+                result: &result.summary,
+                status: result.status,
+                changed_files: &result.changed_files,
+                cost_usd: result.cost_usd,
+                session_cost_usd: self.session_cost_usd,
+            });
             if !self.hooks.is_empty() {
                 hooks::run_post_tool_use(&self.hooks, &call, &result.summary, &workspace_root)
                     .await;
@@ -1151,12 +1169,11 @@ impl Agent {
         match store.store(&namespace, call_id, "output", full) {
             Ok(handle) => Some(harness_tools::preview(full, &handle)),
             Err(e) => {
-                // Same posture as a failed `persist`: say so on stderr, then
-                // carry on. stdout is the NDJSON protocol channel and must
-                // not be touched.
-                eprintln!(
-                    "\x1b[33mwarning: could not store a large result as an artifact: {e}\x1b[0m"
-                );
+                // Same posture as a failed `persist`: report it through the
+                // host, then carry on with the inline result.
+                self.ui.diagnostic(&format!(
+                    "warning: could not store a large result as an artifact: {e}"
+                ));
                 None
             }
         }
