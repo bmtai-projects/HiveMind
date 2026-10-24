@@ -240,6 +240,37 @@ pub struct HookSpec {
     pub enforcement: bool,
 }
 
+/// Which wire dialect to speak to the resolved endpoint. Orthogonal to
+/// [`Backend`]: Hosted and Local are always `OpenAiCompatible` (HiveMind's
+/// own proxy and local servers like Ollama both speak it); only a BYOK key
+/// can be `Anthropic`, because Anthropic's native Messages API is the one
+/// provider in this catalog that doesn't speak the OpenAI dialect at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Dialect {
+    #[default]
+    OpenAiCompatible,
+    Anthropic,
+}
+
+impl Dialect {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Dialect::OpenAiCompatible => "openai_compatible",
+            Dialect::Anthropic => "anthropic",
+        }
+    }
+
+    /// Accepts the spellings a user might reasonably type ("claude" is as
+    /// likely as "anthropic") or write into `config.toml` by hand.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "" | "openai_compatible" | "openai" => Some(Dialect::OpenAiCompatible),
+            "anthropic" | "claude" => Some(Dialect::Anthropic),
+            _ => None,
+        }
+    }
+}
+
 /// Which kind of backend this session talks to.
 ///
 /// An enum rather than a pair of bools: `hosted` and `local` as two flags
@@ -286,6 +317,7 @@ pub struct Resolved {
     pub default_model: String,
     pub mode: Mode,
     pub backend: Backend,
+    pub dialect: Dialect,
     pub reasoning_effort: Option<String>,
     pub budget_usd: Option<f64>,
     pub policy: AgentPolicy,
@@ -312,6 +344,7 @@ struct ModelSection {
     base_url: Option<String>,
     model: Option<String>,
     reasoning_effort: Option<String>,
+    dialect: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
@@ -389,13 +422,20 @@ pub enum ConfigError {
          pulled, e.g. `ollama list`"
     )]
     MissingLocalModel,
+    #[error(
+        "an Anthropic key has no default model — pass --model <name> (or set \
+         `model` under [model] in your config file) with a real Anthropic \
+         model id; check https://docs.anthropic.com/en/docs/about-claude/models \
+         for current names, since HiveMind's own model aliases don't apply here"
+    )]
+    MissingAnthropicModel,
     #[error("writing {path}: {source}")]
     Write {
         path: String,
         #[source]
         source: std::io::Error,
     },
-    #[error("serializing credentials: {source}")]
+    #[error("serializing TOML: {source}")]
     Serialize {
         #[source]
         source: toml::ser::Error,
@@ -404,7 +444,7 @@ pub enum ConfigError {
 
 /// Overrides collected from CLI flags — anything `Some` here wins over the
 /// config file and environment.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct CliOverrides {
     pub api_key: Option<String>,
     pub base_url: Option<String>,
@@ -412,6 +452,7 @@ pub struct CliOverrides {
     pub reasoning_effort: Option<String>,
     pub budget_usd: Option<f64>,
     pub mode: Option<Mode>,
+    pub dialect: Option<Dialect>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -445,6 +486,12 @@ pub fn resolve(
         .clone()
         .or_else(|| file.model.base_url.clone())
         .or_else(|| file.deepseek.base_url.clone());
+    // Only meaningful for Byok below -- Hosted and Local are always
+    // OpenAiCompatible regardless of what's configured here.
+    let dialect = cli
+        .dialect
+        .or_else(|| file.model.dialect.as_deref().and_then(Dialect::parse))
+        .unwrap_or_default();
 
     // Three-way, in order of how explicit the user was:
     //
@@ -456,13 +503,22 @@ pub fn resolve(
     // The middle arm is the whole point: previously "no key" meant "you must
     // be hosted", which made Ollama impossible to express without inventing
     // a fake key.
-    let (api_key, base_url, backend) = match explicit_key {
+    let (api_key, base_url, backend, dialect) = match explicit_key {
         // An explicit key is BYOK regardless of what else is configured.
-        Some(key) => (
-            key,
-            base_url_override.unwrap_or_else(|| "https://api.deepseek.com".to_string()),
-            Backend::Byok,
-        ),
+        // The default endpoint depends on the dialect: Anthropic's own API,
+        // or DeepSeek's for every OpenAI-compatible key.
+        Some(key) => {
+            let default_base = match dialect {
+                Dialect::Anthropic => "https://api.anthropic.com",
+                Dialect::OpenAiCompatible => "https://api.deepseek.com",
+            };
+            (
+                key,
+                base_url_override.unwrap_or_else(|| default_base.to_string()),
+                Backend::Byok,
+                dialect,
+            )
+        }
         None => match load_hosted_credentials(credentials_path) {
             // Signed in. `--base-url` still applies, which is how a
             // non-production deployment gets pointed at.
@@ -470,12 +526,18 @@ pub fn resolve(
                 creds.access_token,
                 base_url_override.unwrap_or(creds.api_base),
                 Backend::Hosted,
+                Dialect::OpenAiCompatible,
             ),
             // Not signed in, but an endpoint was named. Previously this was
             // an error, which made a keyless server impossible to express
             // without inventing a fake key.
             None => match base_url_override {
-                Some(url) => (String::new(), url, Backend::Local),
+                Some(url) => (
+                    String::new(),
+                    url,
+                    Backend::Local,
+                    Dialect::OpenAiCompatible,
+                ),
                 None => return Err(ConfigError::MissingKey),
             },
         },
@@ -484,18 +546,22 @@ pub fn resolve(
     // Hosted mode defaults to the branded "hivemind" alias, which resolves
     // to the full catalog server-side. Every other backend talks to a
     // provider directly, so it needs a real provider-native id instead.
-    // A local server's model names are whatever the user pulled, so there is
-    // nothing safe to guess: inventing one produces a confusing 404 from the
-    // provider instead of a usable message.
+    // A local server's model names (and a direct Anthropic key's) are
+    // whatever the user pulled or picked, so there is nothing safe to
+    // guess: inventing one produces a confusing 404 instead of a usable
+    // message.
     let configured_model = cli
         .model
         .or_else(|| file.model.model.clone())
         .or_else(|| file.deepseek.model.clone());
-    let default_model = match (configured_model, backend) {
-        (Some(m), _) => m,
-        (None, Backend::Hosted) => "hivemind".to_string(),
-        (None, Backend::Byok) => "deepseek-v4-flash".to_string(),
-        (None, Backend::Local) => return Err(ConfigError::MissingLocalModel),
+    let default_model = match (configured_model, backend, dialect) {
+        (Some(m), _, _) => m,
+        (None, Backend::Hosted, _) => "hivemind".to_string(),
+        (None, Backend::Byok, Dialect::Anthropic) => {
+            return Err(ConfigError::MissingAnthropicModel);
+        }
+        (None, Backend::Byok, Dialect::OpenAiCompatible) => "deepseek-v4-flash".to_string(),
+        (None, Backend::Local, _) => return Err(ConfigError::MissingLocalModel),
     };
 
     let reasoning_effort = cli
@@ -542,6 +608,7 @@ pub fn resolve(
         default_model,
         mode,
         backend,
+        dialect,
         reasoning_effort,
         budget_usd,
         policy,
@@ -561,6 +628,80 @@ fn load_file(path: &Path) -> Result<File, ConfigError> {
         path: path.display().to_string(),
         source,
     })
+}
+
+/// Writes `[model]`'s api_key/base_url/model/dialect into `config.toml`,
+/// preserving every other section already there. Used by the interactive
+/// BYOK setup wizard (`hivemind activate`'s first-run provider picker).
+/// Applies the same owner-only permissions `save_hosted_credentials` does
+/// on Unix -- this file can now hold a live provider secret, not just
+/// values a user chose to hand-edit themselves.
+pub fn save_model_section(
+    config_path: &Path,
+    api_key: &str,
+    base_url: &str,
+    model: &str,
+    dialect: Dialect,
+) -> Result<(), ConfigError> {
+    let mut root: toml::Value = if config_path.exists() {
+        let text = std::fs::read_to_string(config_path).map_err(|source| ConfigError::Read {
+            path: config_path.display().to_string(),
+            source,
+        })?;
+        toml::from_str(&text).map_err(|source| ConfigError::Parse {
+            path: config_path.display().to_string(),
+            source,
+        })?
+    } else {
+        toml::Value::Table(toml::value::Table::new())
+    };
+
+    let table = root
+        .as_table_mut()
+        .expect("a parsed TOML document is always a table at its root");
+    let model_section = table
+        .entry("model")
+        .or_insert_with(|| toml::Value::Table(toml::value::Table::new()));
+    let model_table = model_section
+        .as_table_mut()
+        .expect("[model] is always a table");
+    model_table.insert(
+        "api_key".to_string(),
+        toml::Value::String(api_key.to_string()),
+    );
+    model_table.insert(
+        "base_url".to_string(),
+        toml::Value::String(base_url.to_string()),
+    );
+    model_table.insert("model".to_string(), toml::Value::String(model.to_string()));
+    model_table.insert(
+        "dialect".to_string(),
+        toml::Value::String(dialect.as_str().to_string()),
+    );
+
+    if let Some(parent) = config_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|source| ConfigError::Write {
+            path: parent.display().to_string(),
+            source,
+        })?;
+    }
+    let text = toml::to_string_pretty(&root).map_err(|source| ConfigError::Serialize { source })?;
+    std::fs::write(config_path, text).map_err(|source| ConfigError::Write {
+        path: config_path.display().to_string(),
+        source,
+    })?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(config_path, std::fs::Permissions::from_mode(0o600)).map_err(
+            |source| ConfigError::Write {
+                path: config_path.display().to_string(),
+                source,
+            },
+        )?;
+    }
+    Ok(())
 }
 
 /// Default config file location: `~/.config/hivemind/config.toml`.
@@ -1069,6 +1210,131 @@ mod tests {
         .unwrap();
         assert!(delete_hosted_credentials(&path).unwrap());
         assert!(!path.exists());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn dialect_parse_accepts_claude_as_a_synonym_for_anthropic() {
+        assert_eq!(Dialect::parse("anthropic"), Some(Dialect::Anthropic));
+        assert_eq!(Dialect::parse("Claude"), Some(Dialect::Anthropic));
+        assert_eq!(Dialect::parse("openai"), Some(Dialect::OpenAiCompatible));
+        assert_eq!(Dialect::parse(""), Some(Dialect::OpenAiCompatible));
+        assert_eq!(Dialect::parse("bogus"), None);
+    }
+
+    #[test]
+    fn an_anthropic_byok_key_defaults_to_anthropics_own_api() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("HIVEMIND_API_KEY");
+            std::env::remove_var("DEEPSEEK_API_KEY");
+        };
+        let cli = CliOverrides {
+            api_key: Some("ak-abc".into()),
+            model: Some("claude-x".into()),
+            dialect: Some(Dialect::Anthropic),
+            ..Default::default()
+        };
+        let resolved = resolve(
+            Path::new("/nonexistent/config.toml"),
+            Path::new("/nonexistent/credentials.toml"),
+            cli,
+        )
+        .unwrap();
+        assert_eq!(resolved.backend, Backend::Byok);
+        assert_eq!(resolved.dialect, Dialect::Anthropic);
+        assert_eq!(resolved.endpoint.base_url, "https://api.anthropic.com");
+    }
+
+    /// Mirrors the Local-backend guard: a direct Anthropic model id is
+    /// whatever the user picked, so there is nothing safe to default to.
+    #[test]
+    fn an_anthropic_byok_key_without_a_model_says_so_instead_of_guessing() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("HIVEMIND_API_KEY");
+            std::env::remove_var("DEEPSEEK_API_KEY");
+        };
+        let cli = CliOverrides {
+            api_key: Some("ak-abc".into()),
+            dialect: Some(Dialect::Anthropic),
+            ..Default::default()
+        };
+        let result = resolve(
+            Path::new("/nonexistent/config.toml"),
+            Path::new("/nonexistent/credentials.toml"),
+            cli,
+        );
+        assert!(matches!(result, Err(ConfigError::MissingAnthropicModel)));
+    }
+
+    #[test]
+    fn a_plain_byok_key_is_unaffected_by_the_default_dialect() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("HIVEMIND_API_KEY");
+            std::env::remove_var("DEEPSEEK_API_KEY");
+        };
+        let cli = CliOverrides {
+            api_key: Some("sk-test".into()),
+            ..Default::default()
+        };
+        let resolved = resolve(
+            Path::new("/nonexistent/config.toml"),
+            Path::new("/nonexistent/credentials.toml"),
+            cli,
+        )
+        .unwrap();
+        assert_eq!(resolved.dialect, Dialect::OpenAiCompatible);
+        assert_eq!(resolved.endpoint.base_url, "https://api.deepseek.com");
+    }
+
+    #[test]
+    fn save_model_section_round_trips_and_preserves_other_sections() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("HIVEMIND_API_KEY");
+            std::env::remove_var("DEEPSEEK_API_KEY");
+        };
+        let dir =
+            std::env::temp_dir().join(format!("hivemind-test-save-model-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("config.toml");
+        std::fs::write(&config_path, "[agent]\nmax_turns = 42\n").unwrap();
+
+        save_model_section(
+            &config_path,
+            "ak-xyz",
+            "https://api.anthropic.com",
+            "claude-x",
+            Dialect::Anthropic,
+        )
+        .unwrap();
+
+        let resolved = resolve(
+            &config_path,
+            Path::new("/nonexistent/credentials.toml"),
+            CliOverrides::default(),
+        )
+        .unwrap();
+        assert_eq!(resolved.endpoint.api_key, "ak-xyz");
+        assert_eq!(resolved.dialect, Dialect::Anthropic);
+        assert_eq!(
+            resolved.policy.max_turns, 42,
+            "the pre-existing [agent] section must survive"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&config_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+        }
 
         std::fs::remove_dir_all(&dir).ok();
     }

@@ -145,9 +145,11 @@ pub(crate) fn to_wire_messages(msgs: &[Message], cache_prompt_prefix: bool) -> V
             } else {
                 Vec::new()
             };
-            // Empty stays absent, never `""` -- see WireMessage::content.
+            // Absent only for tool-call-only turns; elsewhere a missing key is null to Ollama.
             let content = if m.content.is_empty() {
-                None
+                tool_calls
+                    .is_empty()
+                    .then(|| WireContent::Text(String::new()))
             } else if cache_prompt_prefix && m.role == Role::System {
                 Some(WireContent::Parts(vec![WireContentPart {
                     kind: "text",
@@ -370,6 +372,15 @@ mod tests {
                 "content must be absent, not empty (cache={cache}): {j}"
             );
             assert_eq!(j[0]["tool_calls"][0]["function"]["name"], "list_dir");
+        }
+    }
+
+    #[test]
+    fn an_empty_assistant_turn_without_tool_calls_sends_an_empty_string() {
+        let empty_turn = Message::assistant("");
+        for cache in [false, true] {
+            let j = to_json(std::slice::from_ref(&empty_turn), cache);
+            assert_eq!(j[0]["content"], serde_json::json!(""));
         }
     }
 

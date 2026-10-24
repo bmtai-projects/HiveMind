@@ -5,8 +5,8 @@
 
 use std::sync::Arc;
 
-use harness_config::{AgentPolicy, Backend, HookSpec, Resolved};
-use harness_provider::{ChatClient, ProviderError};
+use harness_config::{AgentPolicy, Backend, Dialect, HookSpec, Resolved};
+use harness_provider::{AnthropicClient, ChatClient, Provider, ProviderError};
 use harness_tools::{
     ArtifactStore, DEFAULT_ARTIFACT_THRESHOLD_BYTES, Registry, ToolResult, Workspace,
 };
@@ -174,7 +174,7 @@ fn compose_system_prompt(
 }
 
 pub struct Agent {
-    client: ChatClient,
+    client: Box<dyn Provider>,
     tools: Registry,
     policy: AgentPolicy,
     ui: Arc<dyn Ui>,
@@ -280,14 +280,30 @@ impl Agent {
         system_prompt: String,
     ) -> Self {
         let ui_for_retry = ui.clone();
-        let client = ChatClient::new(
-            resolved.endpoint.base_url.clone(),
-            resolved.endpoint.api_key.clone(),
-        )
-        .with_max_retries(harness_provider::DEFAULT_MAX_RETRIES)
-        .with_retry_hook(Arc::new(move |attempt, max, delay, err| {
+        let retry_hook = Arc::new(move |attempt, max, delay, err: &ProviderError| {
             ui_for_retry.retrying(attempt, max, delay, &err.to_string());
-        }));
+        });
+        // Anthropic's own Messages API is the one dialect here that isn't
+        // OpenAI-Chat-Completions-shaped -- everything else (Hosted, Local,
+        // every other BYOK key) speaks that dialect and uses `ChatClient`.
+        let client: Box<dyn Provider> = match resolved.dialect {
+            Dialect::Anthropic => Box::new(
+                AnthropicClient::new(
+                    resolved.endpoint.base_url.clone(),
+                    resolved.endpoint.api_key.clone(),
+                )
+                .with_max_retries(harness_provider::DEFAULT_MAX_RETRIES)
+                .with_retry_hook(retry_hook),
+            ),
+            Dialect::OpenAiCompatible => Box::new(
+                ChatClient::new(
+                    resolved.endpoint.base_url.clone(),
+                    resolved.endpoint.api_key.clone(),
+                )
+                .with_max_retries(harness_provider::DEFAULT_MAX_RETRIES)
+                .with_retry_hook(retry_hook),
+            ),
+        };
 
         let default_model = resolved.default_model;
         let context_window = harness_config::lookup_model(&default_model)
@@ -450,7 +466,8 @@ impl Agent {
             title: derive_title(&self.messages),
         };
         if let Err(e) = p.store.save(&record) {
-            eprintln!("\x1b[33mwarning: could not save session: {e}\x1b[0m");
+            self.ui
+                .diagnostic(&format!("warning: could not save session: {e}"));
         }
     }
 
@@ -616,7 +633,7 @@ impl Agent {
             self.last_total_tokens.max(1),
             self.context_window,
             &policy,
-            &self.client,
+            self.client.as_ref(),
             &self.current_model,
         )
         .await
@@ -1015,7 +1032,8 @@ impl Agent {
                 first_tool_traced = true;
                 t.emit("first_tool_call_started");
             }
-            self.ui.tool_start(&call.name, call.args.get());
+            self.ui
+                .tool_start_detailed(&call.id, &call.name, call.args.get());
         }
 
         let workspace_root = self.workspace.root.to_string_lossy().into_owned();
@@ -1025,8 +1043,15 @@ impl Agent {
                 HookDecision::Allow => allowed.push(call),
                 HookDecision::Deny { reason, hook_name } => {
                     let result = format!("ERROR: blocked by hook '{hook_name}': {reason}");
-                    self.ui
-                        .tool_end(&call.name, &result, true, 0.0, self.session_cost_usd);
+                    self.ui.tool_end_detailed(crate::ToolEvent {
+                        call_id: &call.id,
+                        name: &call.name,
+                        result: &result,
+                        status: harness_tools::ToolStatus::Denied,
+                        changed_files: &[],
+                        cost_usd: 0.0,
+                        session_cost_usd: self.session_cost_usd,
+                    });
                     self.messages
                         .push(Message::tool_result(call.id, call.name, result));
                 }
@@ -1038,8 +1063,15 @@ impl Agent {
             if is_web_tool(&call.name) {
                 if self.web_operations_remaining == 0 {
                     let result = "ERROR: web operation quota exhausted for this user request (maximum 3); use the sources already gathered and answer now";
-                    self.ui
-                        .tool_end(&call.name, result, true, 0.0, self.session_cost_usd);
+                    self.ui.tool_end_detailed(crate::ToolEvent {
+                        call_id: &call.id,
+                        name: &call.name,
+                        result,
+                        status: harness_tools::ToolStatus::Denied,
+                        changed_files: &[],
+                        cost_usd: 0.0,
+                        session_cost_usd: self.session_cost_usd,
+                    });
                     self.messages.push(Message::tool_result(
                         call.id,
                         call.name,
@@ -1086,13 +1118,15 @@ impl Agent {
             self.run_ledger
                 .record(&call.name, &call.args, is_error, &created);
             self.session_cost_usd += result.cost_usd;
-            self.ui.tool_end(
-                &call.name,
-                &result.summary,
-                is_error,
-                result.cost_usd,
-                self.session_cost_usd,
-            );
+            self.ui.tool_end_detailed(crate::ToolEvent {
+                call_id: &call.id,
+                name: &call.name,
+                result: &result.summary,
+                status: result.status,
+                changed_files: &result.changed_files,
+                cost_usd: result.cost_usd,
+                session_cost_usd: self.session_cost_usd,
+            });
             if !self.hooks.is_empty() {
                 hooks::run_post_tool_use(&self.hooks, &call, &result.summary, &workspace_root)
                     .await;
@@ -1135,12 +1169,11 @@ impl Agent {
         match store.store(&namespace, call_id, "output", full) {
             Ok(handle) => Some(harness_tools::preview(full, &handle)),
             Err(e) => {
-                // Same posture as a failed `persist`: say so on stderr, then
-                // carry on. stdout is the NDJSON protocol channel and must
-                // not be touched.
-                eprintln!(
-                    "\x1b[33mwarning: could not store a large result as an artifact: {e}\x1b[0m"
-                );
+                // Same posture as a failed `persist`: report it through the
+                // host, then carry on with the inline result.
+                self.ui.diagnostic(&format!(
+                    "warning: could not store a large result as an artifact: {e}"
+                ));
                 None
             }
         }
@@ -1288,7 +1321,7 @@ impl Agent {
             effective_tokens,
             self.context_window,
             &policy,
-            &self.client,
+            self.client.as_ref(),
             &self.current_model,
         )
         .await

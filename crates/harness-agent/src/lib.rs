@@ -27,4 +27,4 @@ pub use session::{
 };
 pub use skills::Skill;
 pub use tokens::estimate_tokens;
-pub use ui::Ui;
+pub use ui::{ToolEvent, Ui};

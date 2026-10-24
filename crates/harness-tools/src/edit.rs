@@ -91,6 +91,11 @@ fn post_edit_window(path: &str, updated: &str, start_byte: usize, new_len: usize
     out
 }
 
+/// Normalizes to `\r\n` without doubling any `\r\n` already present.
+fn to_crlf(s: &str) -> String {
+    s.replace("\r\n", "\n").replace('\n', "\r\n")
+}
+
 #[derive(Deserialize)]
 struct EditArgs {
     path: String,
@@ -185,6 +190,19 @@ impl Tool for EditFile {
                 a.path
             )));
         }
+
+        // Windows checkouts store `\r\n` but models write `\n`; retry in the file's style.
+        let (old_string, new_string) =
+            if original.contains("\r\n") && !original.contains(&a.old_string) {
+                (to_crlf(&a.old_string), to_crlf(&a.new_string))
+            } else {
+                (a.old_string.clone(), a.new_string.clone())
+            };
+        let a = EditArgs {
+            old_string,
+            new_string,
+            ..a
+        };
 
         let occurrences = original.matches(&a.old_string).count();
         if occurrences == 0 {
@@ -357,6 +375,61 @@ mod tests {
             .summary;
         assert!(out.contains("2 replacements"), "{out}");
         assert!(!out.contains("after the edit"), "{out}");
+    }
+
+    /// Real failure: an LF `old_string` never matched a CRLF file, costing ~30 turns.
+    #[tokio::test]
+    async fn a_multi_line_edit_matches_a_crlf_file_and_keeps_its_line_endings() {
+        let w = ws("crlf");
+        let body =
+            "    }\r\n\r\n    /// A comment.\r\n    #[tokio::test]\r\n    async fn t() {}\r\n";
+        std::fs::write(w.root.join("f.rs"), body).unwrap();
+
+        EditFile(w.clone())
+            .execute(&args(serde_json::json!({
+                "path": "f.rs",
+                "old_string": "    /// A comment.\n    #[tokio::test]",
+                "new_string": "    #[tokio::test]",
+            })))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(w.root.join("f.rs")).unwrap(),
+            "    }\r\n\r\n    #[tokio::test]\r\n    async fn t() {}\r\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn new_lines_introduced_into_a_crlf_file_are_crlf_too() {
+        let w = ws("crlf_new");
+        std::fs::write(w.root.join("f.rs"), "a\r\nb\r\n").unwrap();
+        EditFile(w.clone())
+            .execute(&args(serde_json::json!({
+                "path": "f.rs", "old_string": "a\nb", "new_string": "a\nx\nb",
+            })))
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(w.root.join("f.rs")).unwrap(),
+            "a\r\nx\r\nb\r\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_lf_file_is_left_exactly_as_it_was_matched() {
+        let w = ws("lf_untouched");
+        std::fs::write(w.root.join("f.rs"), "a\nb\n").unwrap();
+        EditFile(w.clone())
+            .execute(&args(serde_json::json!({
+                "path": "f.rs", "old_string": "a\nb", "new_string": "a\nx\nb",
+            })))
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(w.root.join("f.rs")).unwrap(),
+            "a\nx\nb\n"
+        );
     }
 
     #[tokio::test]
