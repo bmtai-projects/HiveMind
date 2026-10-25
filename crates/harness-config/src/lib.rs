@@ -274,11 +274,11 @@ impl Dialect {
 /// Which kind of backend this session talks to.
 ///
 /// An enum rather than a pair of bools: `hosted` and `local` as two flags
-/// would admit a fourth state that means nothing, and the markup, the web
-/// tools and Pro mode each key off exactly one of these.
+/// would admit a fourth state that means nothing, and the markup and the
+/// web tools each key off exactly one of these.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Backend {
-    /// HiveMind's own proxy. Markup applies; web tools and Pro mode exist.
+    /// HiveMind's own proxy. Markup applies; web tools exist.
     Hosted,
     /// The user's own key, straight to their provider. No markup.
     Byok,
@@ -315,7 +315,6 @@ impl Backend {
 pub struct Resolved {
     pub endpoint: Endpoint,
     pub default_model: String,
-    pub mode: Mode,
     pub backend: Backend,
     pub dialect: Dialect,
     pub reasoning_effort: Option<String>,
@@ -347,40 +346,8 @@ struct ModelSection {
     dialect: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Mode {
-    /// Everything local and free. Works offline, costs nothing.
-    #[default]
-    Standard,
-    /// Hosted code-aware embeddings, billed against the account balance.
-    Pro,
-}
-
-impl Mode {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Mode::Standard => "standard",
-            Mode::Pro => "pro",
-        }
-    }
-
-    /// Accepts the spellings a user might reasonably type or a client might
-    /// send. Anything unrecognized is `None` so the caller can fall through
-    /// to the next precedence tier rather than silently guessing a tier the
-    /// user did not ask (and may be billed) for.
-    pub fn parse(s: &str) -> Option<Self> {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "standard" | "default" | "free" | "local" => Some(Mode::Standard),
-            "pro" | "remote" | "cloud" => Some(Mode::Pro),
-            _ => None,
-        }
-    }
-}
-
 #[derive(Debug, Default, Deserialize)]
 struct AgentSection {
-    mode: Option<String>,
     max_turns: Option<u32>,
     compaction_threshold_percent: Option<u8>,
     auto_escalate: Option<bool>,
@@ -451,7 +418,6 @@ pub struct CliOverrides {
     pub model: Option<String>,
     pub reasoning_effort: Option<String>,
     pub budget_usd: Option<f64>,
-    pub mode: Option<Mode>,
     pub dialect: Option<Dialect>,
 }
 
@@ -569,20 +535,6 @@ pub fn resolve(
         .or_else(|| file.model.reasoning_effort.clone());
     let budget_usd = cli.budget_usd.or(file.agent.budget_usd);
 
-    // Highest wins: --mode > $HIVEMIND_MODE > [agent] mode > Standard.
-    // An unparseable value at any tier falls through to the next rather
-    // than defaulting to Pro -- nobody gets billed because of a typo.
-    let mode = cli
-        .mode
-        .or_else(|| {
-            std::env::var("HIVEMIND_MODE")
-                .ok()
-                .as_deref()
-                .and_then(Mode::parse)
-        })
-        .or_else(|| file.agent.mode.as_deref().and_then(Mode::parse))
-        .unwrap_or_default();
-
     let mut policy = AgentPolicy::default();
     if let Some(v) = file.agent.max_turns {
         policy.max_turns = v;
@@ -606,7 +558,6 @@ pub fn resolve(
     Ok(Resolved {
         endpoint: Endpoint { base_url, api_key },
         default_model,
-        mode,
         backend,
         dialect,
         reasoning_effort,
@@ -721,16 +672,6 @@ pub fn default_credentials_path() -> PathBuf {
             .join("credentials.toml");
     }
     PathBuf::from("hivemind-credentials.toml")
-}
-
-/// Default embedding-cache location: `~/.config/hivemind/embeddings/`.
-/// Vectors keyed by chunk content, so an unchanged chunk is embedded once
-/// ever rather than once per session — see `harness_tools::EmbedCache`.
-pub fn default_embeddings_cache_dir() -> PathBuf {
-    if let Some(home) = dirs_home() {
-        return home.join(".config").join("hivemind").join("embeddings");
-    }
-    PathBuf::from("hivemind-embeddings")
 }
 
 /// Default artifact-store location: `~/.config/hivemind/artifacts/`.

@@ -441,13 +441,6 @@ struct ActivateArgs {
     #[arg(long)]
     budget: Option<f64>,
 
-    /// "standard" (default) runs everything locally and free. "pro" adds
-    /// hosted code-aware embeddings for sharper semantic_search, billed
-    /// against your balance. Also settable via `[agent] mode` in
-    /// config.toml or $HIVEMIND_MODE.
-    #[arg(long)]
-    mode: Option<String>,
-
     /// Enable hosted public web search for this session. Off by default and
     /// available only with `hivemind auth login` credentials.
     #[arg(long)]
@@ -751,7 +744,6 @@ async fn run(args: ActivateArgs) -> anyhow::Result<()> {
         model: args.model.clone(),
         reasoning_effort: args.reasoning_effort.clone(),
         budget_usd: args.budget,
-        mode: args.mode.as_deref().and_then(harness_config::Mode::parse),
         dialect: args
             .dialect
             .as_deref()
@@ -856,16 +848,6 @@ async fn run(args: ActivateArgs) -> anyhow::Result<()> {
         registry.register_disabled(Arc::new(WebSearch(web_client.clone())));
         registry.register_disabled(Arc::new(WebFetch(web_client)));
     }
-    // Pro mode swaps semantic_search onto hosted embeddings. Standard mode
-    // -- and any Pro session that can't reach them -- keeps the local
-    // embedder, which is also retained inside SemanticSearch as the runtime
-    // fallback, so a network failure degrades quality instead of failing
-    // the task.
-    let hosted_token = resolved
-        .backend
-        .is_hosted()
-        .then_some(resolved.endpoint.api_key.as_str());
-    let pro = resolved.mode == harness_config::Mode::Pro;
     let progress_ui: harness_tools::ProgressSink = {
         let json_ui = json_ui.clone();
         let term_ui = term_ui.clone();
@@ -881,20 +863,7 @@ async fn run(args: ActivateArgs) -> anyhow::Result<()> {
         })
     };
     registry.register(Arc::new(
-        match harness_tools::RemoteEmbedder::for_pro_mode(pro, hosted_token) {
-            Some(remote) => SemanticSearch::new(ws.clone())
-                .with_reranker(Arc::new(remote))
-                .with_cache_dir(harness_config::default_embeddings_cache_dir())
-                .with_progress(progress_ui),
-            None => {
-                if pro {
-                    eprintln!(
-                        "pro mode: hosted embeddings need a signed-in account (`hivemind auth login`); using local search"
-                    );
-                }
-                SemanticSearch::new(ws.clone()).with_progress(progress_ui)
-            }
-        },
+        SemanticSearch::new(ws.clone()).with_progress(progress_ui),
     ));
     // Registered unconditionally: a resumed session can carry handles from
     // an earlier run, so the tool has to exist even before this process
@@ -1081,7 +1050,7 @@ async fn run(args: ActivateArgs) -> anyhow::Result<()> {
         agent.set_skill(Some(skill)).map_err(anyhow::Error::msg)?;
     }
 
-    repl(&mut agent, ws, ui, args.yolo, update_check, resolved.mode).await
+    repl(&mut agent, ws, ui, args.yolo, update_check).await
 }
 
 /// Resolve `--continue` / `--resume` into either a restored session or a
@@ -1371,7 +1340,6 @@ async fn repl(
     ui: Arc<TermUi>,
     yolo: bool,
     update_check: tokio::task::JoinHandle<Option<String>>,
-    mode: harness_config::Mode,
 ) -> anyhow::Result<()> {
     banner::print(update_check).await;
     println!("\x1b[90m@ to reference a file\x1b[0m");
@@ -1409,7 +1377,7 @@ async fn repl(
         if let Some(cmd) = commands::parse(input) {
             match cmd {
                 SlashCommand::Help => println!("{}", commands::HELP_TEXT),
-                SlashCommand::Status => print_status(agent, mode),
+                SlashCommand::Status => print_status(agent),
                 SlashCommand::Context => print_context(agent),
                 SlashCommand::Diff(filter) => print_diff(agent, filter.as_deref()),
                 SlashCommand::Clear => print!("\x1b[2J\x1b[H"),
@@ -1658,15 +1626,8 @@ fn context_gauge(used: u64, window: u64, width: usize) -> (u64, usize) {
 /// my workspace". Deliberately includes the change list: cost and model are
 /// easy to remember, but "which files has it touched" is the thing a user
 /// actually loses track of during a long session.
-fn print_status(agent: &Agent, mode: harness_config::Mode) {
+fn print_status(agent: &Agent) {
     println!("\x1b[1mmodel\x1b[0m      {}", agent.current_model());
-    println!(
-        "\x1b[1mmode\x1b[0m       {}",
-        match mode {
-            harness_config::Mode::Pro => "Pro (hosted reranking for semantic_search)",
-            harness_config::Mode::Standard => "Standard (local embeddings)",
-        }
-    );
     println!(
         "\x1b[1mreasoning\x1b[0m  {}",
         agent.reasoning_effort().unwrap_or("off")
