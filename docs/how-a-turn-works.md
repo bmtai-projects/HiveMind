@@ -4,7 +4,10 @@ You press Enter after typing "add a test for this function."
 HiveMind sends that request to a model. The model asks to read code,
 adds a test, runs it, and explains the result.
 
-This guide follows one possible path through an interactive session.
+This guide follows one possible path through an interactive session in the
+plain terminal interface (`--ui plain`). The default full-screen interface
+shows the same turn through `TuiBridge`, in
+[`crates/harness-cli/src/tui/`](../crates/harness-cli/src/tui/).
 The model chooses the tools and their arguments. The sequence below is an
 example, not a script that HiveMind always follows.
 
@@ -17,8 +20,11 @@ One request can take several turns.
 In [`crates/harness-cli/src/main.rs`](../crates/harness-cli/src/main.rs),
 `run` loads settings and resolves the working folder.
 It creates a `Registry`, the collection of tools the model can use.
-It also creates `ChatClient`, which talks to the model, and `TermUi`,
-which displays progress in the terminal. It passes these to `Agent::new`.
+It also creates `TermUi`, which displays progress in the terminal.
+It passes these to `Agent::new`, which builds the model client. A client
+implements the `Provider` trait. `Agent::new` picks `ChatClient` for
+OpenAI-style APIs or `AnthropicClient` for Anthropic's, based on the
+`dialect` setting. This guide follows `ChatClient`.
 
 The same file's `system_prompt` builds the **system prompt**: instructions
 that apply to the whole session. Project conventions are loaded once at
@@ -74,8 +80,12 @@ adds the marker to the system message.
 
 ## 3. Send the request and show the stream
 
-`Agent::run` calls `Ui::turn_started`, then `ChatClient::stream` in
+`Agent::run` calls `Ui::turn_started`, then `Provider::stream`. For an
+OpenAI-style backend that is `ChatClient::stream` in
 [`crates/harness-provider/src/client.rs`](../crates/harness-provider/src/client.rs).
+`AnthropicClient` in
+[`anthropic.rs`](../crates/harness-provider/src/anthropic.rs) does the same job
+against Anthropic's Messages API.
 
 `ChatClient::stream` encodes the request as JSON, a text format for structured
 data. It starts a background task and returns a channel that delivers events
