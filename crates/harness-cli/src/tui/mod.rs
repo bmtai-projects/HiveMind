@@ -14,7 +14,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::Context;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, MouseEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -36,6 +39,7 @@ pub(crate) struct TuiConfig {
 enum InputEvent {
     Key(KeyEvent),
     Paste(String),
+    Wheel { column: u16, row: u16, down: bool },
     Resize,
 }
 
@@ -151,6 +155,10 @@ async fn handle_input(
 ) -> InputOutcome {
     match input {
         InputEvent::Resize => return InputOutcome::Continue,
+        InputEvent::Wheel { column, row, down } => {
+            app.scroll_at(column, row, down);
+            return InputOutcome::Continue;
+        }
         InputEvent::Paste(text) => {
             if app.approval.is_none() && !app.palette_visible {
                 app.composer.push_str(&text);
@@ -243,12 +251,14 @@ async fn handle_input(
                     }
                 }
                 KeyCode::Esc => app.details_visible = false,
-                KeyCode::Up | KeyCode::PageUp => {
-                    app.conversation_scroll = app.conversation_scroll.saturating_add(5)
-                }
-                KeyCode::Down | KeyCode::PageDown => {
-                    app.conversation_scroll = app.conversation_scroll.saturating_sub(5)
-                }
+                KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => app.scroll_tools(-1),
+                KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => app.scroll_tools(1),
+                KeyCode::Up => app.scroll_conversation(-app::SCROLL_ROWS),
+                KeyCode::Down => app.scroll_conversation(app::SCROLL_ROWS),
+                KeyCode::PageUp => app.page_conversation(false),
+                KeyCode::PageDown => app.page_conversation(true),
+                KeyCode::Home => app.scroll_conversation_to_top(),
+                KeyCode::End => app.scroll_conversation_to_latest(),
                 KeyCode::Backspace => {
                     app.composer.pop();
                 }
@@ -497,6 +507,22 @@ fn spawn_input_pump(
                             break;
                         }
                     }
+                    // Only the wheel; pointer moves would flood the queue.
+                    Ok(Event::Mouse(mouse)) => {
+                        let down = match mouse.kind {
+                            MouseEventKind::ScrollDown => true,
+                            MouseEventKind::ScrollUp => false,
+                            _ => continue,
+                        };
+                        let wheel = InputEvent::Wheel {
+                            column: mouse.column,
+                            row: mouse.row,
+                            down,
+                        };
+                        if sender.blocking_send(wheel).is_err() {
+                            break;
+                        }
+                    }
                     Ok(Event::Resize(_, _)) => {
                         if sender.blocking_send(InputEvent::Resize).is_err() {
                             break;
@@ -527,6 +553,8 @@ impl TerminalSession {
             let _ = disable_raw_mode();
             return Err(error).context("enter alternate terminal screen");
         }
+        // Best effort: without it the wheel simply does nothing.
+        let _ = execute!(stdout, EnableMouseCapture);
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend).context("create terminal renderer")?;
         terminal.clear().context("clear terminal renderer")?;
@@ -541,6 +569,7 @@ impl TerminalSession {
 
 impl Drop for TerminalSession {
     fn drop(&mut self) {
+        let _ = execute!(self.terminal.backend_mut(), DisableMouseCapture);
         let _ = disable_raw_mode();
         let _ = cleanup_terminal_output(self.terminal.backend_mut());
         let _ = self.terminal.show_cursor();
@@ -558,8 +587,9 @@ fn install_panic_restore() {
 }
 
 fn restore_terminal() {
-    let _ = disable_raw_mode();
     let mut stdout = io::stdout();
+    let _ = execute!(stdout, DisableMouseCapture);
+    let _ = disable_raw_mode();
     let _ = cleanup_terminal_output(&mut stdout);
 }
 

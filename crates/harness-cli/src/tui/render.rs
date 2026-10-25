@@ -1,8 +1,11 @@
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Direction, Layout, Margin, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{
+    Block, Borders, Clear, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation,
+    ScrollbarState, Wrap,
+};
 
 use super::app::{App, ConversationKind, RunState, TodoState, ToolState, View, slash_matches};
 
@@ -14,6 +17,12 @@ const YELLOW: Color = Color::Rgb(250, 198, 79);
 const RED: Color = Color::Rgb(246, 120, 111);
 
 pub(crate) fn draw(frame: &mut Frame, app: &App) {
+    // Hidden panels must not keep catching the mouse wheel.
+    let mut layout = app.layout.get();
+    layout.conversation = Rect::default();
+    layout.tools = Rect::default();
+    app.layout.set(layout);
+
     let area = frame.area();
     let compact = area.width < 108 || area.height < 28;
     let composer_rows = wrap_rows(&app.composer, area.width.saturating_sub(2) as usize)
@@ -93,18 +102,9 @@ fn render_main(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_conversation(frame: &mut Frame, app: &App, area: Rect) {
-    let inner_height = area.height.saturating_sub(2) as usize;
-    let total = app.conversation.len();
-    let visible = inner_height
-        .saturating_add(app.conversation_scroll)
-        .min(total);
-    let start = total.saturating_sub(visible);
-    let end = total.saturating_sub(app.conversation_scroll);
     let lines: Vec<Line<'static>> = app
         .conversation
         .iter()
-        .skip(start)
-        .take(end.saturating_sub(start))
         .map(|line| match line.kind {
             ConversationKind::User => Line::from(Span::styled(
                 line.text.clone(),
@@ -119,11 +119,52 @@ fn render_conversation(frame: &mut Frame, app: &App, area: Rect) {
             }
         })
         .collect();
+    let title = if app.conversation_top.is_some() {
+        " Conversation · scrolled up · End for latest "
+    } else {
+        " Conversation "
+    };
+    let block = boxed(title);
+    let inner = block.inner(area);
+    let paragraph = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
+    // Counted in wrapped rows, so long lines can't push the newest text out of view.
+    let total = paragraph.line_count(inner.width);
+    let page = inner.height as usize;
+    let max_top = total.saturating_sub(page);
+    let top = app.conversation_top.map_or(max_top, |top| top.min(max_top));
+
+    let mut layout = app.layout.get();
+    layout.conversation = area;
+    layout.conversation_page = page;
+    layout.conversation_max_top = max_top;
+    app.layout.set(layout);
+
     frame.render_widget(
-        Paragraph::new(Text::from(lines))
-            .block(boxed(" Conversation "))
-            .wrap(Wrap { trim: false }),
+        paragraph
+            .block(block)
+            .scroll((top.min(u16::MAX as usize) as u16, 0)),
         area,
+    );
+    if max_top > 0 {
+        let mut state = ScrollbarState::new(max_top + 1)
+            .viewport_content_length(page)
+            .position(top);
+        render_scrollbar(frame, area, &mut state);
+    }
+}
+
+fn render_scrollbar(frame: &mut Frame, area: Rect, state: &mut ScrollbarState) {
+    frame.render_stateful_widget(
+        Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(None)
+            .end_symbol(None)
+            .thumb_style(Style::default().fg(ACCENT))
+            .track_style(Style::default().fg(BORDER)),
+        area.inner(Margin {
+            vertical: 1,
+            horizontal: 0,
+        }),
+        state,
     );
 }
 
@@ -170,7 +211,11 @@ fn render_tasks(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_tools(frame: &mut Frame, app: &App, area: Rect) {
-    let block = boxed(format!(" Tools ({})  Tab browse ", app.tools.len()));
+    let mut layout = app.layout.get();
+    layout.tools = area;
+    app.layout.set(layout);
+
+    let block = boxed(format!(" Tools ({})  Tab details ", app.tools.len()));
     if app.tools.is_empty() {
         frame.render_widget(
             Paragraph::new(Line::styled(
@@ -204,15 +249,19 @@ fn render_tools(frame: &mut Frame, app: &App, area: Rect) {
             ])
         })
         .collect();
+    let selected = app.selected_tool.min(app.tools.len().saturating_sub(1));
     // Stateful so ratatui keeps the selected call scrolled into view.
-    let mut state = ListState::default().with_selected(Some(
-        app.selected_tool.min(app.tools.len().saturating_sub(1)),
-    ));
+    let mut state = ListState::default().with_selected(Some(selected));
     let list = List::new(items)
         .block(block)
         .highlight_style(Style::default().bg(Color::Rgb(38, 50, 62)))
         .highlight_symbol("›");
     frame.render_stateful_widget(list, area, &mut state);
+    // Each card is two rows.
+    if app.tools.len() * 2 > area.height.saturating_sub(2) as usize {
+        let mut bar = ScrollbarState::new(app.tools.len()).position(selected);
+        render_scrollbar(frame, area, &mut bar);
+    }
 }
 
 /// The argument that identifies a call: its command, path, or query.
@@ -439,9 +488,9 @@ fn wrap_rows(text: &str, width: usize) -> Vec<String> {
 
 fn render_footer(frame: &mut Frame, app: &App, area: Rect, compact: bool) {
     let text = if compact {
-        "Enter send  / commands  Tab tools  Ctrl+C stop"
+        "Enter send  / commands  ↑↓ scroll  End latest  Ctrl+C stop"
     } else {
-        "Enter send  / commands  Tab tools  Esc close  Up/Down scroll  Ctrl+C stop  Ctrl+S panel  Ctrl+L clear"
+        "Enter send  / commands  ↑↓ PgUp PgDn scroll  End latest  Shift+↑↓ tools  Tab details  Shift+drag select  Ctrl+C stop"
     };
     let usage = if app.prompt_tokens + app.completion_tokens > 0 {
         format!(
@@ -685,6 +734,116 @@ mod tests {
         let text = screen(&terminal);
         assert!(text.contains("/sessions"));
         assert!(!text.contains("/model"), "only matches are listed");
+    }
+
+    fn stream_lines(app: &mut App, range: std::ops::Range<usize>) {
+        for i in range {
+            app.apply(super::super::events::UiEvent::AssistantDelta(format!(
+                "line {i:03}\n"
+            )));
+        }
+    }
+
+    fn drawn(app: &App) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(140, 42)).unwrap();
+        terminal.draw(|frame| draw(frame, app)).unwrap();
+        screen(&terminal)
+    }
+
+    #[test]
+    fn the_newest_reply_stays_visible_when_long_lines_wrap() {
+        let mut app = App::new("work".into(), "model".into(), &[], Vec::new(), Vec::new());
+        for i in 0..40 {
+            let long = format!("row {i:02} {}\n", "words that wrap ".repeat(14));
+            app.apply(super::super::events::UiEvent::AssistantDelta(long));
+        }
+        app.apply(super::super::events::UiEvent::AssistantDelta(
+            "LAST-LINE-MARKER".into(),
+        ));
+        assert!(drawn(&app).contains("LAST-LINE-MARKER"));
+    }
+
+    #[test]
+    fn scrolling_up_reveals_older_text_and_holds_still_while_output_streams() {
+        let mut app = App::new("work".into(), "model".into(), &[], Vec::new(), Vec::new());
+        stream_lines(&mut app, 0..100);
+        let latest = drawn(&app);
+        assert!(latest.contains("line 099") && !latest.contains("line 020"));
+
+        app.scroll_conversation(-60);
+        let scrolled = drawn(&app);
+        assert!(scrolled.contains("line 020") && !scrolled.contains("line 099"));
+        assert!(scrolled.contains("End for latest"));
+
+        stream_lines(&mut app, 100..110);
+        let still = drawn(&app);
+        assert!(
+            still.contains("line 020") && !still.contains("line 109"),
+            "new output must not move a scrolled-up view"
+        );
+
+        app.scroll_conversation_to_latest();
+        assert!(drawn(&app).contains("line 109"));
+    }
+
+    #[test]
+    fn scrolling_is_clamped_and_reaching_the_bottom_follows_again() {
+        let mut app = App::new("work".into(), "model".into(), &[], Vec::new(), Vec::new());
+        stream_lines(&mut app, 0..100);
+        drawn(&app);
+        app.scroll_conversation(-10_000);
+        assert_eq!(app.conversation_top, Some(0));
+        assert!(drawn(&app).contains("line 000"));
+        app.scroll_conversation(10_000);
+        assert_eq!(app.conversation_top, None);
+    }
+
+    #[test]
+    fn sending_a_message_jumps_back_to_the_latest() {
+        let mut app = App::new("work".into(), "model".into(), &[], Vec::new(), Vec::new());
+        stream_lines(&mut app, 0..100);
+        drawn(&app);
+        app.page_conversation(false);
+        assert!(app.conversation_top.is_some());
+        app.submitted("second question");
+        assert_eq!(app.conversation_top, None);
+        assert!(drawn(&app).contains("second question"));
+    }
+
+    #[test]
+    fn the_wheel_scrolls_the_panel_under_the_pointer() {
+        let mut app = App::new("work".into(), "model".into(), &[], Vec::new(), Vec::new());
+        stream_lines(&mut app, 0..100);
+        for i in 0..30 {
+            app.apply(super::super::events::UiEvent::ToolStarted {
+                call_id: format!("c{i}"),
+                name: "read_file".into(),
+                args: format!(r#"{{"path":"file_{i:02}.rs"}}"#),
+            });
+        }
+        drawn(&app);
+        let layout = app.layout.get();
+
+        app.scroll_at(layout.tools.x + 2, layout.tools.y + 2, false);
+        assert_eq!(app.selected_tool, 28);
+        assert_eq!(
+            app.conversation_top, None,
+            "tools wheel must not scroll the chat"
+        );
+
+        app.scroll_at(layout.conversation.x + 2, layout.conversation.y + 2, false);
+        assert!(app.conversation_top.is_some());
+        assert_eq!(app.selected_tool, 28);
+    }
+
+    #[test]
+    fn a_hidden_side_panel_stops_catching_the_wheel() {
+        let mut app = App::new("work".into(), "model".into(), &[], Vec::new(), Vec::new());
+        drawn(&app);
+        assert_ne!(app.layout.get().tools, Rect::default());
+        app.sidebar_visible = false;
+        drawn(&app);
+        assert_eq!(app.layout.get().tools, Rect::default());
     }
 
     #[test]
