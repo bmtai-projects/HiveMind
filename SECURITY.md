@@ -40,7 +40,7 @@ intend to hold are:
 | Shell approval | `run_shell` prompts before executing, unless you passed `--yolo` or are running headless with `-p` |
 | Secret-write warning | Content the agent writes via `write_file` or `edit_file` is scanned for credential-shaped strings and flagged back to it |
 | Budget enforcement | `--budget` stops at a turn boundary and is not exceeded silently |
-| Credential storage | Hosted credentials stay in the local config directory and are never sent anywhere except the auth endpoint |
+| Credential storage | Hosted sign-in tokens, and API keys saved by the setup picker, stay in the local config directory as plain text. The file is owner-only on macOS and Linux; on Windows it relies on your user folder's default permissions. A key is sent only to the endpoint it belongs to |
 
 **A way around any of those is a vulnerability, and we want to hear about it.**
 Path-escape bypasses, a shell invocation that skips approval, a budget that is
@@ -61,5 +61,6 @@ the workspace, or out of the paths you point it at.
   and exist precisely to skip the prompt.
 - A model producing wrong, insecure, or destructive code. Review what an agent
   writes before you run it.
-- Costs incurred by your own prompts. Use `--budget` if you want a hard cap.
+- Costs incurred by your own prompts. Use `--budget` to set a limit. It is
+  checked between turns, so one turn in progress can go over it.
 - Reports produced solely by a scanner, with no described impact.

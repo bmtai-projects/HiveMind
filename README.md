@@ -70,12 +70,14 @@ hivemind activate
 ```
 
 `hivemind auth status` shows whether you are signed in and what your balance
-is. Web search and Pro mode only work this way.
+is. Web search only works this way.
 
 ### 2. Your own API key
 
 Any provider that speaks the OpenAI-style chat API works, for example
-OpenRouter. Always pass `--base-url` and `--model` with your key.
+OpenRouter. Always pass `--base-url` and `--model` with your key. Anthropic's
+own API works too: add `--dialect anthropic` and use
+`--base-url https://api.anthropic.com`.
 
 ```sh
 export HIVEMIND_API_KEY=<your key>          # Windows PowerShell: $env:HIVEMIND_API_KEY = "<your key>"
@@ -85,6 +87,12 @@ hivemind activate --base-url https://openrouter.ai/api/v1 --model <a model id yo
 > **Do not skip `--base-url`.** If you give a key but no address, HiveMind
 > sends the key to its built-in default, `https://api.deepseek.com`, which is
 > only right if the key is for that service.
+
+If nothing is configured, `hivemind activate` offers a picker instead. A key
+you paste there is hidden as you type and saved as plain text in your config
+file (see [Settings](#settings)). On macOS and Linux that file is readable only
+by you; on Windows it relies on your user folder's default permissions. To
+remove a saved key, delete the `api_key` line from that file.
 
 ### 3. A model on your own machine (no key, no cost)
 
@@ -199,12 +207,10 @@ These do **not** exist yet. Some are good places to help; see
   `hivemind models` that asks your server what it has. Today `hivemind models`
   only prints the built-in list.
 - **MCP support**, to plug in outside tool servers.
-- **A `/tier` command** to switch between standard and Pro mode inside a
-  session. Today you choose with `--mode` when you start.
 - **A real neural embedding model for local `semantic_search`.** Today the
-  local one matches on words, not meaning. Pro mode on the hosted service
-  already uses a stronger, hosted one.
-- **Support for providers that do not use the OpenAI-style chat API.**
+  local one matches on words, not meaning.
+- **More providers that do not use the OpenAI-style chat API.** Anthropic's
+  own API works today; others would each need a new client.
 
 ## Why it is cheap
 
@@ -260,12 +266,14 @@ model and reports progress back through a `Ui` trait that the CLI implements.
 do.) No lower crate reaches back up. That is what lets you change one crate
 without understanding the others.
 
-One client, [`ChatClient`](crates/harness-provider/src/client.rs), speaks the
-OpenAI-style chat API to every backend. There is no `Provider` trait yet, on
-purpose: with only one client it would just add a layer for nothing. If a
-provider ever needs a different request and response format, it would get its
-own module, like [`wire.rs`](crates/harness-provider/src/wire.rs), and that is
-the moment to add the trait.
+The [`Provider`](crates/harness-provider/src/lib.rs) trait hides which API the
+model speaks. Two clients implement it.
+[`ChatClient`](crates/harness-provider/src/client.rs) speaks the OpenAI-style
+chat API: the hosted service, OpenRouter, OpenAI, DeepSeek, and local servers
+such as Ollama. [`AnthropicClient`](crates/harness-provider/src/anthropic.rs)
+speaks Anthropic's own Messages API. `Agent::new` picks one from the
+`dialect` setting. A provider with yet another format would add a third
+implementation.
 
 The hosted service (accounts, billing, and the model proxy) is a separate
 private service. Nothing in this repository needs it, and the second and

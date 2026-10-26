@@ -5,11 +5,14 @@
 //!
 //! Plain numbered stdin prompts, matching `auth.rs`'s own println!-driven
 //! style, rather than the REPL's `reedline` editor: this runs once, before
-//! any session exists, and needs none of that machinery.
+//! any session exists, and needs none of that machinery. API keys are read
+//! with echo off.
 
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::Path;
 
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::terminal;
 use harness_config::Dialect;
 
 struct ProviderPreset {
@@ -82,7 +85,10 @@ pub async fn run(config_path: &Path) -> anyhow::Result<()> {
 }
 
 fn configure_byok(config_path: &Path, preset: &ProviderPreset) -> anyhow::Result<()> {
-    let api_key = read_line_prompt(&format!("\nPaste your {} API key: ", preset.label))?;
+    let api_key = read_secret(&format!(
+        "\nPaste your {} API key (hidden as you type): ",
+        preset.label
+    ))?;
     if api_key.is_empty() {
         anyhow::bail!("no key entered — run `hivemind activate` again");
     }
@@ -110,6 +116,7 @@ fn configure_byok(config_path: &Path, preset: &ProviderPreset) -> anyhow::Result
         "\nSaved. `hivemind activate` will use {} now.",
         preset.label
     );
+    println!("{}", storage_note(config_path));
     Ok(())
 }
 
@@ -119,7 +126,7 @@ fn configure_other(config_path: &Path) -> anyhow::Result<()> {
     if base_url.is_empty() {
         anyhow::bail!("a base URL is required — run `hivemind activate` again");
     }
-    let api_key = read_line_prompt("API key (leave blank for a keyless local server): ")?;
+    let api_key = read_secret("API key (hidden; leave blank for a keyless local server): ")?;
     let model = read_line_prompt("Model id: ")?;
     if model.is_empty() {
         anyhow::bail!("a model id is required");
@@ -132,13 +139,98 @@ fn configure_other(config_path: &Path) -> anyhow::Result<()> {
         Dialect::OpenAiCompatible,
     )?;
     println!("\nSaved. `hivemind activate` will use this endpoint now.");
+    if !api_key.is_empty() {
+        println!("{}", storage_note(config_path));
+    }
     Ok(())
+}
+
+fn storage_note(config_path: &Path) -> String {
+    let access = if cfg!(unix) {
+        "readable only by you"
+    } else {
+        "protected only by your user folder's default permissions"
+    };
+    format!(
+        "Your key is stored as plain text in {} ({access}).\nTo remove it, delete the `api_key` line in that file.",
+        config_path.display()
+    )
 }
 
 fn read_line_prompt(prompt: &str) -> anyhow::Result<String> {
     print!("{prompt}");
     io::stdout().flush().ok();
     read_line()
+}
+
+enum Typed {
+    Pending,
+    Done,
+    Cancelled,
+}
+
+fn apply_key(buf: &mut String, key: KeyEvent) -> Typed {
+    if key.kind == KeyEventKind::Release {
+        return Typed::Pending;
+    }
+    let ctrl =
+        key.modifiers.contains(KeyModifiers::CONTROL) && !key.modifiers.contains(KeyModifiers::ALT);
+    match key.code {
+        KeyCode::Enter => Typed::Done,
+        KeyCode::Esc => Typed::Cancelled,
+        KeyCode::Char('c' | 'd') if ctrl => Typed::Cancelled,
+        KeyCode::Backspace => {
+            buf.pop();
+            Typed::Pending
+        }
+        KeyCode::Char(c) if !ctrl => {
+            buf.push(c);
+            Typed::Pending
+        }
+        _ => Typed::Pending,
+    }
+}
+
+struct RawModeGuard;
+
+impl RawModeGuard {
+    fn enable() -> io::Result<Self> {
+        terminal::enable_raw_mode()?;
+        Ok(Self)
+    }
+}
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        let _ = terminal::disable_raw_mode();
+    }
+}
+
+/// Reads a secret without echoing it. Piped (non-terminal) input falls back
+/// to a plain line read, since nothing is displayed there anyway.
+fn read_secret(prompt: &str) -> anyhow::Result<String> {
+    print!("{prompt}");
+    io::stdout().flush().ok();
+    if !io::stdin().is_terminal() {
+        return read_line();
+    }
+    let mut buf = String::new();
+    let outcome = {
+        let _raw = RawModeGuard::enable()?;
+        loop {
+            if let Event::Key(key) = event::read()? {
+                match apply_key(&mut buf, key) {
+                    Typed::Pending => {}
+                    done => break done,
+                }
+            }
+        }
+    };
+    println!();
+    match outcome {
+        Typed::Cancelled => anyhow::bail!("cancelled — run `hivemind activate` again"),
+        _ => Ok(buf.trim().to_string()),
+    }
 }
 
 fn read_line() -> anyhow::Result<String> {
@@ -161,6 +253,83 @@ mod tests {
             .find(|p| p.dialect == Dialect::Anthropic)
             .unwrap();
         assert!(anthropic.default_model.is_none());
+    }
+
+    fn press(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, mods)
+    }
+
+    fn type_all(keys: &[KeyEvent]) -> (String, Option<&'static str>) {
+        let mut buf = String::new();
+        for k in keys {
+            match apply_key(&mut buf, *k) {
+                Typed::Pending => {}
+                Typed::Done => return (buf, Some("done")),
+                Typed::Cancelled => return (buf, Some("cancelled")),
+            }
+        }
+        (buf, None)
+    }
+
+    #[test]
+    fn typed_characters_build_the_key_and_enter_finishes_it() {
+        let none = KeyModifiers::NONE;
+        let keys = [
+            press(KeyCode::Char('s'), none),
+            press(KeyCode::Char('k'), none),
+            press(KeyCode::Char('-'), none),
+            press(KeyCode::Enter, none),
+        ];
+        assert_eq!(type_all(&keys), ("sk-".to_string(), Some("done")));
+    }
+
+    #[test]
+    fn backspace_removes_the_last_character() {
+        let none = KeyModifiers::NONE;
+        let keys = [
+            press(KeyCode::Char('a'), none),
+            press(KeyCode::Char('b'), none),
+            press(KeyCode::Backspace, none),
+            press(KeyCode::Backspace, none),
+            press(KeyCode::Backspace, none),
+            press(KeyCode::Char('c'), none),
+        ];
+        assert_eq!(type_all(&keys), ("c".to_string(), None));
+    }
+
+    #[test]
+    fn escape_and_ctrl_c_cancel() {
+        let esc = [press(KeyCode::Esc, KeyModifiers::NONE)];
+        assert_eq!(type_all(&esc).1, Some("cancelled"));
+        let ctrl_c = [press(KeyCode::Char('c'), KeyModifiers::CONTROL)];
+        assert_eq!(type_all(&ctrl_c).1, Some("cancelled"));
+    }
+
+    #[test]
+    fn key_release_events_are_ignored() {
+        let release = KeyEvent::new_with_kind(
+            KeyCode::Char('x'),
+            KeyModifiers::NONE,
+            KeyEventKind::Release,
+        );
+        assert_eq!(type_all(&[release]), (String::new(), None));
+    }
+
+    #[test]
+    fn altgr_characters_are_kept() {
+        let altgr = KeyModifiers::CONTROL | KeyModifiers::ALT;
+        assert_eq!(
+            type_all(&[press(KeyCode::Char('@'), altgr)]),
+            ("@".to_string(), None)
+        );
+    }
+
+    #[test]
+    fn the_storage_note_names_the_file_and_how_to_remove_the_key() {
+        let note = storage_note(Path::new("/tmp/hm/config.toml"));
+        assert!(note.contains("config.toml"));
+        assert!(note.contains("`api_key` line"));
+        assert!(!note.contains("sk-"));
     }
 
     #[test]
