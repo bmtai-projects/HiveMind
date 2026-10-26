@@ -34,6 +34,9 @@ pub(crate) enum UiEvent {
         model: String,
         prompt_tokens: u64,
         completion_tokens: u64,
+        /// `None` on a billed backend means the price is unknown, not zero.
+        turn_cost_usd: Option<f64>,
+        billed: bool,
         session_cost_usd: f64,
     },
     ModelChanged(String),
@@ -241,11 +244,13 @@ impl Ui for TuiBridge {
         });
     }
 
-    fn usage(&self, usage: &Usage, model_id: &str, _backend: Backend, session_cost_usd: f64) {
+    fn usage(&self, usage: &Usage, model_id: &str, backend: Backend, session_cost_usd: f64) {
         self.queue.push(UiEvent::Usage {
             model: model_id.to_string(),
             prompt_tokens: usage.prompt_tokens,
             completion_tokens: usage.completion_tokens,
+            turn_cost_usd: harness_agent::estimate_cost_usd(usage, model_id, backend),
+            billed: backend.is_billed(),
             session_cost_usd,
         });
     }

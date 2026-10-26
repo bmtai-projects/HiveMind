@@ -19,6 +19,18 @@ pub(crate) struct LastLayout {
     pub(crate) conversation_page: usize,
     pub(crate) conversation_max_top: usize,
     pub(crate) tools: Rect,
+    pub(crate) tasks: Rect,
+    pub(crate) tasks_max_offset: usize,
+}
+
+/// What the footer can honestly say about spend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CostStatus {
+    /// Local endpoint: no price to quote.
+    Local,
+    Known,
+    /// At least one billed turn had no known price.
+    Partial,
 }
 
 /// Listed as you type `/` -- VS Code's terminal swallows Ctrl+P and F1.
@@ -115,8 +127,59 @@ pub(crate) struct ToolCard {
     pub(crate) call_id: String,
     pub(crate) name: String,
     pub(crate) args: String,
+    /// Computed once at start, so drawing never re-diffs an edit.
+    pub(crate) summary: String,
     pub(crate) result: String,
     pub(crate) state: ToolState,
+}
+
+/// A short, readable description of a call: what it touched, never raw JSON.
+pub(crate) fn tool_summary(name: &str, args: &str) -> String {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(args) else {
+        return args.split_whitespace().collect::<Vec<_>>().join(" ");
+    };
+    let text = |key: &str| value.get(key).and_then(|v| v.as_str());
+    let first_line =
+        |key: &str| text(key).map(|s| s.lines().next().unwrap_or_default().to_string());
+    match name {
+        "todo_write" => {
+            if let Some(todos) = value.get("todos").and_then(|v| v.as_array()) {
+                let done = todos
+                    .iter()
+                    .filter(|t| t.get("status").and_then(|s| s.as_str()) == Some("completed"))
+                    .count();
+                return format!("{} tasks · {done} done", todos.len());
+            }
+        }
+        "edit_file" => {
+            if let (Some(path), Some(old), Some(new)) =
+                (text("path"), text("old_string"), text("new_string"))
+            {
+                let stats = crate::diff::stats(&crate::diff::diff(old, new));
+                return format!("{path}  +{} −{}", stats.added, stats.removed);
+            }
+        }
+        "write_file" => {
+            if let (Some(path), Some(content)) = (text("path"), text("content")) {
+                return format!("{path}  {} lines", content.lines().count());
+            }
+        }
+        "list_dir" => {
+            return first_line("path")
+                .filter(|p| !p.is_empty())
+                .unwrap_or(".".into());
+        }
+        _ => {}
+    }
+    for key in ["command", "path", "pattern", "query", "url", "title"] {
+        if let Some(line) = first_line(key) {
+            return line;
+        }
+    }
+    value
+        .as_object()
+        .map(|map| map.keys().cloned().collect::<Vec<_>>().join(", "))
+        .unwrap_or_default()
 }
 
 #[derive(Debug, Clone)]
@@ -174,12 +237,17 @@ pub(crate) struct App {
     pub(crate) selected_tool: usize,
     pub(crate) changed_files: Vec<ChangedFile>,
     pub(crate) todos: Vec<TodoItem>,
+    pub(crate) tasks_offset: usize,
     pub(crate) approval: Option<Approval>,
     pub(crate) notices: VecDeque<String>,
-    pub(crate) prompt_tokens: u64,
-    pub(crate) completion_tokens: u64,
+    /// Session totals, summed across every model request.
+    pub(crate) session_prompt_tokens: u64,
+    pub(crate) session_completion_tokens: u64,
     pub(crate) session_cost_usd: f64,
+    pub(crate) cost_status: CostStatus,
     assistant_stream_open: bool,
+    /// One "HiveMind" heading per reply, not one per stream segment.
+    reply_heading_shown: bool,
     pub(crate) sessions: Vec<harness_agent::SessionSummary>,
     pub(crate) reviews: Vec<ReviewReport>,
 }
@@ -208,32 +276,39 @@ impl App {
             selected_tool: 0,
             changed_files: Vec::new(),
             todos: Vec::new(),
+            tasks_offset: 0,
             approval: None,
             notices: VecDeque::new(),
-            prompt_tokens: 0,
-            completion_tokens: 0,
+            session_prompt_tokens: 0,
+            session_completion_tokens: 0,
             session_cost_usd: 0.0,
+            cost_status: CostStatus::Known,
             assistant_stream_open: false,
+            reply_heading_shown: false,
             sessions,
             reviews,
         };
         for message in history {
             match message.role {
-                Role::User => app.push_message(ConversationKind::User, &message.content),
-                Role::Assistant if !message.content.is_empty() => {
-                    app.push_message(ConversationKind::Assistant, &message.content)
+                Role::User => {
+                    app.push_message(ConversationKind::User, &message.content, true);
+                    app.reply_heading_shown = false;
                 }
-                Role::Tool => app.push_message(
-                    ConversationKind::Notice,
-                    &format!(
-                        "{}: {}",
-                        message.name.as_deref().unwrap_or("tool"),
-                        message.content
-                    ),
-                ),
+                Role::Assistant if !message.content.is_empty() => {
+                    let heading = !app.reply_heading_shown;
+                    app.push_message(ConversationKind::Assistant, &message.content, heading);
+                    app.reply_heading_shown = true;
+                }
+                // A resumed session's tool output can be whole files; one line is enough.
+                Role::Tool => app.push_notice(format!(
+                    "{}: {}",
+                    message.name.as_deref().unwrap_or("tool"),
+                    message.content.lines().next().unwrap_or_default()
+                )),
                 _ => {}
             }
         }
+        app.notices.clear();
         app
     }
 
@@ -251,6 +326,7 @@ impl App {
                 let following = self.selected_tool + 1 >= self.tools.len();
                 self.tools.push_back(ToolCard {
                     call_id,
+                    summary: tool_summary(&name, &args),
                     name,
                     args,
                     result: String::new(),
@@ -281,6 +357,7 @@ impl App {
                         call_id,
                         name: name.clone(),
                         args: String::new(),
+                        summary: String::new(),
                         result: result.clone(),
                         state: tool_state(status),
                     });
@@ -289,18 +366,31 @@ impl App {
                 self.record_changes(changed_files);
                 if name == "todo_write" && status == ToolStatus::Ok {
                     self.todos = parse_todos(&result);
+                    // Keep the step being worked on in view; drawing clamps the rest.
+                    self.tasks_offset = self
+                        .todos
+                        .iter()
+                        .position(|todo| todo.state == TodoState::InProgress)
+                        .map_or(0, |index| index.saturating_sub(1));
                 }
             }
             UiEvent::Usage {
                 model,
                 prompt_tokens,
                 completion_tokens,
+                turn_cost_usd,
+                billed,
                 session_cost_usd,
             } => {
                 self.model = model;
-                self.prompt_tokens = prompt_tokens;
-                self.completion_tokens = completion_tokens;
+                self.session_prompt_tokens += prompt_tokens;
+                self.session_completion_tokens += completion_tokens;
                 self.session_cost_usd = session_cost_usd;
+                self.cost_status = match (billed, turn_cost_usd, self.cost_status) {
+                    (false, _, _) => CostStatus::Local,
+                    (true, None, _) | (true, Some(_), CostStatus::Partial) => CostStatus::Partial,
+                    (true, Some(_), _) => CostStatus::Known,
+                };
             }
             UiEvent::ModelChanged(model) => self.model = model,
             UiEvent::RunFinished { error } => self.run_finished(error.map_or(Ok(()), Err)),
@@ -331,9 +421,11 @@ impl App {
     }
 
     pub(crate) fn submitted(&mut self, text: &str) {
-        self.push_message(ConversationKind::User, text);
+        self.push_message(ConversationKind::User, text, true);
         self.composer.clear();
         self.conversation_top = None;
+        self.reply_heading_shown = false;
+        self.assistant_stream_open = false;
     }
 
     /// Positive `rows` scrolls toward newer output. Reaching the bottom resumes following.
@@ -364,10 +456,23 @@ impl App {
         }
     }
 
+    pub(crate) fn scroll_tasks(&mut self, rows: isize) {
+        let max = self.layout.get().tasks_max_offset;
+        self.tasks_offset = self
+            .tasks_offset
+            .min(max)
+            .saturating_add_signed(rows)
+            .min(max);
+    }
+
     /// Mouse wheel: scrolls whichever panel is under the pointer.
     pub(crate) fn scroll_at(&mut self, column: u16, row: u16, down: bool) {
-        if self.layout.get().tools.contains(Position::new(column, row)) {
+        let layout = self.layout.get();
+        let pointer = Position::new(column, row);
+        if layout.tools.contains(pointer) {
             self.scroll_tools(if down { 1 } else { -1 });
+        } else if layout.tasks.contains(pointer) {
+            self.scroll_tasks(if down { 1 } else { -1 });
         } else {
             self.scroll_conversation(if down { SCROLL_ROWS } else { -SCROLL_ROWS });
         }
@@ -396,11 +501,9 @@ impl App {
                 ToolState::Denied
             };
         }
-        self.push_notice(if approved {
-            "Approved command".into()
-        } else {
-            "Denied command".into()
-        });
+        let verdict = if approved { "Approved" } else { "Denied" };
+        let command = approval.command.lines().next().unwrap_or_default();
+        self.push_notice(format!("{verdict}: {command}"));
         Some(approval.request_id)
     }
 
@@ -426,10 +529,19 @@ impl App {
 
     fn append_assistant_delta(&mut self, delta: &str) {
         if !self.assistant_stream_open {
-            self.conversation.push_back(ConversationLine {
-                text: "HiveMind".into(),
-                kind: ConversationKind::Assistant,
-            });
+            if !self.reply_heading_shown {
+                self.conversation.push_back(ConversationLine {
+                    text: "HiveMind".into(),
+                    kind: ConversationKind::Assistant,
+                });
+                self.reply_heading_shown = true;
+            } else if self.conversation.back().is_some_and(|l| !l.text.is_empty()) {
+                // Later segments of the same reply: a blank line, not a new heading.
+                self.conversation.push_back(ConversationLine {
+                    text: String::new(),
+                    kind: ConversationKind::Assistant,
+                });
+            }
             self.conversation.push_back(ConversationLine {
                 text: String::new(),
                 kind: ConversationKind::Assistant,
@@ -452,16 +564,17 @@ impl App {
         self.trim_conversation();
     }
 
-    fn push_message(&mut self, kind: ConversationKind, text: &str) {
-        let title = match kind {
-            ConversationKind::User => "You",
-            ConversationKind::Assistant => "HiveMind",
-            ConversationKind::Notice => "HiveMind",
-        };
-        self.conversation.push_back(ConversationLine {
-            text: title.into(),
-            kind,
-        });
+    fn push_message(&mut self, kind: ConversationKind, text: &str, heading: bool) {
+        if heading {
+            let title = match kind {
+                ConversationKind::User => "You",
+                ConversationKind::Assistant | ConversationKind::Notice => "HiveMind",
+            };
+            self.conversation.push_back(ConversationLine {
+                text: title.into(),
+                kind,
+            });
+        }
         for line in text.lines().chain(text.is_empty().then_some("")) {
             self.conversation.push_back(ConversationLine {
                 text: line.to_string(),
@@ -662,6 +775,152 @@ mod tests {
                 .text
                 .contains("Earlier display output")
         );
+    }
+
+    fn usage_event(prompt: u64, cost: Option<f64>, billed: bool, session: f64) -> UiEvent {
+        UiEvent::Usage {
+            model: "m".into(),
+            prompt_tokens: prompt,
+            completion_tokens: 10,
+            turn_cost_usd: cost,
+            billed,
+            session_cost_usd: session,
+        }
+    }
+
+    #[test]
+    fn usage_accumulates_session_totals_and_never_fakes_a_known_cost() {
+        let mut app = App::new("work".into(), "model".into(), &[], Vec::new(), Vec::new());
+        app.apply(usage_event(1_000, Some(0.01), true, 0.01));
+        app.apply(usage_event(2_000, Some(0.02), true, 0.03));
+        assert_eq!(app.session_prompt_tokens, 3_000);
+        assert_eq!(app.session_completion_tokens, 20);
+        assert_eq!(app.cost_status, CostStatus::Known);
+
+        app.apply(usage_event(500, None, true, 0.03));
+        assert_eq!(app.cost_status, CostStatus::Partial);
+        app.apply(usage_event(500, Some(0.01), true, 0.04));
+        assert_eq!(
+            app.cost_status,
+            CostStatus::Partial,
+            "an unknown turn stays counted"
+        );
+
+        let mut local = App::new("work".into(), "model".into(), &[], Vec::new(), Vec::new());
+        local.apply(usage_event(100, None, false, 0.0));
+        assert_eq!(local.cost_status, CostStatus::Local);
+    }
+
+    #[test]
+    fn a_reply_split_by_tool_calls_gets_one_heading() {
+        let mut app = App::new("work".into(), "model".into(), &[], Vec::new(), Vec::new());
+        app.submitted("build it");
+        app.apply(UiEvent::AssistantDelta("Reading files.".into()));
+        app.apply(UiEvent::AssistantDone);
+        app.apply(UiEvent::Notice("Approved: ls".into()));
+        app.apply(UiEvent::AssistantDelta("Done.".into()));
+        let headings = |app: &App| {
+            app.conversation
+                .iter()
+                .filter(|l| l.text == "HiveMind")
+                .count()
+        };
+        assert_eq!(headings(&app), 1);
+
+        app.submitted("next");
+        app.apply(UiEvent::AssistantDelta("Again.".into()));
+        assert_eq!(headings(&app), 2, "a new request starts a new reply");
+    }
+
+    #[test]
+    fn approval_notices_name_the_command() {
+        let mut app = App::new("work".into(), "model".into(), &[], Vec::new(), Vec::new());
+        app.apply(UiEvent::ApprovalRequested {
+            request_id: "r".into(),
+            command: "curl -s http://localhost:8080\nsecond line".into(),
+        });
+        app.resolve_approval(true);
+        assert!(
+            app.conversation
+                .iter()
+                .any(|l| l.text == "· Approved: curl -s http://localhost:8080")
+        );
+    }
+
+    #[test]
+    fn tool_summaries_are_readable_not_raw_json() {
+        let todos = r#"{"todos":[{"content":"a","status":"completed"},{"content":"b","status":"pending"}]}"#;
+        assert_eq!(tool_summary("todo_write", todos), "2 tasks · 1 done");
+        let edit = r#"{"path":"script.js","old_string":"a\nb","new_string":"a\nc\nd"}"#;
+        assert_eq!(tool_summary("edit_file", edit), "script.js  +2 −1");
+        let write = r#"{"path":"index.html","content":"<p>\n</p>\n"}"#;
+        assert_eq!(tool_summary("write_file", write), "index.html  2 lines");
+        assert_eq!(tool_summary("list_dir", "{}"), ".");
+        assert_eq!(
+            tool_summary("run_shell", r#"{"command":"ls -la\npwd"}"#),
+            "ls -la"
+        );
+        assert_eq!(
+            tool_summary("mystery", r#"{"alpha":1,"beta":[2]}"#),
+            "alpha, beta"
+        );
+    }
+
+    #[test]
+    fn a_todo_update_keeps_the_current_step_in_view() {
+        let mut app = App::new("work".into(), "model".into(), &[], Vec::new(), Vec::new());
+        let list = (0..12)
+            .map(|i| {
+                format!(
+                    "[{}] step {i}",
+                    if i < 8 {
+                        "x"
+                    } else if i == 8 {
+                        "~"
+                    } else {
+                        " "
+                    }
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.apply(UiEvent::ToolFinished {
+            call_id: "t".into(),
+            name: "todo_write".into(),
+            result: list,
+            status: ToolStatus::Ok,
+            changed_files: Vec::new(),
+        });
+        assert_eq!(app.tasks_offset, 7);
+        app.layout.set(LastLayout {
+            tasks_max_offset: 9,
+            ..LastLayout::default()
+        });
+        app.scroll_tasks(100);
+        assert_eq!(app.tasks_offset, 9);
+        app.scroll_tasks(-100);
+        assert_eq!(app.tasks_offset, 0);
+    }
+
+    #[test]
+    fn a_resumed_sessions_tool_output_is_one_line() {
+        let history = vec![
+            Message::user("show it"),
+            Message::tool_result("c1", "read_file", "line one\nline two\nline three"),
+        ];
+        let app = App::new(
+            "work".into(),
+            "model".into(),
+            &history,
+            Vec::new(),
+            Vec::new(),
+        );
+        assert!(
+            app.conversation
+                .iter()
+                .any(|l| l.text == "· read_file: line one")
+        );
+        assert!(!app.conversation.iter().any(|l| l.text.contains("line two")));
     }
 
     #[test]

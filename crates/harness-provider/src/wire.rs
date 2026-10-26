@@ -255,6 +255,9 @@ pub(crate) struct WireUsage {
     /// every cached token at the full uncached rate.
     #[serde(default)]
     pub prompt_tokens_details: Option<WirePromptTokensDetails>,
+    /// OpenRouter's actual charge for the request, in USD credits.
+    #[serde(default)]
+    pub cost: Option<f64>,
 }
 
 #[derive(Deserialize)]
@@ -394,6 +397,14 @@ mod tests {
             assert_eq!(j[0]["name"], "list_dir");
             assert_eq!(j[0]["content"], serde_json::json!("a.txt"));
         }
+    }
+
+    #[test]
+    fn reads_openrouters_reported_cost() {
+        let u =
+            usage(r#"{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12,"cost":0.00123}"#);
+        assert_eq!(u.cost, Some(0.00123));
+        assert_eq!(usage(r#"{"prompt_tokens":10}"#).cost, None);
     }
 
     #[test]

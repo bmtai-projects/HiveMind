@@ -7,7 +7,9 @@ use ratatui::widgets::{
     ScrollbarState, Wrap,
 };
 
-use super::app::{App, ConversationKind, RunState, TodoState, ToolState, View, slash_matches};
+use super::app::{
+    App, ConversationKind, CostStatus, RunState, TodoState, ToolState, View, slash_matches,
+};
 
 const BORDER: Color = Color::Rgb(83, 101, 119);
 const MUTED: Color = Color::Rgb(159, 173, 189);
@@ -169,12 +171,13 @@ fn render_scrollbar(frame: &mut Frame, area: Rect, state: &mut ScrollbarState) {
 }
 
 fn render_sidebar(frame: &mut Frame, app: &App, area: Rect) {
-    let tasks = app.todos.len().min(6) as u16;
+    // Tasks take up to two fifths of the panel; past that the list scrolls.
+    let tasks = (app.todos.len().max(1) as u16 + 2).min((area.height * 2 / 5).max(3));
     let changes = app.changed_files.len().min(5) as u16;
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length((tasks + 3).max(4)),
+            Constraint::Length(tasks),
             Constraint::Min(8),
             Constraint::Length((changes + 3).max(4)),
         ])
@@ -185,6 +188,24 @@ fn render_sidebar(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_tasks(frame: &mut Frame, app: &App, area: Rect) {
+    let visible = area.height.saturating_sub(2) as usize;
+    let max_offset = app.todos.len().saturating_sub(visible);
+    let offset = app.tasks_offset.min(max_offset);
+    let mut layout = app.layout.get();
+    layout.tasks = area;
+    layout.tasks_max_offset = max_offset;
+    app.layout.set(layout);
+
+    let done = app
+        .todos
+        .iter()
+        .filter(|todo| todo.state == TodoState::Completed)
+        .count();
+    let title = if app.todos.is_empty() {
+        " Tasks ".to_string()
+    } else {
+        format!(" Tasks {done}/{} ", app.todos.len())
+    };
     let items: Vec<ListItem<'static>> = if app.todos.is_empty() {
         vec![ListItem::new(Line::styled(
             "No task checklist yet",
@@ -193,7 +214,6 @@ fn render_tasks(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         app.todos
             .iter()
-            .take(6)
             .map(|todo| {
                 let (mark, style) = match todo.state {
                     TodoState::Completed => ("✓", Style::default().fg(GREEN)),
@@ -207,7 +227,14 @@ fn render_tasks(frame: &mut Frame, app: &App, area: Rect) {
             })
             .collect()
     };
-    frame.render_widget(List::new(items).block(boxed(" Tasks ")), area);
+    let mut state = ListState::default().with_offset(offset);
+    frame.render_stateful_widget(List::new(items).block(boxed(title)), area, &mut state);
+    if max_offset > 0 {
+        let mut bar = ScrollbarState::new(max_offset + 1)
+            .viewport_content_length(visible)
+            .position(offset);
+        render_scrollbar(frame, area, &mut bar);
+    }
 }
 
 fn render_tools(frame: &mut Frame, app: &App, area: Rect) {
@@ -233,7 +260,7 @@ fn render_tools(frame: &mut Frame, app: &App, area: Rect) {
         .iter()
         .map(|tool| {
             let style = tool_style(tool.state);
-            ListItem::new(vec![
+            let mut lines = vec![
                 Line::from(vec![
                     Span::styled(format!("{} ", tool.state.symbol()), style),
                     Span::styled(
@@ -243,10 +270,20 @@ fn render_tools(frame: &mut Frame, app: &App, area: Rect) {
                     Span::styled(format!("  {}", tool.state.label()), style),
                 ]),
                 Line::styled(
-                    format!("  {}", shorten(&tool_summary(&tool.args), detail_width)),
+                    format!("  {}", shorten(&tool.summary, detail_width)),
                     Style::default().fg(MUTED),
                 ),
-            ])
+            ];
+            // A failure says why right on the card.
+            if matches!(tool.state, ToolState::Failed | ToolState::TimedOut)
+                && let Some(reason) = tool.result.lines().find(|line| !line.trim().is_empty())
+            {
+                lines.push(Line::styled(
+                    format!("  {}", shorten(reason.trim(), detail_width)),
+                    Style::default().fg(RED),
+                ));
+            }
+            ListItem::new(lines)
         })
         .collect();
     let selected = app.selected_tool.min(app.tools.len().saturating_sub(1));
@@ -262,18 +299,6 @@ fn render_tools(frame: &mut Frame, app: &App, area: Rect) {
         let mut bar = ScrollbarState::new(app.tools.len()).position(selected);
         render_scrollbar(frame, area, &mut bar);
     }
-}
-
-/// The argument that identifies a call: its command, path, or query.
-fn tool_summary(args: &str) -> String {
-    if let Ok(value) = serde_json::from_str::<serde_json::Value>(args) {
-        for key in ["command", "path", "pattern", "query", "url"] {
-            if let Some(text) = value.get(key).and_then(|v| v.as_str()) {
-                return text.lines().next().unwrap_or_default().to_string();
-            }
-        }
-    }
-    args.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn render_changes(frame: &mut Frame, app: &App, area: Rect) {
@@ -386,10 +411,14 @@ fn render_composer(frame: &mut Frame, app: &App, area: Rect) {
     let wants_cursor = app.approval.is_none() && !app.palette_visible;
 
     if app.composer.is_empty() {
+        // Starts one column in, so the cursor doesn't cover its first letter.
         frame.render_widget(
             Paragraph::new("Ask HiveMind to work on your code…   type / for commands")
                 .style(Style::default().fg(MUTED)),
-            inner,
+            inner.inner(Margin {
+                vertical: 0,
+                horizontal: 1,
+            }),
         );
         if wants_cursor {
             frame.set_cursor_position((inner.x, inner.y));
@@ -492,21 +521,52 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect, compact: bool) {
     } else {
         "Enter send  / commands  ↑↓ PgUp PgDn scroll  End latest  Shift+↑↓ tools  Tab details  Shift+drag select  Ctrl+C stop"
     };
-    let usage = if app.prompt_tokens + app.completion_tokens > 0 {
-        format!(
-            "   {} in / {} out · ${:.6}",
-            app.prompt_tokens, app.completion_tokens, app.session_cost_usd
-        )
-    } else {
-        String::new()
-    };
+    // Usage gets its space first; the key hints are what gets clipped.
+    let usage = usage_summary(app);
+    let parts = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Min(0),
+            Constraint::Length(display_width(&usage) as u16),
+        ])
+        .split(area);
     frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(text, Style::default().fg(MUTED)),
-            Span::styled(usage, Style::default().fg(ACCENT)),
-        ])),
-        area,
+        Paragraph::new(Span::styled(text, Style::default().fg(MUTED))),
+        parts[0],
     );
+    frame.render_widget(
+        Paragraph::new(Span::styled(usage, Style::default().fg(ACCENT))),
+        parts[1],
+    );
+}
+
+/// Session tokens and spend. An unknown price is shown as unknown, never as $0.
+fn usage_summary(app: &App) -> String {
+    if app.session_prompt_tokens + app.session_completion_tokens == 0 {
+        return String::new();
+    }
+    let tokens = format!(
+        "{} in · {} out",
+        compact_count(app.session_prompt_tokens),
+        compact_count(app.session_completion_tokens)
+    );
+    let cost = match app.cost_status {
+        CostStatus::Local => "local model".to_string(),
+        CostStatus::Known => format!("${:.4}", app.session_cost_usd),
+        CostStatus::Partial if app.session_cost_usd > 0.0 => {
+            format!("≥ ${:.4} (some prices unknown)", app.session_cost_usd)
+        }
+        CostStatus::Partial => "cost n/a for this model".to_string(),
+    };
+    format!("   {tokens} · {cost}")
+}
+
+fn compact_count(n: u64) -> String {
+    match n {
+        0..1_000 => n.to_string(),
+        1_000..1_000_000 => format!("{:.1}k", n as f64 / 1_000.0),
+        _ => format!("{:.1}M", n as f64 / 1_000_000.0),
+    }
 }
 
 fn render_approval(frame: &mut Frame, command: &str) {
@@ -636,9 +696,11 @@ fn shorten(value: &str, limit: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    use harness_tools::ToolStatus;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
+    use super::super::events::UiEvent;
     use super::*;
 
     #[test]
@@ -844,6 +906,91 @@ mod tests {
         app.sidebar_visible = false;
         drawn(&app);
         assert_eq!(app.layout.get().tools, Rect::default());
+    }
+
+    fn usage(prompt: u64, cost: Option<f64>, billed: bool, session: f64) -> UiEvent {
+        UiEvent::Usage {
+            model: "model".into(),
+            prompt_tokens: prompt,
+            completion_tokens: 130,
+            turn_cost_usd: cost,
+            billed,
+            session_cost_usd: session,
+        }
+    }
+
+    #[test]
+    fn the_footer_shows_an_unknown_price_as_unknown_not_zero() {
+        let mut app = App::new("work".into(), "model".into(), &[], Vec::new(), Vec::new());
+        app.apply(usage(20_844, None, true, 0.0));
+        let text = drawn(&app);
+        assert!(text.contains("20.8k in · 130 out · cost n/a"), "{text}");
+        assert!(!text.contains("$0.0000"));
+
+        let mut known = App::new("work".into(), "model".into(), &[], Vec::new(), Vec::new());
+        known.apply(usage(1_000, Some(0.0042), true, 0.0042));
+        assert!(drawn(&known).contains("$0.0042"));
+
+        let mut local = App::new("work".into(), "model".into(), &[], Vec::new(), Vec::new());
+        local.apply(usage(1_000, None, false, 0.0));
+        assert!(drawn(&local).contains("local model"));
+    }
+
+    #[test]
+    fn every_task_is_listed_and_the_panel_scrolls_under_the_wheel() {
+        let mut app = App::new("work".into(), "model".into(), &[], Vec::new(), Vec::new());
+        let list = (0..30)
+            .map(|i| format!("[{}] task number {i:02}", if i < 2 { "x" } else { " " }))
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.apply(UiEvent::ToolFinished {
+            call_id: "t".into(),
+            name: "todo_write".into(),
+            result: list,
+            status: ToolStatus::Ok,
+            changed_files: Vec::new(),
+        });
+        let first = drawn(&app);
+        assert!(first.contains("Tasks 2/30"));
+        assert!(first.contains("task number 00") && !first.contains("task number 29"));
+
+        let tasks = app.layout.get().tasks;
+        for _ in 0..40 {
+            app.scroll_at(tasks.x + 2, tasks.y + 2, true);
+        }
+        let scrolled = drawn(&app);
+        assert!(scrolled.contains("task number 29") && !scrolled.contains("task number 00"));
+    }
+
+    #[test]
+    fn a_failed_tool_card_says_why() {
+        let mut app = App::new("work".into(), "model".into(), &[], Vec::new(), Vec::new());
+        app.apply(UiEvent::ToolStarted {
+            call_id: "c".into(),
+            name: "run_shell".into(),
+            args: r#"{"command":"node --check script.js"}"#.into(),
+        });
+        app.apply(UiEvent::ToolFinished {
+            call_id: "c".into(),
+            name: "run_shell".into(),
+            result: "\nSyntaxError: Unexpected token (42:7)\nmore".into(),
+            status: ToolStatus::Failed,
+            changed_files: Vec::new(),
+        });
+        let text = drawn(&app);
+        assert!(text.contains("node --check script.js"));
+        assert!(text.contains("SyntaxError: Unexpected token"));
+    }
+
+    #[test]
+    fn the_placeholder_is_not_hidden_under_the_cursor() {
+        let app = App::new("work".into(), "model".into(), &[], Vec::new(), Vec::new());
+        let mut terminal = Terminal::new(TestBackend::new(140, 42)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let cursor = terminal.get_cursor_position().unwrap();
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(cursor.x, cursor.y)].symbol(), " ");
+        assert!(screen(&terminal).contains("Ask HiveMind"));
     }
 
     #[test]

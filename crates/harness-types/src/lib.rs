@@ -113,6 +113,9 @@ pub struct Usage {
     pub total_tokens: u64,
     pub cache_hit_tokens: Option<u64>,
     pub cache_miss_tokens: Option<u64>,
+    /// Exact USD charge, when the provider reports one (OpenRouter does).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reported_cost_usd: Option<f64>,
 }
 
 impl Usage {

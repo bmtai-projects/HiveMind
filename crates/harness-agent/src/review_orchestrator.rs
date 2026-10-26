@@ -653,8 +653,7 @@ mod tests {
                 prompt_tokens: 10,
                 completion_tokens: 4,
                 total_tokens: 14,
-                cache_hit_tokens: None,
-                cache_miss_tokens: None,
+                ..Usage::default()
             },
             "hivemind",
             Backend::Byok,
