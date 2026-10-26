@@ -44,7 +44,8 @@ terminal_size = "0.4"
 sha2 = "0.11"
 # Ratatui 0.29 uses Crossterm 0.28. Keeping the pair here prevents the CLI
 # from accidentally pulling two incompatible terminal backends.
-ratatui = "0.29"
+# `line_count` lets the conversation scroll in wrapped rows that match what is drawn.
+ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
 crossterm = "0.28.1"
 
 [profile.release]

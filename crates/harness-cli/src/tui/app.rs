@@ -1,13 +1,25 @@
+use std::cell::Cell;
 use std::collections::VecDeque;
 
 use harness_review::ReviewReport;
 use harness_tools::{FileChange, FileChangeKind, ToolStatus};
 use harness_types::{Message, Role};
+use ratatui::layout::{Position, Rect};
 
 use super::events::UiEvent;
 
 const MAX_CONVERSATION_LINES: usize = 4_000;
 const MAX_TOOL_CARDS: usize = 200;
+pub(crate) const SCROLL_ROWS: isize = 3;
+
+/// Geometry from the last drawn frame, so input can clamp and route scrolling.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct LastLayout {
+    pub(crate) conversation: Rect,
+    pub(crate) conversation_page: usize,
+    pub(crate) conversation_max_top: usize,
+    pub(crate) tools: Rect,
+}
 
 /// Listed as you type `/` -- VS Code's terminal swallows Ctrl+P and F1.
 pub(crate) const SLASH_COMMANDS: &[(&str, &str)] = &[
@@ -155,7 +167,9 @@ pub(crate) struct App {
     pub(crate) palette_visible: bool,
     pub(crate) composer: String,
     pub(crate) conversation: VecDeque<ConversationLine>,
-    pub(crate) conversation_scroll: usize,
+    /// First visible wrapped row; `None` follows the newest output.
+    pub(crate) conversation_top: Option<usize>,
+    pub(crate) layout: Cell<LastLayout>,
     pub(crate) tools: VecDeque<ToolCard>,
     pub(crate) selected_tool: usize,
     pub(crate) changed_files: Vec<ChangedFile>,
@@ -188,7 +202,8 @@ impl App {
             palette_visible: false,
             composer: String::new(),
             conversation: VecDeque::new(),
-            conversation_scroll: 0,
+            conversation_top: None,
+            layout: Cell::new(LastLayout::default()),
             tools: VecDeque::new(),
             selected_tool: 0,
             changed_files: Vec::new(),
@@ -318,7 +333,44 @@ impl App {
     pub(crate) fn submitted(&mut self, text: &str) {
         self.push_message(ConversationKind::User, text);
         self.composer.clear();
-        self.conversation_scroll = 0;
+        self.conversation_top = None;
+    }
+
+    /// Positive `rows` scrolls toward newer output. Reaching the bottom resumes following.
+    pub(crate) fn scroll_conversation(&mut self, rows: isize) {
+        let max = self.layout.get().conversation_max_top;
+        let top = self.conversation_top.unwrap_or(max).min(max);
+        let next = top.saturating_add_signed(rows).min(max);
+        self.conversation_top = (next < max).then_some(next);
+    }
+
+    pub(crate) fn page_conversation(&mut self, down: bool) {
+        let page = self.layout.get().conversation_page.saturating_sub(1).max(1) as isize;
+        self.scroll_conversation(if down { page } else { -page });
+    }
+
+    pub(crate) fn scroll_conversation_to_top(&mut self) {
+        self.conversation_top = (self.layout.get().conversation_max_top > 0).then_some(0);
+    }
+
+    pub(crate) fn scroll_conversation_to_latest(&mut self) {
+        self.conversation_top = None;
+    }
+
+    /// Moves the tool selection without wrapping; the list scrolls along.
+    pub(crate) fn scroll_tools(&mut self, steps: isize) {
+        if let Some(last) = self.tools.len().checked_sub(1) {
+            self.selected_tool = self.selected_tool.saturating_add_signed(steps).min(last);
+        }
+    }
+
+    /// Mouse wheel: scrolls whichever panel is under the pointer.
+    pub(crate) fn scroll_at(&mut self, column: u16, row: u16, down: bool) {
+        if self.layout.get().tools.contains(Position::new(column, row)) {
+            self.scroll_tools(if down { 1 } else { -1 });
+        } else {
+            self.scroll_conversation(if down { SCROLL_ROWS } else { -SCROLL_ROWS });
+        }
     }
 
     pub(crate) fn run_finished(&mut self, result: Result<(), String>) {
@@ -368,7 +420,7 @@ impl App {
 
     pub(crate) fn clear_local_conversation(&mut self) {
         self.conversation.clear();
-        self.conversation_scroll = 0;
+        self.conversation_top = None;
         self.push_notice("Cleared this screen only; the agent session is unchanged".into());
     }
 
@@ -609,6 +661,35 @@ mod tests {
                 .unwrap()
                 .text
                 .contains("Earlier display output")
+        );
+    }
+
+    #[test]
+    fn tool_scrolling_stops_at_the_ends_and_the_newest_resumes_following() {
+        let mut app = App::new("work".into(), "model".into(), &[], Vec::new(), Vec::new());
+        let start = |app: &mut App, id: &str| {
+            app.apply(UiEvent::ToolStarted {
+                call_id: id.into(),
+                name: "read_file".into(),
+                args: "{}".into(),
+            })
+        };
+        for id in ["a", "b", "c"] {
+            start(&mut app, id);
+        }
+        app.scroll_tools(-10);
+        assert_eq!(app.selected_tool, 0);
+        start(&mut app, "d");
+        assert_eq!(
+            app.selected_tool, 0,
+            "browsing an old call is not interrupted"
+        );
+        app.scroll_tools(10);
+        assert_eq!(app.selected_tool, 3);
+        start(&mut app, "e");
+        assert_eq!(
+            app.selected_tool, 4,
+            "at the newest call, the list follows again"
         );
     }
 
