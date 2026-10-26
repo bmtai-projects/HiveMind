@@ -1,5 +1,5 @@
-//! Opt-in Ratatui interface for the interactive agent. The plain Reedline
-//! interface and JSON protocol remain separate entry points; Crossterm owns
+//! Default Ratatui interface for the interactive agent. The plain Reedline
+//! interface (`--ui plain`) and JSON protocol remain separate; Crossterm owns
 //! input only while this module is active.
 
 mod app;
