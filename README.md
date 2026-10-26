@@ -70,7 +70,7 @@ hivemind activate
 ```
 
 `hivemind auth status` shows whether you are signed in and what your balance
-is. Web search and Pro mode only work this way.
+is. Web search only works this way.
 
 ### 2. Your own API key
 
@@ -207,11 +207,8 @@ These do **not** exist yet. Some are good places to help; see
   `hivemind models` that asks your server what it has. Today `hivemind models`
   only prints the built-in list.
 - **MCP support**, to plug in outside tool servers.
-- **A `/tier` command** to switch between standard and Pro mode inside a
-  session. Today you choose with `--mode` when you start.
 - **A real neural embedding model for local `semantic_search`.** Today the
-  local one matches on words, not meaning. Pro mode on the hosted service
-  already uses a stronger, hosted one.
+  local one matches on words, not meaning.
 - **More providers that do not use the OpenAI-style chat API.** Anthropic's
   own API works today; others would each need a new client.
 
