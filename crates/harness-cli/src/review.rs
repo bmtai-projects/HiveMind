@@ -221,7 +221,6 @@ async fn run_inner(
                 model: args.model.clone(),
                 reasoning_effort: args.reasoning_effort.clone(),
                 budget_usd: args.budget,
-                mode: None,
                 dialect: None,
             },
         )?;
