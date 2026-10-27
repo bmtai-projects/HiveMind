@@ -115,6 +115,67 @@ struct ReadArgs {
     /// to the byte cap).
     #[serde(default)]
     limit: Option<usize>,
+    /// PDF only: a page (`5`) or range (`3-9`). Models send a bare number too.
+    #[serde(default)]
+    pages: Option<PagesArg>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum PagesArg {
+    Number(u64),
+    Text(String),
+}
+
+impl PagesArg {
+    fn spec(&self) -> String {
+        match self {
+            Self::Number(n) => n.to_string(),
+            Self::Text(s) => s.clone(),
+        }
+    }
+}
+
+/// True for a PDF by its header, or by its name when the header is missing,
+/// so a damaged one gets a clear error rather than being read as garbage text.
+async fn looks_like_pdf(path: &Path) -> bool {
+    use tokio::io::AsyncReadExt;
+    let named_pdf = path
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("pdf"));
+    let mut head = [0u8; 5];
+    let has_header = match tokio::fs::File::open(path).await {
+        Ok(mut file) => file.read_exact(&mut head).await.is_ok() && &head == b"%PDF-",
+        Err(_) => false,
+    };
+    has_header || named_pdf
+}
+
+async fn read_pdf(
+    path: &Path,
+    shown: &str,
+    pages: Option<&PagesArg>,
+) -> Result<ToolResult, ToolError> {
+    use crate::pdf_read::{
+        DEFAULT_PAGES, MAX_PAGES, MAX_PDF_BYTES, extract, parse_page_range, render,
+    };
+    let size = tokio::fs::metadata(path).await?.len();
+    if size > MAX_PDF_BYTES {
+        return Err(ToolError::Message(format!(
+            "{shown} is {} MB; PDFs over {} MB are not read",
+            size / 1_048_576,
+            MAX_PDF_BYTES / 1_048_576
+        )));
+    }
+    let (first, last) = match pages {
+        Some(spec) => parse_page_range(&spec.spec()).map_err(ToolError::Message)?,
+        None => (1, DEFAULT_PAGES),
+    };
+    let last = last.min(first + MAX_PAGES - 1);
+    let extracted = extract(path, first, last)
+        .await
+        .map_err(|why| ToolError::Message(format!("could not read {shown} as a PDF: {why}")))?;
+    Ok(ToolResult::ok(render(&extracted, first)))
 }
 
 /// Longest prefix of `s` that is at most `max` bytes and ends on a `char`
@@ -215,7 +276,9 @@ impl Tool for ReadFile {
          the part you need -- the whole content of a big file is billed as input tokens on every \
          later turn of the session, so reading 80 relevant lines instead of 1500 is much cheaper \
          and just as useful. `project_map` gives you the line numbers to aim at. Every result \
-         says which lines you got and how many the file has, so you can read on from there."
+         says which lines you got and how many the file has, so you can read on from there. \
+         A PDF is read as text, page by page: pass `pages` (e.g. \"3-9\") to choose pages. A \
+         scanned PDF has no text to read."
     }
     fn schema(&self) -> serde_json::Value {
         obj_schema(
@@ -240,6 +303,13 @@ impl Tool for ReadFile {
                         "description": "how many lines to read from offset. Omit to read to the end.",
                     }),
                 ),
+                (
+                    "pages",
+                    serde_json::json!({
+                        "type": "string",
+                        "description": "PDF only: a page or range such as \"5\" or \"3-9\". Omit to start at page 1.",
+                    }),
+                ),
             ],
             &["path"],
         )
@@ -253,6 +323,9 @@ impl Tool for ReadFile {
                 "{} is a directory, not a file -- use list_dir to see what is in it",
                 a.path
             )));
+        }
+        if looks_like_pdf(&p).await {
+            return read_pdf(&p, &a.path, a.pages.as_ref()).await;
         }
         let bytes = tokio::fs::read(&p).await?;
         let text = String::from_utf8_lossy(&bytes);
@@ -522,6 +595,127 @@ mod read_slice_tests {
 
     fn args(v: serde_json::Value) -> Box<RawValue> {
         RawValue::from_string(v.to_string()).unwrap()
+    }
+
+    /// A PDF made by the `create_pdf` tool, with enough lines to span pages.
+    async fn make_pdf(w: &Workspace, name: &str, paragraphs: usize) {
+        let markdown: String = (1..=paragraphs)
+            .map(|i| format!("Paragraph {i} about photosynthesis in green plants.\n\n"))
+            .collect();
+        std::fs::write(w.root.join("source.md"), markdown).unwrap();
+        crate::pdf::CreatePdf(w.clone())
+            .execute(&args(
+                serde_json::json!({"path": name, "from_file": "source.md", "title": "Notes"}),
+            ))
+            .await
+            .unwrap();
+    }
+
+    async fn read(w: &Workspace, call: serde_json::Value) -> Result<String, String> {
+        ReadFile(w.clone())
+            .execute(&args(call))
+            .await
+            .map(|out| out.summary)
+            .map_err(|e| e.to_string())
+    }
+
+    #[tokio::test]
+    async fn a_pdf_is_read_as_text_with_page_markers_and_a_note() {
+        let w = ws("pdf_text");
+        make_pdf(&w, "notes.pdf", 120).await;
+        let out = read(&w, serde_json::json!({"path": "notes.pdf"}))
+            .await
+            .unwrap();
+        assert!(out.contains("--- page 1 ---"), "{out}");
+        assert!(out.contains("Paragraph 1 about photosynthesis in green plants."));
+        assert!(
+            out.contains("--- page 2 ---"),
+            "a long document spans pages"
+        );
+        assert!(
+            !out.contains('\u{0}') && !out.contains("%PDF"),
+            "no raw bytes"
+        );
+        assert!(
+            out.contains(" of ") && out.trim_end().ends_with(']'),
+            "{out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_pages_argument_picks_pages_and_accepts_a_bare_number() {
+        let w = ws("pdf_pages");
+        make_pdf(&w, "notes.pdf", 200).await;
+        let two = read(&w, serde_json::json!({"path": "notes.pdf", "pages": "2"}))
+            .await
+            .unwrap();
+        assert!(
+            two.contains("--- page 2 ---") && !two.contains("--- page 1 ---"),
+            "{two}"
+        );
+        assert!(two.contains("[pages 2-2 of "), "{two}");
+        assert!(two.contains("read on with pages=\"3\""), "{two}");
+
+        let number = read(&w, serde_json::json!({"path": "notes.pdf", "pages": 2}))
+            .await
+            .unwrap();
+        assert_eq!(number, two, "models often send the page as a number");
+
+        let span = read(&w, serde_json::json!({"path": "notes.pdf", "pages": "1-2"}))
+            .await
+            .unwrap();
+        assert!(span.contains("--- page 1 ---") && span.contains("--- page 2 ---"));
+    }
+
+    #[tokio::test]
+    async fn a_page_past_the_end_and_a_bad_range_are_explained() {
+        let w = ws("pdf_bounds");
+        make_pdf(&w, "notes.pdf", 5).await;
+        let past = read(&w, serde_json::json!({"path": "notes.pdf", "pages": "99"}))
+            .await
+            .unwrap();
+        assert!(
+            past.starts_with("[page 99 is past the end of the PDF"),
+            "{past}"
+        );
+        let bad = read(&w, serde_json::json!({"path": "notes.pdf", "pages": "9-3"}))
+            .await
+            .unwrap_err();
+        assert!(bad.contains("range like 3-9"), "{bad}");
+    }
+
+    #[tokio::test]
+    async fn a_damaged_or_fake_pdf_is_an_error_not_garbage_or_a_crash() {
+        let w = ws("pdf_damaged");
+        make_pdf(&w, "good.pdf", 120).await;
+        let bytes = std::fs::read(w.root.join("good.pdf")).unwrap();
+        std::fs::write(w.root.join("cut.pdf"), &bytes[..bytes.len() / 3]).unwrap();
+        std::fs::write(w.root.join("fake.pdf"), "just some words, not a PDF").unwrap();
+        for name in ["cut.pdf", "fake.pdf"] {
+            match read(&w, serde_json::json!({"path": name})).await {
+                Err(why) => assert!(why.contains("could not read"), "{name}: {why}"),
+                Ok(text) => assert!(
+                    !text.contains('\u{fffd}'),
+                    "{name} returned garbage: {text}"
+                ),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_pdf_is_never_recorded_as_a_text_read() {
+        let w = ws("pdf_readset");
+        make_pdf(&w, "notes.pdf", 5).await;
+        read(&w, serde_json::json!({"path": "notes.pdf"}))
+            .await
+            .unwrap();
+        let resolved = w.resolve("notes.pdf").unwrap();
+        // A recorded file compares its fingerprint against what it is given;
+        // an untracked one never reports stale.
+        assert!(
+            !w.read_set.is_stale(&resolved, "different content"),
+            "extracted text must not be fingerprinted as the file's contents"
+        );
     }
 
     #[tokio::test]

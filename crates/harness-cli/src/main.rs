@@ -265,6 +265,15 @@ enum Command {
     /// src/") without hand-writing shell into config.toml yourself. Run
     /// with no subcommand to list what's available.
     Hooks(HooksArgs),
+    /// Internal: reads PDF text in a separate process so a damaged file can't
+    /// crash a session. Started by `read_file`, not meant to be run by hand.
+    #[command(hide = true, name = "__pdf-worker")]
+    PdfWorker {
+        path: PathBuf,
+        first: usize,
+        last: usize,
+        byte_budget: usize,
+    },
 }
 
 #[derive(Args)]
@@ -629,7 +638,21 @@ fn list_sessions(args: SessionsArgs) -> anyhow::Result<()> {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    if let Ok(exe) = std::env::current_exe() {
+        harness_tools::set_pdf_worker_exe(exe);
+    }
     let result = match cli.command {
+        Command::PdfWorker {
+            path,
+            first,
+            last,
+            byte_budget,
+        } => std::process::exit(harness_tools::run_pdf_worker(
+            &path,
+            first,
+            last,
+            byte_budget,
+        )),
         Command::Activate(args) => run(args).await,
         Command::Review(args) => review::run(args).await,
         Command::Auth(args) => match args.action {
