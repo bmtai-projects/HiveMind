@@ -3,7 +3,9 @@
 //! input only while this module is active.
 
 mod app;
+mod detail;
 mod events;
+mod listview;
 mod render;
 
 use std::io::{self, Stdout};
@@ -16,7 +18,7 @@ use std::time::Duration;
 use anyhow::Context;
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers, MouseEventKind,
+    KeyModifiers, MouseButton, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -27,7 +29,7 @@ use harness_tools::Workspace;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
-use self::app::{App, View};
+use self::app::{App, Panel, View};
 
 pub(crate) use events::TuiBridge;
 
@@ -40,7 +42,34 @@ enum InputEvent {
     Key(KeyEvent),
     Paste(String),
     Wheel { column: u16, row: u16, down: bool },
+    Click { column: u16, row: u16 },
     Resize,
+}
+
+/// Changed files as the agent first saw them, and as they are now on disk.
+struct WorkspaceFiles<'a> {
+    bridge: &'a TuiBridge,
+    workspace: &'a Workspace,
+}
+
+impl WorkspaceFiles<'_> {
+    fn absolute(&self, path: &str) -> PathBuf {
+        // `resolve` matches how the agent keyed its snapshot; a deleted
+        // file's parent may be gone too, hence the plain join fallback.
+        self.workspace
+            .resolve(path)
+            .unwrap_or_else(|_| self.workspace.root.join(path))
+    }
+}
+
+impl app::FileSource for WorkspaceFiles<'_> {
+    fn before(&self, path: &str) -> Option<Option<String>> {
+        self.bridge.baseline(&self.absolute(path))
+    }
+
+    fn now(&self, path: &str) -> Option<String> {
+        std::fs::read_to_string(self.absolute(path)).ok()
+    }
 }
 
 type TuiTerminal = Terminal<CrosstermBackend<Stdout>>;
@@ -98,6 +127,10 @@ pub(crate) async fn run(
                 app.apply(event);
                 redraw = true;
             }
+            app.refresh_file_stats(&WorkspaceFiles {
+                bridge: &bridge,
+                workspace: &workspace,
+            });
             if redraw {
                 terminal.draw(|frame| render::draw(frame, &app))?;
                 redraw = false;
@@ -153,10 +186,17 @@ async fn handle_input(
     workspace: &Workspace,
     interjections: &harness_agent::InterjectionQueue,
 ) -> InputOutcome {
+    let files = WorkspaceFiles { bridge, workspace };
     match input {
         InputEvent::Resize => return InputOutcome::Continue,
         InputEvent::Wheel { column, row, down } => {
             app.scroll_at(column, row, down);
+            return InputOutcome::Continue;
+        }
+        InputEvent::Click { column, row } => {
+            if app.approval.is_none() && !app.palette_visible && app.click_at(column, row) {
+                app.open_focused(&files);
+            }
             return InputOutcome::Continue;
         }
         InputEvent::Paste(text) => {
@@ -213,7 +253,28 @@ async fn handle_input(
                 return InputOutcome::Continue;
             }
 
-            if key.modifiers.contains(KeyModifiers::CONTROL) {
+            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+            if app.detail.is_some() {
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('q') => app.detail = None,
+                    KeyCode::Up => app.scroll_detail(-1),
+                    KeyCode::Down => app.scroll_detail(1),
+                    KeyCode::PageUp => app.page_detail(false),
+                    KeyCode::PageDown => app.page_detail(true),
+                    KeyCode::Home => app.scroll_detail(isize::MIN / 2),
+                    KeyCode::End => app.scroll_detail(isize::MAX / 2),
+                    KeyCode::Left | KeyCode::BackTab => app.step_detail(false, &files),
+                    KeyCode::Right | KeyCode::Tab => app.step_detail(true, &files),
+                    // Ctrl+C still stops a run: close the view and fall through.
+                    KeyCode::Char('c') if ctrl => app.detail = None,
+                    _ => {}
+                }
+                if !(ctrl && key.code == KeyCode::Char('c')) {
+                    return InputOutcome::Continue;
+                }
+            }
+
+            if ctrl {
                 match key.code {
                     KeyCode::Char('c') => {
                         if app.run_state != app::RunState::Idle {
@@ -239,26 +300,19 @@ async fn handle_input(
                     // While typing a command name, Tab completes it.
                     if let Some((name, _)) = app::slash_matches(&app.composer).first() {
                         app.composer = format!("{name} ");
-                    } else if !app.tools.is_empty() {
-                        // Opening details shows the current call first;
-                        // further presses browse, and the list scrolls along.
-                        if app.details_visible {
-                            let backwards = key.code == KeyCode::BackTab
-                                || key.modifiers.contains(KeyModifiers::SHIFT);
-                            app.select_next_tool(backwards);
-                        }
-                        app.details_visible = true;
+                    } else {
+                        let backwards = key.code == KeyCode::BackTab
+                            || key.modifiers.contains(KeyModifiers::SHIFT);
+                        app.cycle_focus(backwards);
                     }
                 }
-                KeyCode::Esc => app.details_visible = false,
-                KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => app.scroll_tools(-1),
-                KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => app.scroll_tools(1),
-                KeyCode::Up => app.scroll_conversation(-app::SCROLL_ROWS),
-                KeyCode::Down => app.scroll_conversation(app::SCROLL_ROWS),
-                KeyCode::PageUp => app.page_conversation(false),
-                KeyCode::PageDown => app.page_conversation(true),
-                KeyCode::Home => app.scroll_conversation_to_top(),
-                KeyCode::End => app.scroll_conversation_to_latest(),
+                KeyCode::Esc => app.focus = Panel::Conversation,
+                KeyCode::Up => app.step_focused(-1),
+                KeyCode::Down => app.step_focused(1),
+                KeyCode::PageUp => app.page_focused(false),
+                KeyCode::PageDown => app.page_focused(true),
+                KeyCode::Home => app.jump_focused(false),
+                KeyCode::End => app.jump_focused(true),
                 KeyCode::Backspace => {
                     app.composer.pop();
                 }
@@ -268,6 +322,7 @@ async fn handle_input(
                 KeyCode::Enter => {
                     let text = app.composer.trim().to_string();
                     if text.is_empty() {
+                        app.open_focused(&files);
                         return InputOutcome::Continue;
                     }
                     if app.run_state != app::RunState::Idle {
@@ -276,7 +331,9 @@ async fn handle_input(
                         return InputOutcome::Continue;
                     }
                     if text.starts_with('/') {
-                        if handle_command(app, controller, &text).await == InputOutcome::Quit {
+                        if handle_command(app, controller, &files, &text).await
+                            == InputOutcome::Quit
+                        {
                             return InputOutcome::Quit;
                         }
                     } else {
@@ -286,7 +343,11 @@ async fn handle_input(
                         let _ = controller.send(ControllerCommand::Run(expanded)).await;
                     }
                 }
-                KeyCode::Char(character) => app.composer.push(character),
+                KeyCode::Char(character) => {
+                    // Typing means writing a message, so arrows return to the conversation.
+                    app.focus = Panel::Conversation;
+                    app.composer.push(character);
+                }
                 _ => {}
             }
         }
@@ -297,6 +358,7 @@ async fn handle_input(
 async fn handle_command(
     app: &mut App,
     controller: &tokio::sync::mpsc::Sender<ControllerCommand>,
+    files: &dyn app::FileSource,
     text: &str,
 ) -> InputOutcome {
     let mut parts = text.split_whitespace();
@@ -310,6 +372,7 @@ async fn handle_command(
                 .collect();
             app.apply(events::UiEvent::Notice(list.join("\n")));
         }
+        "/diff" => app.open_all_changes(files),
         "/work" => app.view = View::Work,
         "/sessions" => app.view = View::Sessions,
         "/reviews" => app.view = View::Reviews,
@@ -507,19 +570,26 @@ fn spawn_input_pump(
                             break;
                         }
                     }
-                    // Only the wheel; pointer moves would flood the queue.
+                    // Wheel and left click only; pointer moves would flood the queue.
                     Ok(Event::Mouse(mouse)) => {
-                        let down = match mouse.kind {
-                            MouseEventKind::ScrollDown => true,
-                            MouseEventKind::ScrollUp => false,
+                        let (column, row) = (mouse.column, mouse.row);
+                        let input = match mouse.kind {
+                            MouseEventKind::ScrollDown => InputEvent::Wheel {
+                                column,
+                                row,
+                                down: true,
+                            },
+                            MouseEventKind::ScrollUp => InputEvent::Wheel {
+                                column,
+                                row,
+                                down: false,
+                            },
+                            MouseEventKind::Down(MouseButton::Left) => {
+                                InputEvent::Click { column, row }
+                            }
                             _ => continue,
                         };
-                        let wheel = InputEvent::Wheel {
-                            column: mouse.column,
-                            row: mouse.row,
-                            down,
-                        };
-                        if sender.blocking_send(wheel).is_err() {
+                        if sender.blocking_send(input).is_err() {
                             break;
                         }
                     }

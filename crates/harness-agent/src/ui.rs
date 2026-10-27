@@ -32,6 +32,9 @@ pub trait Ui: Send + Sync {
     fn reasoning_delta(&self, text: &str);
     fn assistant_done(&self);
     fn tool_call_pending(&self, _name: &str) {}
+    /// A file's contents just before a tool edits it (`None`: it didn't exist).
+    /// The same snapshot `/undo` and `/diff` use, so hosts can show diffs.
+    fn file_snapshot(&self, _path: &std::path::Path, _before: Option<&str>) {}
     fn tool_start(&self, name: &str, args: &str);
     /// Rich lifecycle notification for hosts that can tell concurrent calls
     /// apart. `tool_start` remains the compatibility surface for hosts that

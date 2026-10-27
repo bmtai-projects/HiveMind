@@ -7,6 +7,7 @@ use harness_types::{Message, Role};
 use ratatui::layout::{Position, Rect};
 
 use super::events::UiEvent;
+use super::listview;
 
 const MAX_CONVERSATION_LINES: usize = 4_000;
 const MAX_TOOL_CARDS: usize = 200;
@@ -19,8 +20,47 @@ pub(crate) struct LastLayout {
     pub(crate) conversation_page: usize,
     pub(crate) conversation_max_top: usize,
     pub(crate) tools: Rect,
+    pub(crate) tools_rows: usize,
     pub(crate) tasks: Rect,
     pub(crate) tasks_max_offset: usize,
+    pub(crate) files: Rect,
+    pub(crate) files_rows: usize,
+    pub(crate) sidebar_shown: bool,
+    pub(crate) detail_page: usize,
+    pub(crate) detail_max_scroll: usize,
+}
+
+/// The panel that arrow keys, PgUp/PgDn and Enter act on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Panel {
+    Conversation,
+    Tasks,
+    Tools,
+    Files,
+}
+
+/// Where a changed file's before and current contents come from.
+pub(crate) trait FileSource {
+    /// `None`: no snapshot. `Some(None)`: the file didn't exist before.
+    fn before(&self, path: &str) -> Option<Option<String>>;
+    fn now(&self, path: &str) -> Option<String>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DetailKind {
+    Tool(String),
+    File(usize),
+    Changes,
+}
+
+/// A scrollable view over the body. Diffs are frozen when opened; a tool's
+/// view is rebuilt every frame so a running call fills in.
+#[derive(Debug, Clone)]
+pub(crate) struct Detail {
+    pub(crate) kind: DetailKind,
+    pub(crate) title: String,
+    pub(crate) lines: Vec<ratatui::text::Line<'static>>,
+    pub(crate) scroll: usize,
 }
 
 /// What the footer can honestly say about spend.
@@ -43,6 +83,7 @@ pub(crate) const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/skill", "off  clear the active skill"),
     ("/compact", "summarize older context"),
     ("/undo", "[n]  undo recent turns"),
+    ("/diff", "every change this session"),
     ("/cost", "spend so far"),
     ("/status", "session status"),
     ("/work", "conversation view"),
@@ -182,10 +223,24 @@ pub(crate) fn tool_summary(name: &str, args: &str) -> String {
         .unwrap_or_default()
 }
 
+/// A failed or timed-out call's first non-empty result line.
+pub(crate) fn failure_reason(card: &ToolCard) -> Option<&str> {
+    matches!(card.state, ToolState::Failed | ToolState::TimedOut)
+        .then(|| card.result.lines().map(str::trim).find(|l| !l.is_empty()))
+        .flatten()
+}
+
+/// Rows a tool card takes in the side panel.
+pub(crate) fn tool_card_height(card: &ToolCard) -> usize {
+    2 + usize::from(failure_reason(card).is_some())
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct ChangedFile {
     pub(crate) path: String,
     pub(crate) kind: FileChangeKind,
+    /// Lines added and removed since the session started, when known.
+    pub(crate) stats: Option<(usize, usize)>,
 }
 
 #[derive(Debug, Clone)]
@@ -226,8 +281,9 @@ pub(crate) struct App {
     pub(crate) run_state: RunState,
     pub(crate) view: View,
     pub(crate) sidebar_visible: bool,
-    pub(crate) details_visible: bool,
     pub(crate) palette_visible: bool,
+    pub(crate) focus: Panel,
+    pub(crate) detail: Option<Detail>,
     pub(crate) composer: String,
     pub(crate) conversation: VecDeque<ConversationLine>,
     /// First visible wrapped row; `None` follows the newest output.
@@ -235,7 +291,12 @@ pub(crate) struct App {
     pub(crate) layout: Cell<LastLayout>,
     pub(crate) tools: VecDeque<ToolCard>,
     pub(crate) selected_tool: usize,
+    /// Corrected while drawing so the selection always stays in view.
+    pub(crate) tools_offset: Cell<usize>,
     pub(crate) changed_files: Vec<ChangedFile>,
+    pub(crate) selected_file: usize,
+    pub(crate) files_offset: Cell<usize>,
+    files_dirty: bool,
     pub(crate) todos: Vec<TodoItem>,
     pub(crate) tasks_offset: usize,
     pub(crate) approval: Option<Approval>,
@@ -266,15 +327,20 @@ impl App {
             run_state: RunState::Idle,
             view: View::Work,
             sidebar_visible: true,
-            details_visible: false,
             palette_visible: false,
+            focus: Panel::Conversation,
+            detail: None,
             composer: String::new(),
             conversation: VecDeque::new(),
             conversation_top: None,
             layout: Cell::new(LastLayout::default()),
             tools: VecDeque::new(),
             selected_tool: 0,
+            tools_offset: Cell::new(0),
             changed_files: Vec::new(),
+            selected_file: 0,
+            files_offset: Cell::new(0),
+            files_dirty: false,
             todos: Vec::new(),
             tasks_offset: 0,
             approval: None,
@@ -467,14 +533,245 @@ impl App {
 
     /// Mouse wheel: scrolls whichever panel is under the pointer.
     pub(crate) fn scroll_at(&mut self, column: u16, row: u16, down: bool) {
+        let step: isize = if down { 1 } else { -1 };
+        if self.detail.is_some() {
+            self.scroll_detail(step * SCROLL_ROWS);
+            return;
+        }
         let layout = self.layout.get();
         let pointer = Position::new(column, row);
         if layout.tools.contains(pointer) {
-            self.scroll_tools(if down { 1 } else { -1 });
+            let (offset, selected) = listview::scroll(
+                &self.tool_heights(),
+                self.tools_offset.get(),
+                self.selected_tool,
+                layout.tools_rows,
+                step,
+            );
+            self.tools_offset.set(offset);
+            self.selected_tool = selected;
+        } else if layout.files.contains(pointer) {
+            let (offset, selected) = listview::scroll(
+                &vec![1; self.changed_files.len()],
+                self.files_offset.get(),
+                self.selected_file,
+                layout.files_rows,
+                step,
+            );
+            self.files_offset.set(offset);
+            self.selected_file = selected;
         } else if layout.tasks.contains(pointer) {
-            self.scroll_tasks(if down { 1 } else { -1 });
+            self.scroll_tasks(step);
         } else {
-            self.scroll_conversation(if down { SCROLL_ROWS } else { -SCROLL_ROWS });
+            self.scroll_conversation(step * SCROLL_ROWS);
+        }
+    }
+
+    pub(crate) fn tool_heights(&self) -> Vec<usize> {
+        self.tools.iter().map(tool_card_height).collect()
+    }
+
+    /// Left click: focus the panel there and select its row. True when the
+    /// row was already selected, meaning "open it".
+    pub(crate) fn click_at(&mut self, column: u16, row: u16) -> bool {
+        if self.detail.is_some() {
+            return false;
+        }
+        let layout = self.layout.get();
+        let pointer = Position::new(column, row);
+        let list_row = |area: Rect| row.saturating_sub(area.y + 1) as usize;
+        if layout.tools.contains(pointer) {
+            self.focus = Panel::Tools;
+            let hit = listview::index_at(
+                &self.tool_heights(),
+                self.tools_offset.get(),
+                list_row(layout.tools),
+            );
+            if let Some(index) = hit {
+                let again = index == self.selected_tool;
+                self.selected_tool = index;
+                return again;
+            }
+        } else if layout.files.contains(pointer) {
+            self.focus = Panel::Files;
+            let hit = listview::index_at(
+                &vec![1; self.changed_files.len()],
+                self.files_offset.get(),
+                list_row(layout.files),
+            );
+            if let Some(index) = hit {
+                let again = index == self.selected_file;
+                self.selected_file = index;
+                return again;
+            }
+        } else if layout.tasks.contains(pointer) {
+            self.focus = Panel::Tasks;
+        } else if layout.conversation.contains(pointer) {
+            self.focus = Panel::Conversation;
+        }
+        false
+    }
+
+    /// Tab order. Only the conversation exists while the side panel is hidden.
+    pub(crate) fn cycle_focus(&mut self, backwards: bool) {
+        const ALL: [Panel; 4] = [
+            Panel::Conversation,
+            Panel::Tasks,
+            Panel::Tools,
+            Panel::Files,
+        ];
+        if !self.layout.get().sidebar_shown {
+            self.focus = Panel::Conversation;
+            return;
+        }
+        let at = ALL.iter().position(|p| *p == self.focus).unwrap_or(0);
+        let next = if backwards {
+            at + ALL.len() - 1
+        } else {
+            at + 1
+        };
+        self.focus = ALL[next % ALL.len()];
+    }
+
+    /// One arrow-key step on the focused panel.
+    pub(crate) fn step_focused(&mut self, steps: isize) {
+        match self.focus {
+            Panel::Conversation => self.scroll_conversation(steps * SCROLL_ROWS),
+            Panel::Tasks => self.scroll_tasks(steps),
+            Panel::Tools => self.scroll_tools(steps),
+            Panel::Files => {
+                if let Some(last) = self.changed_files.len().checked_sub(1) {
+                    self.selected_file = self.selected_file.saturating_add_signed(steps).min(last);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn page_focused(&mut self, down: bool) {
+        match self.focus {
+            Panel::Conversation => self.page_conversation(down),
+            _ => self.step_focused(if down { 5 } else { -5 }),
+        }
+    }
+
+    /// Home/End on the focused panel.
+    pub(crate) fn jump_focused(&mut self, to_end: bool) {
+        match (self.focus, to_end) {
+            (Panel::Conversation, true) => self.scroll_conversation_to_latest(),
+            (Panel::Conversation, false) => self.scroll_conversation_to_top(),
+            (_, true) => self.step_focused(isize::MAX / 2),
+            (_, false) => self.step_focused(-(isize::MAX / 2)),
+        }
+    }
+
+    /// Enter on an empty composer: open the focused tool or file.
+    pub(crate) fn open_focused(&mut self, files: &dyn FileSource) {
+        match self.focus {
+            Panel::Tools => self.open_tool(self.selected_tool),
+            Panel::Files => self.open_file(self.selected_file, files),
+            Panel::Conversation | Panel::Tasks => {}
+        }
+    }
+
+    fn open_tool(&mut self, index: usize) {
+        if let Some(card) = self.tools.get(index) {
+            self.selected_tool = index;
+            self.detail = Some(Detail {
+                kind: DetailKind::Tool(card.call_id.clone()),
+                title: String::new(),
+                lines: Vec::new(),
+                scroll: 0,
+            });
+        }
+    }
+
+    fn open_file(&mut self, index: usize, files: &dyn FileSource) {
+        let Some(file) = self.changed_files.get(index) else {
+            return;
+        };
+        self.selected_file = index;
+        self.detail = Some(Detail {
+            kind: DetailKind::File(index),
+            title: format!(" {}{} ", file.path, stats_label(file.stats)),
+            lines: super::detail::file_lines(files.before(&file.path), files.now(&file.path)),
+            scroll: 0,
+        });
+    }
+
+    /// `/diff`: every file this session changed, one after another.
+    pub(crate) fn open_all_changes(&mut self, files: &dyn FileSource) {
+        let entries: Vec<_> = self
+            .changed_files
+            .iter()
+            .map(|f| (f.path.clone(), files.before(&f.path), files.now(&f.path)))
+            .collect();
+        self.detail = Some(Detail {
+            kind: DetailKind::Changes,
+            title: format!(" Changes this session · {} file(s) ", entries.len()),
+            lines: super::detail::changes_lines(&entries),
+            scroll: 0,
+        });
+    }
+
+    /// ←/→ inside a detail view: the previous or next tool or file.
+    pub(crate) fn step_detail(&mut self, forward: bool, files: &dyn FileSource) {
+        let Some(detail) = &self.detail else {
+            return;
+        };
+        let step = |index: usize, len: usize| {
+            if forward {
+                (index + 1 < len).then_some(index + 1)
+            } else {
+                index.checked_sub(1)
+            }
+        };
+        match detail.kind.clone() {
+            DetailKind::Tool(id) => {
+                if let Some(next) = self
+                    .tools
+                    .iter()
+                    .position(|card| card.call_id == id)
+                    .and_then(|index| step(index, self.tools.len()))
+                {
+                    self.open_tool(next);
+                }
+            }
+            DetailKind::File(index) => {
+                if let Some(next) = step(index, self.changed_files.len()) {
+                    self.open_file(next, files);
+                }
+            }
+            DetailKind::Changes => {}
+        }
+    }
+
+    pub(crate) fn scroll_detail(&mut self, rows: isize) {
+        let max = self.layout.get().detail_max_scroll;
+        if let Some(detail) = &mut self.detail {
+            detail.scroll = detail.scroll.min(max).saturating_add_signed(rows).min(max);
+        }
+    }
+
+    pub(crate) fn page_detail(&mut self, down: bool) {
+        let page = self.layout.get().detail_page.saturating_sub(1).max(1) as isize;
+        self.scroll_detail(if down { page } else { -page });
+    }
+
+    /// Recounts each changed file's +/− lines. Cheap: the diff is size-capped.
+    pub(crate) fn refresh_file_stats(&mut self, files: &dyn FileSource) {
+        if !std::mem::take(&mut self.files_dirty) {
+            return;
+        }
+        for file in &mut self.changed_files {
+            file.stats = match (files.before(&file.path), files.now(&file.path)) {
+                (Some(Some(before)), Some(now)) => {
+                    let stats = crate::diff::stats(&crate::diff::diff(&before, &now));
+                    Some((stats.added, stats.removed))
+                }
+                (Some(None), Some(now)) => Some((now.lines().count(), 0)),
+                (Some(Some(before)), None) => Some((0, before.lines().count())),
+                _ => None,
+            };
         }
     }
 
@@ -505,20 +802,6 @@ impl App {
         let command = approval.command.lines().next().unwrap_or_default();
         self.push_notice(format!("{verdict}: {command}"));
         Some(approval.request_id)
-    }
-
-    pub(crate) fn select_next_tool(&mut self, backwards: bool) {
-        if self.tools.is_empty() {
-            return;
-        }
-        if backwards {
-            self.selected_tool = self
-                .selected_tool
-                .checked_sub(1)
-                .unwrap_or(self.tools.len() - 1);
-        } else {
-            self.selected_tool = (self.selected_tool + 1) % self.tools.len();
-        }
     }
 
     pub(crate) fn clear_local_conversation(&mut self) {
@@ -616,8 +899,10 @@ impl App {
                 self.changed_files.push(ChangedFile {
                     path: change.path,
                     kind: change.kind,
+                    stats: None,
                 });
             }
+            self.files_dirty = true;
         }
     }
 
@@ -638,8 +923,17 @@ impl App {
             self.tools.pop_front();
             // Keep pointing at the same card after the front shifts away.
             self.selected_tool = self.selected_tool.saturating_sub(1);
+            self.tools_offset
+                .set(self.tools_offset.get().saturating_sub(1));
         }
     }
+}
+
+/// "  +12 −3" for a title, or nothing when the counts are unknown.
+pub(crate) fn stats_label(stats: Option<(usize, usize)>) -> String {
+    stats.map_or(String::new(), |(added, removed)| {
+        format!("  +{added} −{removed}")
+    })
 }
 
 fn tool_state(status: ToolStatus) -> ToolState {

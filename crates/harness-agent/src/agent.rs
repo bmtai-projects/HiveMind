@@ -1023,7 +1023,11 @@ impl Agent {
     /// downstream doesn't need to know hooks exist). `PostToolUse` hooks
     /// run after, observationally, for calls that actually executed.
     async fn dispatch_and_record(&mut self, calls: Vec<ToolCall>, checkpoint: &mut Checkpoint) {
+        let known = checkpoint.snapshot_count();
         checkpoint.capture(&self.workspace, &calls).await;
+        for (path, before) in checkpoint.snapshots_since(known) {
+            self.ui.file_snapshot(path, before);
+        }
         let mut first_tool_traced = false;
         for call in &calls {
             if let Some(t) = &self.tracer
