@@ -597,6 +597,7 @@ mod read_slice_tests {
         RawValue::from_string(v.to_string()).unwrap()
     }
 
+    #[cfg(feature = "pdf")]
     /// A PDF made by the `create_pdf` tool, with enough lines to span pages.
     async fn make_pdf(w: &Workspace, name: &str, paragraphs: usize) {
         let markdown: String = (1..=paragraphs)
@@ -611,6 +612,7 @@ mod read_slice_tests {
             .unwrap();
     }
 
+    #[cfg(feature = "pdf")]
     async fn read(w: &Workspace, call: serde_json::Value) -> Result<String, String> {
         ReadFile(w.clone())
             .execute(&args(call))
@@ -619,6 +621,7 @@ mod read_slice_tests {
             .map_err(|e| e.to_string())
     }
 
+    #[cfg(feature = "pdf")]
     #[tokio::test]
     async fn a_pdf_is_read_as_text_with_page_markers_and_a_note() {
         let w = ws("pdf_text");
@@ -642,6 +645,7 @@ mod read_slice_tests {
         );
     }
 
+    #[cfg(feature = "pdf")]
     #[tokio::test]
     async fn the_pages_argument_picks_pages_and_accepts_a_bare_number() {
         let w = ws("pdf_pages");
@@ -667,6 +671,7 @@ mod read_slice_tests {
         assert!(span.contains("--- page 1 ---") && span.contains("--- page 2 ---"));
     }
 
+    #[cfg(feature = "pdf")]
     #[tokio::test]
     async fn a_page_past_the_end_and_a_bad_range_are_explained() {
         let w = ws("pdf_bounds");
@@ -684,6 +689,7 @@ mod read_slice_tests {
         assert!(bad.contains("range like 3-9"), "{bad}");
     }
 
+    #[cfg(feature = "pdf")]
     #[tokio::test]
     async fn a_damaged_or_fake_pdf_is_an_error_not_garbage_or_a_crash() {
         let w = ws("pdf_damaged");
@@ -702,6 +708,24 @@ mod read_slice_tests {
         }
     }
 
+    #[cfg(not(feature = "pdf"))]
+    #[tokio::test]
+    async fn a_build_without_pdf_support_says_so_instead_of_returning_garbage() {
+        let w = ws("pdf_not_built");
+        std::fs::write(w.root.join("book.pdf"), b"%PDF-1.4\n\x00\xff binary \x80").unwrap();
+        let err = ReadFile(w.clone())
+            .execute(&args(serde_json::json!({"path": "book.pdf"})))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("does not include PDF reading"), "{err}");
+        assert!(
+            err.contains("Tell the user"),
+            "the model needs the next step: {err}"
+        );
+    }
+
+    #[cfg(feature = "pdf")]
     #[tokio::test]
     async fn a_pdf_is_never_recorded_as_a_text_read() {
         let w = ws("pdf_readset");

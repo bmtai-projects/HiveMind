@@ -60,9 +60,23 @@ pub fn run_worker(path: &Path, first: usize, last: usize, byte_budget: usize) ->
     }
 }
 
+const NOT_BUILT: &str = "this build of HiveMind does not include PDF reading. Tell the user, and ask \
+                         for the text or a link instead";
+
+#[cfg(not(feature = "pdf"))]
+pub(crate) fn extract_in_process(
+    _path: &Path,
+    _first: usize,
+    _last: usize,
+    _byte_budget: usize,
+) -> Result<PdfExtract, String> {
+    Err(NOT_BUILT.into())
+}
+
 /// Reads pages `first..=last` (1-based), stopping early once `byte_budget`
 /// is spent. The first page is always included, so one dense page can't
 /// stall a read.
+#[cfg(feature = "pdf")]
 pub(crate) fn extract_in_process(
     path: &Path,
     first: usize,
@@ -95,6 +109,9 @@ pub(crate) fn extract_in_process(
 }
 
 pub(crate) async fn extract(path: &Path, first: usize, last: usize) -> Result<PdfExtract, String> {
+    if !cfg!(feature = "pdf") {
+        return Err(NOT_BUILT.into());
+    }
     let budget = crate::fs::MAX_READ_BYTES;
     match WORKER.get() {
         Some(exe) => run_child(exe, path, first, last, budget).await,
@@ -307,6 +324,7 @@ mod tests {
         assert!(err.contains("could not start"), "{err}");
     }
 
+    #[cfg(feature = "pdf")]
     #[test]
     fn garbage_and_missing_files_are_errors_not_crashes() {
         let dir = std::env::temp_dir().join(format!("hivemind_pdf_garbage_{}", std::process::id()));

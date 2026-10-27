@@ -1,4 +1,5 @@
 //! `read_file` on a PDF, through the real `hivemind __pdf-worker` child process.
+#![cfg(feature = "pdf")]
 
 use harness_tools::{CreatePdf, ReadFile, Tool, Workspace};
 use serde_json::value::RawValue;

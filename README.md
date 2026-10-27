@@ -149,7 +149,7 @@ hand a file to the model directly.
 
 | Tool | What it does |
 |---|---|
-| `read_file`, `list_dir`, `project_map` | Look at files and the shape of the project. `read_file` also reads the text of a PDF, a few pages at a time (not scanned PDFs, which have no text to read). |
+| `read_file`, `list_dir`, `project_map` | Look at files and the shape of the project. With `--features pdf` at build time, `read_file` also reads the text of a PDF, a few pages at a time (not scanned PDFs, which have no text to read). The official downloads do not include this yet. |
 | `search` | Find exact text |
 | `semantic_search` | Find code by meaning. Runs locally. |
 | `read_program` | Several read-only lookups in one step (turned off if you have hooks configured) |
