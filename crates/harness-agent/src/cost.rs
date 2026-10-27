@@ -11,6 +11,12 @@ pub fn estimate_cost_usd(usage: &Usage, model_id: &str, backend: Backend) -> Opt
     if !backend.is_billed() {
         return None;
     }
+    // Hosted ignores it: the proxy's upstream charge excludes our markup.
+    if backend == Backend::Byok
+        && let Some(cost) = usage.reported_cost_usd
+    {
+        return Some(cost);
+    }
     let pricing = lookup_model(model_id)?.wholesale_pricing;
     let miss = usage.cache_miss_tokens.unwrap_or(usage.prompt_tokens) as f64;
     let hit = usage.cache_hit_tokens.unwrap_or(0) as f64;
@@ -35,9 +41,30 @@ mod tests {
             prompt_tokens: prompt,
             completion_tokens: completion,
             total_tokens: prompt + completion,
-            cache_hit_tokens: None,
-            cache_miss_tokens: None,
+            ..Usage::default()
         }
+    }
+
+    #[test]
+    fn a_byok_providers_reported_cost_wins_even_for_an_unlisted_model() {
+        let reported = Usage {
+            reported_cost_usd: Some(0.0042),
+            ..usage(5_000, 100)
+        };
+        assert_eq!(
+            estimate_cost_usd(&reported, "deepseek/deepseek-v4-flash", Backend::Byok),
+            Some(0.0042)
+        );
+    }
+
+    #[test]
+    fn hosted_ignores_the_upstream_reported_cost() {
+        let reported = Usage {
+            reported_cost_usd: Some(9.0),
+            ..usage(1_000_000, 0)
+        };
+        let hosted = estimate_cost_usd(&reported, "hivemind", Backend::Hosted).unwrap();
+        assert!((hosted - 0.0826 * harness_config::HOSTED_MARKUP_MULTIPLIER).abs() < 1e-9);
     }
 
     #[test]

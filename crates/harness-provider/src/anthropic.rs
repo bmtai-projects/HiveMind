@@ -305,6 +305,7 @@ impl AnthropicClient {
             total_tokens: cache_hit + cache_miss + output_tokens,
             cache_hit_tokens: Some(cache_hit),
             cache_miss_tokens: Some(cache_miss),
+            reported_cost_usd: None,
         };
 
         let response = ChatResponse {

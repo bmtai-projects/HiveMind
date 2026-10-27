@@ -254,6 +254,7 @@ impl ChatClient {
                         total_tokens: u.total_tokens,
                         cache_hit_tokens: u.cache_hit_tokens(),
                         cache_miss_tokens: u.cache_miss_tokens(),
+                        reported_cost_usd: u.cost,
                     };
                 }
 
