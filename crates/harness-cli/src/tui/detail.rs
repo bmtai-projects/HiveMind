@@ -35,15 +35,23 @@ pub(crate) fn render_detail(frame: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(ACCENT),
             ),
         },
-        DetailKind::File(_) | DetailKind::Changes => (
+        // Rebuilt every frame so a running request keeps filling in.
+        DetailKind::Transcript => (
+            detail.title.clone(),
+            super::render::conversation_lines(app, true),
+            Style::default().fg(ACCENT),
+        ),
+        DetailKind::File(_) | DetailKind::Changes | DetailKind::Help => (
             detail.title.clone(),
             detail.lines.clone(),
             Style::default().fg(ACCENT),
         ),
     };
     let hint = match detail.kind {
-        DetailKind::Changes => " ↑↓ PgUp PgDn scroll · Esc close ",
-        _ => " ↑↓ PgUp PgDn scroll · ←→ previous/next · Esc close ",
+        DetailKind::Tool(_) | DetailKind::File(_) => {
+            " ↑↓ PgUp PgDn scroll · ←→ previous/next · Esc close "
+        }
+        _ => " ↑↓ PgUp PgDn scroll · Esc close ",
     };
     let block = boxed(title).border_style(border).title_bottom(hint);
     let inner = block.inner(area);
@@ -203,6 +211,75 @@ pub(crate) fn changes_lines(files: &[FileVersions]) -> Vec<Line<'static>> {
         ]));
         out.extend(file_lines(before.clone(), now.clone()));
         out.push(Line::raw(""));
+    }
+    out
+}
+
+/// Every key and command, grouped by what you're trying to do.
+pub(crate) fn help_lines() -> Vec<Line<'static>> {
+    const KEYS: &[(&str, &[(&str, &str)])] = &[
+        (
+            "Moving around",
+            &[
+                ("Tab / Shift+Tab", "next / previous panel"),
+                (
+                    "↑ ↓  PgUp PgDn",
+                    "scroll the focused panel, or move its selection",
+                ),
+                ("Home / End", "top / latest"),
+                ("Mouse wheel", "scrolls the panel under the pointer"),
+                (
+                    "Click",
+                    "focus a panel; click a selected row again to open it",
+                ),
+            ],
+        ),
+        (
+            "Looking closer",
+            &[
+                ("Enter", "open the selected tool call or changed file"),
+                ("← →", "previous / next item in an open view"),
+                (
+                    "Ctrl+O",
+                    "transcript: everything so far, tool calls expanded",
+                ),
+                ("Esc", "close a view, leave a panel, or stop a run"),
+            ],
+        ),
+        (
+            "Writing and running",
+            &[
+                ("Enter", "send  ·  Shift+Enter for a new line"),
+                ("Ctrl+C", "stop the run, or clear the message box"),
+                ("Ctrl+L", "clear the screen  ·  Ctrl+S hide the side panel"),
+                ("Ctrl+D", "quit"),
+            ],
+        ),
+        (
+            "Copying",
+            &[
+                ("Shift+drag", "select text (Option+drag in iTerm2)"),
+                ("/copy", "copy the last reply to the clipboard"),
+            ],
+        ),
+    ];
+    let mut out = Vec::new();
+    for (group, keys) in KEYS {
+        out.push(heading(group));
+        for (key, what) in *keys {
+            out.push(Line::from(vec![
+                Span::styled(format!("  {key:<18}"), Style::default().fg(ACCENT)),
+                Span::raw(what.to_string()),
+            ]));
+        }
+        out.push(Line::raw(""));
+    }
+    out.push(heading("Commands"));
+    for (name, what) in super::app::SLASH_COMMANDS {
+        out.push(Line::from(vec![
+            Span::styled(format!("  {name:<18}"), Style::default().fg(ACCENT)),
+            Span::raw(what.to_string()),
+        ]));
     }
     out
 }

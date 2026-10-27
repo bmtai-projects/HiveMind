@@ -182,16 +182,26 @@ hand a file to the model directly.
 that don't get along with raw mode (some SSH setups, unusual multiplexers).
 Neither can be combined with `--protocol json` or headless `--prompt`.
 
-The screen shows the live conversation, the model's `todo_write` checklist,
-individual tool calls, changed files, real usage, and saved sessions and
-reviews. Shell commands use the same approval policy as the plain REPL: a
-panel shows the exact command, and `[Y]`/`[N]` approves or denies it.
+The screen shows the conversation with each tool call in place, the model's
+`todo_write` checklist, every tool call, changed files with their `+/−` line
+counts, the provider and model, and session tokens and cost. Shell commands
+use the same approval policy as the plain REPL: a panel shows the exact
+command, and `[Y]`/`[N]` approves or denies it.
 
-Useful keys: `Enter` sends, `Shift+Enter` adds a line, `Ctrl+C` interrupts,
-`Ctrl+L` clears the local display, `Ctrl+S` toggles the side panel, `Tab`
-opens a tool's details, `F1`/`F2`/`F3` switch Work/Sessions/Reviews, and
-`Ctrl+P` opens the command palette. The same slash commands as the plain
-REPL work here too.
+Useful keys:
+
+- `Enter` sends a message; `Shift+Enter` adds a line.
+- `Tab` moves between panels, and `↑`/`↓`, `PgUp`/`PgDn` and the mouse wheel
+  scroll them.
+- `Enter` on a tool call or a changed file opens its full result or its diff.
+  `Ctrl+O` (or `/transcript`) shows everything with tool calls expanded, and
+  `/diff` shows every change this session.
+- `Esc` stops a run, `Ctrl+C` interrupts or clears the message box, and `?`
+  lists every key.
+
+The same slash commands as the plain REPL work here too, plus `/copy` to copy
+the last reply. The interface captures the mouse so the wheel can scroll each
+panel, so select text with `Shift`+drag (`Option`+drag in iTerm2).
 
 **For editors and other tools**
 
