@@ -7,6 +7,7 @@ mod detail;
 mod events;
 mod listview;
 mod markdown;
+mod picks;
 mod render;
 
 use std::io::{self, Stdout};
@@ -340,6 +341,8 @@ async fn handle_input(
                     KeyCode::Char('c') if ctrl => app.close_picker(),
                     KeyCode::Up => picker.move_by(-1),
                     KeyCode::Down => picker.move_by(1),
+                    KeyCode::Left | KeyCode::BackTab => picker.next_view(false),
+                    KeyCode::Right | KeyCode::Tab => picker.next_view(true),
                     KeyCode::PageUp => picker.move_by(-page),
                     KeyCode::PageDown => picker.move_by(page),
                     KeyCode::Home => picker.move_by(isize::MIN / 2),
@@ -591,13 +594,22 @@ async fn load_models_once(agent: &mut Agent) {
     }
 }
 
-fn model_choice(model: &harness_agent::RemoteModel) -> events::ModelChoice {
+fn model_choice(model: &harness_agent::RemoteModel, popular: &[String]) -> events::ModelChoice {
     events::ModelChoice {
         id: model.id.clone(),
         name: model.name.clone(),
         context_window: model.context_window,
         input_per_m: model.input_per_m,
         output_per_m: model.output_per_m,
+        created: model.created,
+        supports_tools: model.supports_tools,
+        text_output: model.text_output,
+        intelligence: model.intelligence,
+        thinks: model
+            .reasoning_efforts
+            .as_ref()
+            .is_some_and(|e| !e.is_empty()),
+        popular_rank: popular.iter().position(|id| *id == model.id),
     }
 }
 
@@ -615,6 +627,8 @@ fn catalog_choices() -> Vec<events::ModelChoice> {
             output_per_m: Some(
                 entry.wholesale_pricing.output_per_m * harness_config::HOSTED_MARKUP_MULTIPLIER,
             ),
+            thinks: !entry.reasoning_efforts.is_empty(),
+            ..events::ModelChoice::default()
         })
         .collect()
 }
@@ -687,7 +701,14 @@ async fn agent_controller(
                     agent
                         .refresh_models()
                         .await
-                        .map(|_| agent.listed_models().iter().map(model_choice).collect())
+                        .map(|_| {
+                            let popular = agent.popular_ids();
+                            agent
+                                .listed_models()
+                                .iter()
+                                .map(|model| model_choice(model, popular))
+                                .collect()
+                        })
                         .map_err(|why| friendly_models_error(&why))
                 };
                 bridge.model_choices(current, result);
@@ -995,6 +1016,82 @@ mod lifecycle_tests {
         assert!(
             k.rx.try_recv().is_err(),
             "cancelling sends nothing to the agent"
+        );
+    }
+
+    /// Twenty models the provider scores, so the ranked views exist.
+    fn ranked_models() -> events::UiEvent {
+        let choices = (0..20)
+            .map(|i| events::ModelChoice {
+                id: format!("v/m{i:02}"),
+                context_window: Some(1_000_000),
+                input_per_m: Some(0.5 + f64::from(i) * 0.1),
+                output_per_m: Some(2.0),
+                supports_tools: Some(true),
+                text_output: Some(true),
+                // m19 is the smartest, m00 the weakest.
+                intelligence: Some(10.0 + f64::from(i) * 2.0),
+                created: Some(1_000 + i64::from(i)),
+                ..events::ModelChoice::default()
+            })
+            .collect();
+        events::UiEvent::ModelChoices {
+            current: "v/m00".into(),
+            result: Ok(choices),
+        }
+    }
+
+    #[tokio::test]
+    async fn tab_and_the_arrows_switch_views_and_a_ranked_row_can_be_chosen() {
+        let mut k = Keys::new("v/m00");
+        k.type_text("/model").await;
+        k.press(KeyCode::Enter).await;
+        let _ = k.rx.try_recv();
+        k.app.apply(ranked_models());
+        assert_eq!(k.app.picker.as_ref().unwrap().view, app::ModelView::Top);
+
+        k.press(KeyCode::Tab).await;
+        assert_eq!(
+            k.app.picker.as_ref().unwrap().view,
+            app::ModelView::Smartest
+        );
+        k.press(KeyCode::Right).await;
+        assert_eq!(
+            k.app.picker.as_ref().unwrap().view,
+            app::ModelView::Cheapest
+        );
+        k.press(KeyCode::Left).await;
+        k.press(KeyCode::BackTab).await;
+        assert_eq!(k.app.picker.as_ref().unwrap().view, app::ModelView::Top);
+
+        k.press(KeyCode::Tab).await;
+        // Row 0 is the model in use, then the smartest, then the next smartest.
+        k.press(KeyCode::Down).await;
+        k.press(KeyCode::Down).await;
+        k.press(KeyCode::Enter).await;
+        assert!(
+            matches!(k.rx.try_recv(), Ok(ControllerCommand::SetModel(id)) if id == "v/m18"),
+            "the second smartest model"
+        );
+        assert_eq!(k.app.model, "v/m18");
+    }
+
+    #[tokio::test]
+    async fn typing_in_a_ranked_view_searches_all_models_instead() {
+        let mut k = Keys::new("v/m00");
+        k.type_text("/model").await;
+        k.press(KeyCode::Enter).await;
+        k.app.apply(ranked_models());
+        k.type_text("m07").await;
+        let picker = k.app.picker.as_ref().unwrap();
+        assert_eq!(picker.view, app::ModelView::All);
+        assert_eq!(picker.filter, "m07");
+        assert_eq!(picker.chosen().unwrap().value, "v/m07");
+        k.press(KeyCode::Tab).await;
+        assert_eq!(
+            k.app.picker.as_ref().unwrap().view,
+            app::ModelView::Top,
+            "Tab still moves on from the search view"
         );
     }
 

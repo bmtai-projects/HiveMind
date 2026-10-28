@@ -188,6 +188,8 @@ pub struct Agent {
     /// The provider's own list of models, once asked for. Empty until then.
     listed_models: Vec<RemoteModel>,
     models_loaded: bool,
+    /// Ids the provider ranks as most used for programming, best first.
+    popular_ids: Vec<String>,
     /// The list described reasoning for at least one model.
     list_reports_reasoning: bool,
     reasoning_effort: Option<String>,
@@ -331,6 +333,7 @@ impl Agent {
             backend: resolved.backend,
             listed_models: Vec::new(),
             models_loaded: false,
+            popular_ids: Vec::new(),
             list_reports_reasoning: false,
             reasoning_effort: resolved.reasoning_effort,
             budget_usd: resolved.budget_usd,
@@ -509,6 +512,12 @@ impl Agent {
         &self.listed_models
     }
 
+    /// Model ids the provider ranks as most used for programming, best first.
+    /// Empty when it keeps no such ranking.
+    pub fn popular_ids(&self) -> &[String] {
+        &self.popular_ids
+    }
+
     /// Ask the provider which models it offers, and remember the answer.
     /// Hosted sessions use the built-in catalog and make no request. A
     /// failure is not remembered, so the next call tries again.
@@ -516,10 +525,15 @@ impl Agent {
         if self.backend.is_hosted() {
             return Ok(0);
         }
-        let models = self.client.list_models().await.map_err(|e| e.to_string())?;
+        let (models, popular) = tokio::join!(self.client.list_models(), self.client.list_popular());
+        let models = models.map_err(|e| e.to_string())?;
         self.list_reports_reasoning = models.iter().any(|m| m.reasoning_efforts.is_some());
         self.models_loaded = true;
         self.listed_models = models;
+        // The ranking is a bonus: without it the list is still complete.
+        self.popular_ids = popular
+            .map(|ranked| ranked.into_iter().map(|m| m.id).collect())
+            .unwrap_or_default();
         Ok(self.listed_models.len())
     }
 

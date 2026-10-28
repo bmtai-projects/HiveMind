@@ -201,9 +201,19 @@ Useful keys:
 
 The same slash commands as the plain REPL work here too, plus `/copy` to copy
 the last reply. `/model` and `/reasoning` open a list: `↑`/`↓` to move, `Enter`
-to choose, `Esc` to cancel, and type to filter the models. With your own key the
-model list comes from your provider when it publishes one. OpenRouter also says
-which reasoning levels each model accepts, size and price included. Where a
+to choose, `Esc` to cancel. With your own key the model list comes from your
+provider when it publishes one.
+
+When the provider publishes benchmark scores (OpenRouter does), `/model` opens
+on **Top 5**, five good starting points with a tag saying why each is there
+(Smartest, Best value, Popular for coding, and so on). `Tab` or `←`/`→` switch
+to **Smartest**, **Cheapest**, **Context** (largest window), **Popular** or
+**All**. Each row shows a cost tier (`$` to `$$$$`), the price per 1M tokens
+(input/output), the context size, the score, and whether the model thinks.
+Typing jumps to **All** and filters it. Models without a score appear only
+under Popular and All. The model you're using always stays at the top.
+
+OpenRouter also says which reasoning levels each model accepts. Where a
 provider doesn't say, `/reasoning` offers `low`, `medium` and `high`, marked as
 unverified, and sends your choice as-is. You can still type `/model <id>` or
 `/reasoning <level>` directly.

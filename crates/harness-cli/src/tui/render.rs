@@ -8,8 +8,8 @@ use ratatui::widgets::{
 };
 
 use super::app::{
-    App, ConversationKind, CostStatus, Panel, PickerKind, RunState, TodoState, ToolCard, ToolState,
-    View, failure_reason, slash_matches, tool_verb,
+    App, ConversationKind, CostStatus, ModelView, Panel, PickerKind, RunState, TodoState, ToolCard,
+    ToolState, View, failure_reason, slash_matches, tool_verb,
 };
 use super::{listview, markdown};
 
@@ -841,17 +841,36 @@ fn render_picker(frame: &mut Frame, app: &App) {
         return;
     };
     let area = frame.area();
-    let rows_wanted = picker.items.len().clamp(3, 14) as u16;
-    let note_rows = picker.note.as_ref().map_or(0, |note| {
-        let width = (area.width * 72 / 100).saturating_sub(4).max(10) as usize;
-        wrap_rows(note, width).len().min(3) as u16
-    });
-    let filter_row = u16::from(picker.kind == PickerKind::Model);
-    let height = (rows_wanted + note_rows + filter_row + 2).min(area.height);
+    let text_width = (area.width * 72 / 100).saturating_sub(4).max(10) as usize;
+    let with_tabs = picker.kind == PickerKind::Model && !picker.loading && picker.views.len() > 1;
+    let note_rows = picker
+        .note
+        .as_ref()
+        .map_or(0, |note| wrap_rows(note, text_width).len().min(3) as u16);
+    let blurb_rows = if with_tabs {
+        wrap_rows(picker.view.blurb(), text_width).len().min(2) as u16
+    } else {
+        0
+    };
+    let tabs_rows = u16::from(with_tabs);
+    let filter_row = u16::from(
+        picker.kind == PickerKind::Model && !picker.loading && picker.view == ModelView::All,
+    );
+    // A stable height with tabs, so switching views doesn't make the window jump.
+    let rows_wanted = if with_tabs {
+        14
+    } else {
+        picker.items.len().clamp(3, 14) as u16
+    };
+    let height =
+        (rows_wanted + note_rows + tabs_rows + blurb_rows + filter_row + 2).min(area.height);
     let rect = centered_rect(72, height, area);
-    let hint = match picker.kind {
-        PickerKind::Model => " ↑↓ choose · Enter select · type to filter · Esc cancel ",
-        PickerKind::Reasoning => " ↑↓ choose · Enter select · Esc cancel ",
+    let hint = match (picker.kind, with_tabs) {
+        (PickerKind::Model, true) => {
+            " ←→ view · ↑↓ choose · Enter select · type to search · Esc cancel "
+        }
+        (PickerKind::Model, false) => " ↑↓ choose · Enter select · type to filter · Esc cancel ",
+        (PickerKind::Reasoning, _) => " ↑↓ choose · Enter select · Esc cancel ",
     };
     frame.render_widget(Clear, rect);
     let block = boxed(picker.title.clone())
@@ -864,6 +883,8 @@ fn render_picker(frame: &mut Frame, app: &App) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(note_rows),
+            Constraint::Length(tabs_rows),
+            Constraint::Length(blurb_rows),
             Constraint::Length(filter_row),
             Constraint::Min(1),
         ])
@@ -876,11 +897,40 @@ fn render_picker(frame: &mut Frame, app: &App) {
             parts[0],
         );
     }
+    if with_tabs {
+        let mut tabs: Vec<Span<'static>> = Vec::new();
+        for view in &picker.views {
+            let label = if *view == ModelView::All {
+                format!(" All {} ", picker.items.len())
+            } else {
+                format!(" {} ", view.label())
+            };
+            tabs.push(Span::styled(
+                label,
+                if *view == picker.view {
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(ACCENT)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(MUTED)
+                },
+            ));
+            tabs.push(Span::raw(" "));
+        }
+        frame.render_widget(Paragraph::new(Line::from(tabs)), parts[1]);
+        frame.render_widget(
+            Paragraph::new(picker.view.blurb())
+                .style(Style::default().fg(MUTED))
+                .wrap(Wrap { trim: true }),
+            parts[2],
+        );
+    }
     if filter_row == 1 {
         let shown = picker.visible().len();
         frame.render_widget(
             Paragraph::new(Line::from(vec![
-                Span::styled("Filter: ", Style::default().fg(MUTED)),
+                Span::styled("Search: ", Style::default().fg(MUTED)),
                 Span::raw(picker.filter.clone()),
                 Span::styled("▌", Style::default().fg(ACCENT)),
                 Span::styled(
@@ -888,11 +938,11 @@ fn render_picker(frame: &mut Frame, app: &App) {
                     Style::default().fg(MUTED),
                 ),
             ])),
-            parts[1],
+            parts[3],
         );
     }
 
-    let list_area = parts[2];
+    let list_area = parts[4];
     let mut layout = app.layout.get();
     layout.picker = rect;
     layout.picker_list = list_area;
@@ -917,24 +967,39 @@ fn render_picker(frame: &mut Frame, app: &App) {
         .map(|&i| display_width(&picker.items[i].label))
         .max()
         .unwrap_or(0)
-        .min(width / 2);
+        .min(width / 3);
+    let tags_width = visible
+        .iter()
+        .map(|&i| display_width(&picker.items[i].tags.join(" · ")))
+        .max()
+        .unwrap_or(0)
+        .min(width / 3);
     let items: Vec<ListItem<'static>> = visible
         .iter()
         .map(|&index| {
             let item = &picker.items[index];
             let marker = if item.current { "● " } else { "  " };
             let label = shorten(&item.label, label_width);
-            let pad = " ".repeat(label_width.saturating_sub(display_width(&label)) + 2);
-            let detail_room = width.saturating_sub(2 + label_width + 2 + 2);
-            ListItem::new(Line::from(vec![
+            let tags = shorten(&item.tags.join(" · "), tags_width);
+            let detail_room = width.saturating_sub(2 + label_width + 2 + tags_width + 2);
+            let mut spans = vec![
                 Span::styled(marker, Style::default().fg(GREEN)),
-                Span::styled(label, Style::default().add_modifier(Modifier::BOLD)),
-                Span::raw(pad),
                 Span::styled(
-                    shorten(&item.detail, detail_room),
-                    Style::default().fg(MUTED),
+                    format!("{label:<label_width$}  "),
+                    Style::default().add_modifier(Modifier::BOLD),
                 ),
-            ]))
+            ];
+            if tags_width > 0 {
+                spans.push(Span::styled(
+                    format!("{tags:<tags_width$}  "),
+                    Style::default().fg(YELLOW),
+                ));
+            }
+            spans.push(Span::styled(
+                shorten(&item.detail, detail_room),
+                Style::default().fg(MUTED),
+            ));
+            ListItem::new(Line::from(spans))
         })
         .collect();
     let rows = list_area.height as usize;
@@ -991,8 +1056,8 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
-    use super::super::app::PickerChoice;
     use super::super::app::{DetailKind, FileSource};
+    use super::super::app::{ModelView, PickerChoice};
     use super::super::events::{ModelChoice, UiEvent};
     use super::*;
 
@@ -1658,6 +1723,7 @@ mod tests {
             context_window: window,
             input_per_m: prices.map(|p| p.0),
             output_per_m: prices.map(|p| p.1),
+            ..ModelChoice::default()
         }
     }
 
@@ -1735,11 +1801,15 @@ mod tests {
             "the model in use is marked: {text}"
         );
         assert!(
-            text.contains("1M ctx") && text.contains("$0.14 in / $0.28 out per 1M"),
-            "{text}"
+            text.contains("1M ctx") && text.contains("$ $0.14/$0.28"),
+            "a cheap model shows one dollar sign and its prices: {text}"
+        );
+        assert!(
+            text.contains("$$$ $3.00/$15.00"),
+            "a dearer one shows three: {text}"
         );
         assert!(text.contains("anthropic/claude-sonnet-5") && text.contains("tiny/model"));
-        assert!(text.contains("Filter:") && text.contains("3 of 3"));
+        assert!(text.contains("Search:") && text.contains("3 of 3"));
         let order: Vec<usize> = [
             "deepseek/deepseek-v4-flash",
             "anthropic/claude-sonnet-5",
@@ -1864,7 +1934,10 @@ mod tests {
             !text.contains("sent as-is"),
             "verified levels carry no warning"
         );
-        assert!(!text.contains("Filter:"), "a short list needs no filter");
+        assert!(
+            !text.contains("Search:"),
+            "a short list needs no search box"
+        );
 
         assert_eq!(
             app.picker.as_ref().unwrap().chosen().unwrap().value,
@@ -1990,6 +2063,232 @@ mod tests {
         assert!(!drawn(&app).contains("Tab completes"));
         app.close_picker();
         assert!(drawn(&app).contains("Tab completes"));
+    }
+
+    /// The same twenty-model market the ranking tests use: five strong models
+    /// and fifteen weak ones.
+    fn scored_market() -> Vec<ModelChoice> {
+        let strong =
+            |id: &str, score: f64, prices: (f64, f64), context: u64, created: i64| ModelChoice {
+                id: id.into(),
+                context_window: Some(context),
+                input_per_m: Some(prices.0),
+                output_per_m: Some(prices.1),
+                created: Some(created),
+                supports_tools: Some(true),
+                text_output: Some(true),
+                intelligence: Some(score),
+                thinks: true,
+                ..ModelChoice::default()
+            };
+        let mut choices = vec![
+            strong("big/genius", 60.0, (4.0, 20.0), 1_000_000, 100),
+            strong("big/solid", 54.0, (2.0, 10.0), 1_000_000, 300),
+            strong("mid/fast", 50.0, (0.5, 1.5), 256_000, 400),
+            strong("mid/value", 47.0, (0.06, 0.2), 512_000, 200),
+            strong("mid/new", 46.0, (0.8, 3.0), 1_000_000, 900),
+        ];
+        choices.extend((0..15).map(|i| {
+            strong(
+                &format!("low/{i:02}"),
+                1.0 + f64::from(i),
+                (0.05, 0.2),
+                131_000,
+                10 + i64::from(i),
+            )
+        }));
+        // The provider's favourite for programming is a weak, cheap model.
+        let favourite = choices.iter().position(|c| c.id == "low/07").unwrap();
+        choices[favourite].popular_rank = Some(0);
+        choices
+    }
+
+    fn market_app(current: &str) -> App {
+        let mut app = App::new("work".into(), current.into(), &[], Vec::new(), Vec::new());
+        app.open_model_picker();
+        app.apply(UiEvent::ModelChoices {
+            current: current.into(),
+            result: Ok(scored_market()),
+        });
+        app
+    }
+
+    fn picker_text(app: &App) -> String {
+        drawn_in(app, |a| a.layout.get().picker)
+    }
+
+    #[test]
+    fn a_ranked_provider_opens_on_five_picks_with_their_reasons() {
+        let app = market_app("low/00");
+        let text = picker_text(&app);
+        for tab in [
+            "Top 5", "Smartest", "Cheapest", "Context", "Popular", "All 20",
+        ] {
+            assert!(text.contains(tab), "tab {tab} missing: {text}");
+        }
+        for (model, reason) in [
+            ("big/genius", "Smartest"),
+            ("mid/value", "Best value"),
+            ("mid/fast", "Smart & affordable"),
+            ("low/07", "Popular for coding"),
+            ("mid/new", "Newest strong"),
+        ] {
+            let row = text.lines().find(|l| l.contains(model)).unwrap_or_default();
+            assert!(row.contains(reason), "{model} should say {reason}: {text}");
+        }
+        assert!(
+            !text.contains("big/solid"),
+            "only five picks, plus the model in use: {text}"
+        );
+        let genius = text.lines().find(|l| l.contains("big/genius")).unwrap();
+        assert!(
+            genius.contains("$$$$") && genius.contains("score 60") && genius.contains("thinks"),
+            "{genius}"
+        );
+        assert!(
+            text.contains("the tag says why"),
+            "the view explains itself: {text}"
+        );
+    }
+
+    #[test]
+    fn the_model_in_use_stays_on_top_in_every_view() {
+        let mut app = market_app("my/own-choice");
+        let top = picker_text(&app);
+        let first_row = top.lines().find(|l| l.contains("●")).unwrap();
+        assert!(first_row.contains("my/own-choice"), "{top}");
+        assert!(
+            top.find("my/own-choice").unwrap() < top.find("big/genius").unwrap(),
+            "pinned above the picks"
+        );
+        app.picker.as_mut().unwrap().next_view(true);
+        assert!(picker_text(&app).contains("my/own-choice"));
+    }
+
+    #[test]
+    fn the_arrow_keys_walk_the_views_and_each_reorders_the_list() {
+        let mut app = market_app("low/00");
+        let order = |app: &App| {
+            let text = picker_text(app);
+            let mut found: Vec<(usize, &str)> = [
+                "big/genius",
+                "big/solid",
+                "mid/fast",
+                "mid/value",
+                "mid/new",
+            ]
+            .iter()
+            .filter_map(|id| text.find(id).map(|at| (at, *id)))
+            .collect();
+            found.sort();
+            found.into_iter().map(|(_, id)| id).collect::<Vec<_>>()
+        };
+        let picker = |app: &mut App| app.picker.as_mut().unwrap().next_view(true);
+
+        picker(&mut app);
+        assert_eq!(app.picker.as_ref().unwrap().view, ModelView::Smartest);
+        assert_eq!(
+            order(&app),
+            [
+                "big/genius",
+                "big/solid",
+                "mid/fast",
+                "mid/value",
+                "mid/new"
+            ]
+        );
+        assert!(picker_text(&app).contains("Artificial Analysis"));
+
+        picker(&mut app);
+        assert_eq!(app.picker.as_ref().unwrap().view, ModelView::Cheapest);
+        assert_eq!(
+            order(&app),
+            [
+                "mid/value",
+                "mid/fast",
+                "mid/new",
+                "big/solid",
+                "big/genius"
+            ]
+        );
+
+        picker(&mut app);
+        assert_eq!(app.picker.as_ref().unwrap().view, ModelView::Context);
+        assert_eq!(
+            order(&app),
+            [
+                "big/genius",
+                "big/solid",
+                "mid/new",
+                "mid/value",
+                "mid/fast"
+            ]
+        );
+
+        picker(&mut app);
+        assert_eq!(app.picker.as_ref().unwrap().view, ModelView::Popular);
+        assert!(picker_text(&app).contains("low/07"));
+
+        picker(&mut app);
+        assert_eq!(app.picker.as_ref().unwrap().view, ModelView::All);
+        assert!(picker_text(&app).contains("Search:"));
+
+        picker(&mut app);
+        assert_eq!(
+            app.picker.as_ref().unwrap().view,
+            ModelView::Top,
+            "wraps around"
+        );
+        app.picker.as_mut().unwrap().next_view(false);
+        assert_eq!(
+            app.picker.as_ref().unwrap().view,
+            ModelView::All,
+            "and back"
+        );
+    }
+
+    #[test]
+    fn typing_leaves_the_ranked_views_and_searches_everything() {
+        let mut app = market_app("low/00");
+        for ch in "low/1".chars() {
+            app.picker.as_mut().unwrap().type_char(ch);
+        }
+        assert_eq!(app.picker.as_ref().unwrap().view, ModelView::All);
+        let text = picker_text(&app);
+        assert!(text.contains("Search: low/1"), "{text}");
+        assert!(
+            text.contains("low/10") && !text.contains("big/genius"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_click_on_a_ranked_row_chooses_that_model() {
+        let mut app = market_app("low/00");
+        drawn(&app);
+        let list = app.layout.get().picker_list;
+        // Row 0 is the model in use; the first pick is row 1.
+        assert_eq!(
+            app.click_picker(list.x + 4, list.y + 1),
+            Some(PickerChoice::Model("big/genius".into()))
+        );
+    }
+
+    #[test]
+    fn a_provider_without_scores_shows_no_tabs_at_all() {
+        let app = picker_app(
+            "a/one",
+            vec![
+                choice("a/one", None, None, None),
+                choice("b/two", None, None, None),
+            ],
+        );
+        let text = picker_text(&app);
+        assert!(
+            !text.contains("Top 5") && !text.contains("Smartest"),
+            "{text}"
+        );
+        assert!(text.contains("Search:"));
     }
 
     #[test]

@@ -1,7 +1,8 @@
 //! Asking a provider which models it offers, and what it says about each.
 //!
 //! OpenAI-style servers answer `GET {base}/models` with `{"data": [{"id": ..}]}`.
-//! OpenRouter adds a context size, per-token prices and, for reasoning models,
+//! OpenRouter adds a context size, per-token prices, release date, the
+//! parameters each model supports, benchmark scores and, for reasoning models,
 //! the exact effort levels each accepts. Anthropic answers with `display_name`.
 //! Everything beyond `id` is optional, and a missing field means "unknown".
 
@@ -9,6 +10,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 use serde::Deserialize;
+use serde_json::Value;
 
 use crate::error::ProviderError;
 
@@ -22,6 +24,16 @@ pub struct RemoteModel {
     pub reasoning_efforts: Option<Vec<String>>,
     pub input_per_m: Option<f64>,
     pub output_per_m: Option<f64>,
+    /// Release time, in seconds since the Unix epoch.
+    pub created: Option<i64>,
+    /// Whether the model supports tool calling. `None` when the provider
+    /// doesn't list supported parameters.
+    pub supports_tools: Option<bool>,
+    /// Whether the model produces text. `None` when the provider doesn't say.
+    pub text_output: Option<bool>,
+    /// Artificial Analysis Intelligence Index (0-100), as published by the
+    /// provider. A third-party benchmark, not HiveMind's own measurement.
+    pub intelligence: Option<f64>,
 }
 
 pub type ModelsFuture<'a> =
@@ -33,6 +45,8 @@ struct ModelList {
     data: Vec<RawModel>,
 }
 
+/// Loosely typed on purpose: one odd value in one model's entry must not make
+/// the whole list unreadable.
 #[derive(Deserialize)]
 struct RawModel {
     id: String,
@@ -41,11 +55,19 @@ struct RawModel {
     #[serde(default)]
     display_name: Option<String>,
     #[serde(default)]
-    context_length: Option<u64>,
+    context_length: Option<Value>,
+    #[serde(default)]
+    created: Option<Value>,
     #[serde(default)]
     pricing: Option<RawPricing>,
     #[serde(default)]
     reasoning: Option<RawReasoning>,
+    #[serde(default)]
+    supported_parameters: Option<Value>,
+    #[serde(default)]
+    architecture: Option<Value>,
+    #[serde(default)]
+    benchmarks: Option<Value>,
 }
 
 #[derive(Deserialize)]
@@ -81,6 +103,10 @@ struct RawReasoning {
     supported_efforts: Option<Vec<String>>,
 }
 
+fn strings(value: &Value) -> Option<Vec<&str>> {
+    Some(value.as_array()?.iter().filter_map(Value::as_str).collect())
+}
+
 pub(crate) fn parse_models(json: &str) -> Result<Vec<RemoteModel>, ProviderError> {
     let list: ModelList = serde_json::from_str(json)
         .map_err(|e| ProviderError::Request(format!("the model list was not understood: {e}")))?;
@@ -89,9 +115,32 @@ pub(crate) fn parse_models(json: &str) -> Result<Vec<RemoteModel>, ProviderError
         .into_iter()
         .filter(|m| !m.id.trim().is_empty())
         .map(|m| RemoteModel {
+            supports_tools: m
+                .supported_parameters
+                .as_ref()
+                .and_then(strings)
+                .map(|params| params.contains(&"tools")),
+            text_output: m
+                .architecture
+                .as_ref()
+                .and_then(|a| strings(a.get("output_modalities")?))
+                .map(|modalities| modalities.contains(&"text")),
+            intelligence: m.benchmarks.as_ref().and_then(|b| {
+                b.get("artificial_analysis")?
+                    .get("intelligence_index")?
+                    .as_f64()
+            }),
+            created: m
+                .created
+                .as_ref()
+                .and_then(|c| c.as_i64().or_else(|| c.as_f64().map(|f| f as i64))),
+            context_window: m
+                .context_length
+                .as_ref()
+                .and_then(Value::as_u64)
+                .filter(|n| *n > 0),
             id: m.id,
             name: m.name.or(m.display_name).filter(|n| !n.trim().is_empty()),
-            context_window: m.context_length.filter(|n| *n > 0),
             reasoning_efforts: m.reasoning.and_then(|r| r.supported_efforts),
             input_per_m: m
                 .pricing
@@ -126,6 +175,16 @@ pub(crate) async fn fetch_models(
     parse_models(&text)
 }
 
+/// Only OpenRouter answers a `category` filter, so only it is asked.
+pub(crate) fn is_openrouter(base_url: &str) -> bool {
+    base_url
+        .split_once("://")
+        .map_or(base_url, |(_, rest)| rest)
+        .split('/')
+        .next()
+        .is_some_and(|host| host == "openrouter.ai" || host.ends_with(".openrouter.ai"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -144,6 +203,10 @@ mod tests {
             "silence is unknown, not empty"
         );
         assert_eq!(models[0].input_per_m, None);
+        assert_eq!(models[0].supports_tools, None);
+        assert_eq!(models[0].text_output, None);
+        assert_eq!(models[0].intelligence, None);
+        assert_eq!(models[0].created, None);
     }
 
     #[test]
@@ -173,6 +236,43 @@ mod tests {
     }
 
     #[test]
+    fn tool_support_text_output_release_date_and_benchmarks_are_read() {
+        let json = r#"{"data":[
+            {"id":"a/smart","created":1790000000,
+             "supported_parameters":["max_tokens","tools","reasoning"],
+             "architecture":{"input_modalities":["text","image"],"output_modalities":["text"]},
+             "benchmarks":{"design_arena":[],"artificial_analysis":{"intelligence_index":57.6,"coding_index":null}}},
+            {"id":"a/imagegen","supported_parameters":["max_tokens"],
+             "architecture":{"output_modalities":["image"]},
+             "benchmarks":{"artificial_analysis":{"intelligence_index":null}}},
+            {"id":"a/odd","created":"soon","supported_parameters":"tools",
+             "architecture":[1],"benchmarks":{"artificial_analysis":"n/a"},"context_length":"big"}
+        ]}"#;
+        let models = parse_models(json).unwrap();
+        let smart = &models[0];
+        assert_eq!(smart.supports_tools, Some(true));
+        assert_eq!(smart.text_output, Some(true));
+        assert_eq!(smart.created, Some(1_790_000_000));
+        assert_eq!(smart.intelligence, Some(57.6));
+        let image = &models[1];
+        assert_eq!(image.supports_tools, Some(false));
+        assert_eq!(image.text_output, Some(false));
+        assert_eq!(image.intelligence, None, "a null score is no score");
+        let odd = &models[2];
+        assert_eq!(
+            (
+                odd.created,
+                odd.supports_tools,
+                odd.text_output,
+                odd.intelligence,
+                odd.context_window
+            ),
+            (None, None, None, None, None),
+            "values of an unexpected shape are unknown, and do not break the list"
+        );
+    }
+
+    #[test]
     fn anthropics_display_name_and_numeric_prices_work() {
         let json = r#"{"data":[{"id":"claude-sonnet-5","display_name":"Claude Sonnet 5","type":"model",
             "pricing":{"prompt":0.000003,"completion":0.000015}}]}"#;
@@ -191,6 +291,17 @@ mod tests {
         );
         assert_eq!(parse_models("{}").unwrap().len(), 0);
         assert!(parse_models("<html>not json</html>").is_err());
+    }
+
+    #[test]
+    fn only_openrouter_hosts_are_asked_for_a_category() {
+        assert!(is_openrouter("https://openrouter.ai/api/v1"));
+        assert!(is_openrouter("https://eu.openrouter.ai/api/v1"));
+        assert!(is_openrouter("openrouter.ai/api/v1"));
+        assert!(!is_openrouter("https://api.openai.com/v1"));
+        assert!(!is_openrouter("http://127.0.0.1:11434/v1"));
+        assert!(!is_openrouter("https://openrouter.ai.evil.example/v1"));
+        assert!(!is_openrouter("https://notopenrouter.ai/v1"));
     }
 }
 
@@ -212,12 +323,7 @@ pub(crate) mod test_server {
             let n = sock.read(&mut scratch).await.unwrap_or(0);
             let _ = tx.send(String::from_utf8_lossy(&scratch[..n]).to_string());
             let reply = format!(
-                "HTTP/1.1 {status}
-Content-Type: application/json
-Content-Length: {}
-Connection: close
-
-{body}",
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
             );
             let _ = sock.write_all(reply.as_bytes()).await;

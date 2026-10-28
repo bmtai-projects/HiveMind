@@ -81,6 +81,50 @@ pub(crate) struct PickerItem {
     pub(crate) label: String,
     pub(crate) detail: String,
     pub(crate) current: bool,
+    /// Why it is listed, in the top picks ("Smartest", "Best value").
+    pub(crate) tags: Vec<&'static str>,
+}
+
+/// The ways `/model` can order and narrow its list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ModelView {
+    Top,
+    Smartest,
+    Cheapest,
+    Context,
+    Popular,
+    All,
+}
+
+impl ModelView {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Top => "Top 5",
+            Self::Smartest => "Smartest",
+            Self::Cheapest => "Cheapest",
+            Self::Context => "Context",
+            Self::Popular => "Popular",
+            Self::All => "All",
+        }
+    }
+
+    /// One plain line saying what the view is, and where its numbers come from.
+    pub(crate) fn blurb(self) -> &'static str {
+        match self {
+            Self::Top => {
+                "Five good starting points; the tag says why. $ to $$$$ shows cost, with prices per 1M tokens (input/output)."
+            }
+            Self::Smartest => {
+                "Highest score on the Artificial Analysis intelligence index (0-100), as published by the provider."
+            }
+            Self::Cheapest => {
+                "Cheapest among the strongest quarter by score. Cost counts 3 parts input to 1 part output."
+            }
+            Self::Context => "Largest context window first, among the strongest quarter by score.",
+            Self::Popular => "What people use most for programming, according to the provider.",
+            Self::All => "Every model this provider lists. Type to search.",
+        }
+    }
 }
 
 /// A list to choose from, opened by `/model` and `/reasoning`.
@@ -97,6 +141,11 @@ pub(crate) struct Picker {
     /// Corrected while drawing so the selection stays in view.
     pub(crate) offset: Cell<usize>,
     pub(crate) loading: bool,
+    /// The views on offer, in tab order. One entry means no tabs.
+    pub(crate) views: Vec<ModelView>,
+    pub(crate) view: ModelView,
+    /// Item indices for each ranked view; [`ModelView::All`] has no list.
+    pub(crate) lists: Vec<(ModelView, Vec<usize>)>,
 }
 
 /// What choosing a row asks for.
@@ -118,23 +167,53 @@ impl Picker {
             selected: 0,
             offset: Cell::new(0),
             loading: true,
+            views: vec![ModelView::All],
+            view: ModelView::All,
+            lists: Vec::new(),
         }
     }
 
-    /// Indices into `items` that match the filter, in list order.
+    /// Indices into `items` to show: the current view's list, or everything
+    /// that matches the filter. The model in use always comes first.
     pub(crate) fn visible(&self) -> Vec<usize> {
         let needle = self.filter.trim().to_lowercase();
-        self.items
-            .iter()
-            .enumerate()
-            .filter(|(_, item)| {
-                needle.is_empty()
-                    || format!("{} {} {}", item.value, item.label, item.detail)
-                        .to_lowercase()
-                        .contains(&needle)
-            })
-            .map(|(index, _)| index)
-            .collect()
+        let mut shown: Vec<usize> = match self.lists.iter().find(|(view, _)| *view == self.view) {
+            Some((_, list)) => list.clone(),
+            None => (0..self.items.len()).collect(),
+        };
+        shown.retain(|&index| {
+            let item = &self.items[index];
+            needle.is_empty()
+                || format!("{} {} {}", item.value, item.label, item.detail)
+                    .to_lowercase()
+                    .contains(&needle)
+        });
+        if self.kind == PickerKind::Model {
+            let current = self.items.iter().position(|item| item.current);
+            if let Some(current) = current {
+                match shown.iter().position(|&index| index == current) {
+                    Some(at) => {
+                        shown.remove(at);
+                        shown.insert(0, current);
+                    }
+                    None if needle.is_empty() => shown.insert(0, current),
+                    None => {}
+                }
+            }
+        }
+        shown
+    }
+
+    /// Switches to the next or previous view, wrapping around.
+    pub(crate) fn next_view(&mut self, forward: bool) {
+        if self.kind != PickerKind::Model || self.loading || self.views.len() < 2 {
+            return;
+        }
+        let at = self.views.iter().position(|v| *v == self.view).unwrap_or(0);
+        let count = self.views.len();
+        self.view = self.views[(if forward { at + 1 } else { at + count - 1 }) % count];
+        self.selected = 0;
+        self.offset.set(0);
     }
 
     pub(crate) fn chosen(&self) -> Option<&PickerItem> {
@@ -150,8 +229,10 @@ impl Picker {
         }
     }
 
+    /// Typing searches everything, so it leaves any ranked view.
     pub(crate) fn type_char(&mut self, c: char) {
         if self.kind == PickerKind::Model && !self.loading {
+            self.view = ModelView::All;
             self.filter.push(c);
             self.selected = 0;
         }
@@ -183,15 +264,22 @@ fn price_label(per_million: f64) -> String {
 
 fn model_detail(choice: &ModelChoice) -> String {
     let mut parts = Vec::new();
-    if let Some(window) = choice.context_window {
-        parts.push(format!("{} ctx", compact_tokens(window)));
-    }
     if let (Some(input), Some(output)) = (choice.input_per_m, choice.output_per_m) {
+        let tier = super::picks::blended_price(choice).map_or("", super::picks::cost_tier);
         parts.push(format!(
-            "{} in / {} out per 1M",
+            "{tier} {}/{}",
             price_label(input),
             price_label(output)
         ));
+    }
+    if let Some(window) = choice.context_window {
+        parts.push(format!("{} ctx", compact_tokens(window)));
+    }
+    if let Some(score) = choice.intelligence {
+        parts.push(format!("score {score:.0}"));
+    }
+    if choice.thinks {
+        parts.push("thinks".to_string());
     }
     if let Some(name) = choice.name.as_deref().filter(|n| *n != choice.id) {
         parts.push(name.to_string());
@@ -840,24 +928,47 @@ impl App {
                 label: choice.id.clone(),
                 detail: model_detail(choice),
                 current: choice.id == current,
+                tags: Vec::new(),
             })
             .collect();
-        // The model in use leads the list even when the provider doesn't list it.
-        match items.iter().position(|item| item.current) {
-            Some(index) => {
-                let item = items.remove(index);
-                items.insert(0, item);
-            }
-            None => items.insert(
-                0,
-                PickerItem {
-                    value: current.to_string(),
-                    label: current.to_string(),
-                    detail: "in use".into(),
-                    current: true,
-                },
-            ),
+        // The model in use is listed even when the provider doesn't list it.
+        if !items.iter().any(|item| item.current) {
+            items.push(PickerItem {
+                value: current.to_string(),
+                label: current.to_string(),
+                detail: "in use".into(),
+                current: true,
+                tags: Vec::new(),
+            });
         }
+        let (views, lists) = match super::picks::rank(&choices) {
+            Some(ranking) => {
+                for (index, reasons) in &ranking.top {
+                    items[*index].tags = reasons.clone();
+                }
+                let mut views = Vec::new();
+                let mut lists = Vec::new();
+                let top: Vec<usize> = ranking.top.iter().map(|(index, _)| *index).collect();
+                for (view, list) in [
+                    (ModelView::Top, top),
+                    (ModelView::Smartest, ranking.smartest),
+                    (ModelView::Cheapest, ranking.cheapest),
+                    (ModelView::Context, ranking.context),
+                    (ModelView::Popular, ranking.popular),
+                ] {
+                    if !list.is_empty() {
+                        views.push(view);
+                        lists.push((view, list));
+                    }
+                }
+                views.push(ModelView::All);
+                (views, lists)
+            }
+            None => (vec![ModelView::All], Vec::new()),
+        };
+        picker.view = views[0];
+        picker.views = views;
+        picker.lists = lists;
         picker.items = items;
         picker.note = note;
         picker.selected = 0;
@@ -888,6 +999,7 @@ impl App {
             label: value.to_string(),
             detail: level_blurb(value).to_string(),
             current: is_current,
+            tags: Vec::new(),
         };
         let mut items = vec![item("off", current.is_none())];
         items.extend(

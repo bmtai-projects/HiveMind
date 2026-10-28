@@ -94,6 +94,32 @@ impl ChatClient {
         crate::models::fetch_models(req).await
     }
 
+    /// Models in one of the provider's own categories (`?category=`), in the
+    /// order it returns them.
+    async fn list_models_in_category(
+        &self,
+        category: &str,
+    ) -> Result<Vec<crate::RemoteModel>, ProviderError> {
+        let mut req = self
+            .http
+            .get(format!("{}/models", self.base_url))
+            .query(&[("category", category)])
+            .header("Accept", "application/json");
+        if !self.api_key.is_empty() {
+            req = req.header("Authorization", format!("Bearer {}", self.api_key));
+        }
+        crate::models::fetch_models(req).await
+    }
+
+    /// OpenRouter's list of models people use for programming, most used
+    /// first. Empty for any other provider.
+    pub async fn list_popular(&self) -> Result<Vec<crate::RemoteModel>, ProviderError> {
+        if !crate::models::is_openrouter(&self.base_url) {
+            return Ok(Vec::new());
+        }
+        self.list_models_in_category("programming").await
+    }
+
     /// Start one streaming sampling request. Borrows `req` only long enough
     /// to serialize it (synchronously, before any `.await`) — the caller
     /// gets `req`'s ownership straight back, so driving a multi-turn
@@ -453,6 +479,40 @@ mod tests {
         assert!(
             matches!(err, ProviderError::Http { status: 404, .. }),
             "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_category_request_carries_the_category_and_keeps_the_providers_order() {
+        let (url, rx) = crate::models::test_server::serve_json(
+            "200 OK",
+            r#"{"data":[{"id":"z/second-alphabetically"},{"id":"a/first-ranked"}]}"#,
+        )
+        .await;
+        let models = ChatClient::new(format!("{url}/v1"), "k")
+            .list_models_in_category("programming")
+            .await
+            .unwrap();
+        let sent = rx.await.unwrap();
+        assert!(
+            sent.starts_with("GET /v1/models?category=programming "),
+            "{sent}"
+        );
+        assert_eq!(
+            models[0].id, "z/second-alphabetically",
+            "the ranking is the provider's"
+        );
+    }
+
+    #[tokio::test]
+    async fn other_providers_are_not_asked_for_a_popular_list_at_all() {
+        let popular = ChatClient::new("http://127.0.0.1:9/v1", "k")
+            .list_popular()
+            .await
+            .unwrap();
+        assert!(
+            popular.is_empty(),
+            "no request is made, so a dead port causes no error"
         );
     }
 

@@ -19,6 +19,16 @@ pub(crate) struct ModelChoice {
     pub(crate) context_window: Option<u64>,
     pub(crate) input_per_m: Option<f64>,
     pub(crate) output_per_m: Option<f64>,
+    pub(crate) created: Option<i64>,
+    pub(crate) supports_tools: Option<bool>,
+    pub(crate) text_output: Option<bool>,
+    /// Artificial Analysis intelligence index (0-100), as the provider publishes it.
+    pub(crate) intelligence: Option<f64>,
+    /// Whether the model has adjustable reasoning.
+    pub(crate) thinks: bool,
+    /// Position (0 is best) in the provider's own list of models people use
+    /// for programming.
+    pub(crate) popular_rank: Option<usize>,
 }
 
 /// Events produced by the agent and consumed by the TUI event loop.  Keeping

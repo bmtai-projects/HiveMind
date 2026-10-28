@@ -45,6 +45,11 @@ pub trait Provider: Send + Sync {
             ))
         })
     }
+    /// The models people most use for programming, best first, when the
+    /// provider keeps such a list. Empty when it does not.
+    fn list_popular(&self) -> ModelsFuture<'_> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
 }
 
 impl Provider for ChatClient {
@@ -56,6 +61,9 @@ impl Provider for ChatClient {
     }
     fn list_models(&self) -> ModelsFuture<'_> {
         Box::pin(ChatClient::list_models(self))
+    }
+    fn list_popular(&self) -> ModelsFuture<'_> {
+        Box::pin(ChatClient::list_popular(self))
     }
 }
 
