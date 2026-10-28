@@ -8,21 +8,26 @@ use ratatui::widgets::{
 };
 
 use super::app::{
-    App, ConversationKind, CostStatus, RunState, TodoState, ToolState, View, slash_matches,
+    App, ConversationKind, CostStatus, Panel, RunState, TodoState, ToolState, View, failure_reason,
+    slash_matches,
 };
+use super::listview;
 
-const BORDER: Color = Color::Rgb(83, 101, 119);
-const MUTED: Color = Color::Rgb(159, 173, 189);
-const ACCENT: Color = Color::Rgb(99, 208, 225);
-const GREEN: Color = Color::Rgb(113, 239, 157);
-const YELLOW: Color = Color::Rgb(250, 198, 79);
-const RED: Color = Color::Rgb(246, 120, 111);
+pub(crate) const BORDER: Color = Color::Rgb(83, 101, 119);
+pub(crate) const MUTED: Color = Color::Rgb(159, 173, 189);
+pub(crate) const ACCENT: Color = Color::Rgb(99, 208, 225);
+pub(crate) const GREEN: Color = Color::Rgb(113, 239, 157);
+pub(crate) const YELLOW: Color = Color::Rgb(250, 198, 79);
+pub(crate) const RED: Color = Color::Rgb(246, 120, 111);
 
 pub(crate) fn draw(frame: &mut Frame, app: &App) {
-    // Hidden panels must not keep catching the mouse wheel.
+    // Hidden panels must not keep catching the mouse or Tab focus.
     let mut layout = app.layout.get();
     layout.conversation = Rect::default();
     layout.tools = Rect::default();
+    layout.tasks = Rect::default();
+    layout.files = Rect::default();
+    layout.sidebar_shown = false;
     app.layout.set(layout);
 
     let area = frame.area();
@@ -51,6 +56,8 @@ pub(crate) fn draw(frame: &mut Frame, app: &App) {
         render_main(frame, app, body[0]);
         render_sidebar(frame, app, body[1]);
     }
+    // Over the body only, so the message box and footer stay usable.
+    super::detail::render_detail(frame, app, chunks[1]);
     render_composer(frame, app, chunks[2]);
     render_footer(frame, app, chunks[3], compact);
 
@@ -61,16 +68,24 @@ pub(crate) fn draw(frame: &mut Frame, app: &App) {
         render_approval(frame, approval.command.as_str());
     } else if app.palette_visible {
         render_palette(frame);
-    } else if app.details_visible {
-        render_tool_details(frame, app);
     }
 }
 
-fn boxed(title: impl Into<Line<'static>>) -> Block<'static> {
+pub(crate) fn boxed(title: impl Into<Line<'static>>) -> Block<'static> {
     Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(BORDER))
         .title(title)
+}
+
+/// A side or main panel; the focused one gets the accent border.
+fn panel(app: &App, which: Panel, title: impl Into<Line<'static>>) -> Block<'static> {
+    let block = boxed(title);
+    if app.focus == which && app.detail.is_none() {
+        block.border_style(Style::default().fg(ACCENT))
+    } else {
+        block
+    }
 }
 
 fn render_header(frame: &mut Frame, app: &App, area: Rect) {
@@ -126,7 +141,7 @@ fn render_conversation(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         " Conversation "
     };
-    let block = boxed(title);
+    let block = panel(app, Panel::Conversation, title);
     let inner = block.inner(area);
     let paragraph = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
     // Counted in wrapped rows, so long lines can't push the newest text out of view.
@@ -155,7 +170,7 @@ fn render_conversation(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
-fn render_scrollbar(frame: &mut Frame, area: Rect, state: &mut ScrollbarState) {
+pub(crate) fn render_scrollbar(frame: &mut Frame, area: Rect, state: &mut ScrollbarState) {
     frame.render_stateful_widget(
         Scrollbar::new(ScrollbarOrientation::VerticalRight)
             .begin_symbol(None)
@@ -171,15 +186,18 @@ fn render_scrollbar(frame: &mut Frame, area: Rect, state: &mut ScrollbarState) {
 }
 
 fn render_sidebar(frame: &mut Frame, app: &App, area: Rect) {
-    // Tasks take up to two fifths of the panel; past that the list scrolls.
+    let mut layout = app.layout.get();
+    layout.sidebar_shown = true;
+    app.layout.set(layout);
+    // Tasks and files each take a share; past it their lists scroll.
     let tasks = (app.todos.len().max(1) as u16 + 2).min((area.height * 2 / 5).max(3));
-    let changes = app.changed_files.len().min(5) as u16;
+    let files = (app.changed_files.len().max(1) as u16 + 2).min((area.height / 4).max(3));
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(tasks),
-            Constraint::Min(8),
-            Constraint::Length((changes + 3).max(4)),
+            Constraint::Min(6),
+            Constraint::Length(files),
         ])
         .split(area);
     render_tasks(frame, app, chunks[0]);
@@ -228,7 +246,8 @@ fn render_tasks(frame: &mut Frame, app: &App, area: Rect) {
             .collect()
     };
     let mut state = ListState::default().with_offset(offset);
-    frame.render_stateful_widget(List::new(items).block(boxed(title)), area, &mut state);
+    let block = panel(app, Panel::Tasks, title);
+    frame.render_stateful_widget(List::new(items).block(block), area, &mut state);
     if max_offset > 0 {
         let mut bar = ScrollbarState::new(max_offset + 1)
             .viewport_content_length(visible)
@@ -237,12 +256,35 @@ fn render_tasks(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
+/// Highlights the selected row only while its panel has focus.
+fn selectable_list<'a>(items: Vec<ListItem<'a>>, block: Block<'a>, focused: bool) -> List<'a> {
+    let list = List::new(items).block(block);
+    if focused {
+        list.highlight_style(Style::default().bg(Color::Rgb(38, 50, 62)))
+            .highlight_symbol("›")
+    } else {
+        list.highlight_symbol(" ")
+    }
+}
+
 fn render_tools(frame: &mut Frame, app: &App, area: Rect) {
+    let rows = area.height.saturating_sub(2) as usize;
     let mut layout = app.layout.get();
     layout.tools = area;
+    layout.tools_rows = rows;
     app.layout.set(layout);
 
-    let block = boxed(format!(" Tools ({})  Tab details ", app.tools.len()));
+    let focused = app.focus == Panel::Tools;
+    let hint = if focused {
+        "· ↑↓ select · Enter details "
+    } else {
+        ""
+    };
+    let block = panel(
+        app,
+        Panel::Tools,
+        format!(" Tools {} {hint}", app.tools.len()),
+    );
     if app.tools.is_empty() {
         frame.render_widget(
             Paragraph::new(Line::styled(
@@ -275,56 +317,95 @@ fn render_tools(frame: &mut Frame, app: &App, area: Rect) {
                 ),
             ];
             // A failure says why right on the card.
-            if matches!(tool.state, ToolState::Failed | ToolState::TimedOut)
-                && let Some(reason) = tool.result.lines().find(|line| !line.trim().is_empty())
-            {
+            if let Some(reason) = failure_reason(tool) {
                 lines.push(Line::styled(
-                    format!("  {}", shorten(reason.trim(), detail_width)),
+                    format!("  {}", shorten(reason, detail_width)),
                     Style::default().fg(RED),
                 ));
             }
             ListItem::new(lines)
         })
         .collect();
-    let selected = app.selected_tool.min(app.tools.len().saturating_sub(1));
-    // Stateful so ratatui keeps the selected call scrolled into view.
-    let mut state = ListState::default().with_selected(Some(selected));
-    let list = List::new(items)
-        .block(block)
-        .highlight_style(Style::default().bg(Color::Rgb(38, 50, 62)))
-        .highlight_symbol("›");
-    frame.render_stateful_widget(list, area, &mut state);
-    // Each card is two rows.
-    if app.tools.len() * 2 > area.height.saturating_sub(2) as usize {
-        let mut bar = ScrollbarState::new(app.tools.len()).position(selected);
+    let heights = app.tool_heights();
+    let selected = app.selected_tool.min(app.tools.len() - 1);
+    let offset = listview::offset_showing(&heights, app.tools_offset.get(), selected, rows);
+    app.tools_offset.set(offset);
+    let mut state = ListState::default()
+        .with_offset(offset)
+        .with_selected(Some(selected));
+    frame.render_stateful_widget(selectable_list(items, block, focused), area, &mut state);
+    let max = listview::max_offset(&heights, rows);
+    if max > 0 {
+        let mut bar = ScrollbarState::new(max + 1).position(offset.min(max));
         render_scrollbar(frame, area, &mut bar);
     }
 }
 
 fn render_changes(frame: &mut Frame, app: &App, area: Rect) {
-    let items: Vec<ListItem<'static>> = if app.changed_files.is_empty() {
-        vec![ListItem::new(Line::styled(
-            "No files changed",
-            Style::default().fg(MUTED),
-        ))]
-    } else {
-        app.changed_files
-            .iter()
-            .take(5)
-            .map(|file| {
-                let (kind, color) = match file.kind {
-                    harness_tools::FileChangeKind::Created => ("A", GREEN),
-                    harness_tools::FileChangeKind::Modified => ("M", YELLOW),
-                    harness_tools::FileChangeKind::Deleted => ("D", RED),
-                };
-                ListItem::new(Line::from(vec![
-                    Span::styled(format!("{kind}  "), Style::default().fg(color)),
-                    Span::raw(shorten(&file.path, 44)),
-                ]))
-            })
-            .collect()
+    let rows = area.height.saturating_sub(2) as usize;
+    let mut layout = app.layout.get();
+    layout.files = area;
+    layout.files_rows = rows;
+    app.layout.set(layout);
+
+    let focused = app.focus == Panel::Files;
+    let count = app.changed_files.len();
+    let title = match (count, focused) {
+        (0, _) => " Changed files ".to_string(),
+        (_, true) => format!(" Changed files {count} · Enter diff "),
+        (_, false) => format!(" Changed files {count} "),
     };
-    frame.render_widget(List::new(items).block(boxed(" Changed files ")), area);
+    let block = panel(app, Panel::Files, title);
+    if count == 0 {
+        frame.render_widget(
+            Paragraph::new(Line::styled("No files changed", Style::default().fg(MUTED)))
+                .block(block),
+            area,
+        );
+        return;
+    }
+    let width = area.width.saturating_sub(5) as usize;
+    let items: Vec<ListItem<'static>> = app
+        .changed_files
+        .iter()
+        .map(|file| {
+            let (kind, color) = match file.kind {
+                harness_tools::FileChangeKind::Created => ("A", GREEN),
+                harness_tools::FileChangeKind::Modified => ("M", YELLOW),
+                harness_tools::FileChangeKind::Deleted => ("D", RED),
+            };
+            let mut spans = vec![Span::styled(format!("{kind} "), Style::default().fg(color))];
+            match file.stats {
+                Some((added, removed)) => {
+                    let (plus, minus) = (format!(" +{added}"), format!(" −{removed}"));
+                    let room =
+                        width.saturating_sub(display_width(&plus) + display_width(&minus) + 2);
+                    let path = shorten(&file.path, room);
+                    let pad = room.saturating_sub(display_width(&path));
+                    spans.push(Span::raw(format!("{path}{}", " ".repeat(pad))));
+                    spans.push(Span::styled(plus, Style::default().fg(GREEN)));
+                    spans.push(Span::styled(minus, Style::default().fg(RED)));
+                }
+                None => spans.push(Span::raw(shorten(&file.path, width.saturating_sub(2)))),
+            }
+            ListItem::new(Line::from(spans))
+        })
+        .collect();
+    let heights = vec![1; count];
+    let selected = app.selected_file.min(count - 1);
+    let offset = listview::offset_showing(&heights, app.files_offset.get(), selected, rows);
+    app.files_offset.set(offset);
+    let mut state = ListState::default()
+        .with_offset(offset)
+        .with_selected(Some(selected));
+    frame.render_stateful_widget(selectable_list(items, block, focused), area, &mut state);
+    let max = listview::max_offset(&heights, rows);
+    if max > 0 {
+        let mut bar = ScrollbarState::new(max + 1)
+            .viewport_content_length(rows)
+            .position(offset.min(max));
+        render_scrollbar(frame, area, &mut bar);
+    }
 }
 
 fn render_sessions(frame: &mut Frame, app: &App, area: Rect) {
@@ -516,10 +597,12 @@ fn wrap_rows(text: &str, width: usize) -> Vec<String> {
 }
 
 fn render_footer(frame: &mut Frame, app: &App, area: Rect, compact: bool) {
-    let text = if compact {
-        "Enter send  / commands  ↑↓ scroll  End latest  Ctrl+C stop"
-    } else {
-        "Enter send  / commands  ↑↓ PgUp PgDn scroll  End latest  Shift+↑↓ tools  Tab details  Shift+drag select  Ctrl+C stop"
+    let text = match (app.detail.is_some(), compact) {
+        (true, _) => "↑↓ PgUp PgDn scroll  ←→ previous/next  Esc close",
+        (false, true) => "Tab panel  ↑↓ scroll  Enter open  Ctrl+C stop",
+        (false, false) => {
+            "Enter send  Tab next panel  ↑↓ scroll  Enter open  /diff changes  Shift+drag select  Ctrl+C stop"
+        }
     };
     // Usage gets its space first; the key hints are what gets clipped.
     let usage = usage_summary(app);
@@ -618,50 +701,7 @@ fn render_palette(frame: &mut Frame) {
     );
 }
 
-fn render_tool_details(frame: &mut Frame, app: &App) {
-    let Some(tool) = app.tools.get(app.selected_tool) else {
-        return;
-    };
-    let area = centered_rect(76, 17, frame.area());
-    frame.render_widget(Clear, area);
-    let output = if tool.result.is_empty() {
-        "No result yet.".to_string()
-    } else {
-        shorten(&tool.result, 1_600)
-    };
-    let text = Text::from(vec![
-        Line::from(vec![
-            Span::styled("Call: ", Style::default().fg(MUTED)),
-            Span::styled(tool.call_id.clone(), Style::default().fg(ACCENT)),
-        ]),
-        Line::from(vec![
-            Span::styled("Arguments: ", Style::default().fg(MUTED)),
-            Span::raw(shorten(&tool.args, 700)),
-        ]),
-        Line::raw(""),
-        Line::styled(
-            "Result",
-            Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
-        ),
-        Line::raw(output),
-        Line::raw(""),
-        Line::styled(
-            "Tab next · Shift+Tab previous · Esc close",
-            Style::default().fg(MUTED),
-        ),
-    ]);
-    frame.render_widget(
-        Paragraph::new(text)
-            .block(
-                boxed(format!(" Tool: {} · {} ", tool.name, tool.state.label()))
-                    .border_style(tool_style(tool.state)),
-            )
-            .wrap(Wrap { trim: false }),
-        area,
-    );
-}
-
-fn tool_style(state: ToolState) -> Style {
+pub(crate) fn tool_style(state: ToolState) -> Style {
     match state {
         ToolState::Completed => Style::default().fg(GREEN),
         ToolState::WaitingForApproval => Style::default().fg(YELLOW),
@@ -700,8 +740,232 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
+    use super::super::app::{DetailKind, FileSource};
     use super::super::events::UiEvent;
     use super::*;
+
+    #[derive(Default)]
+    struct FakeFiles(std::collections::HashMap<String, (Option<Option<String>>, Option<String>)>);
+
+    impl FakeFiles {
+        fn with(mut self, path: &str, before: Option<Option<&str>>, now: Option<&str>) -> Self {
+            self.0.insert(
+                path.into(),
+                (
+                    before.map(|b| b.map(str::to_string)),
+                    now.map(str::to_string),
+                ),
+            );
+            self
+        }
+    }
+
+    impl FileSource for FakeFiles {
+        fn before(&self, path: &str) -> Option<Option<String>> {
+            self.0.get(path).and_then(|(before, _)| before.clone())
+        }
+        fn now(&self, path: &str) -> Option<String> {
+            self.0.get(path).and_then(|(_, now)| now.clone())
+        }
+    }
+
+    fn start_tools(app: &mut App, count: usize) {
+        for i in 0..count {
+            app.apply(UiEvent::ToolStarted {
+                call_id: format!("c{i}"),
+                name: "read_file".into(),
+                args: format!(r#"{{"path":"file_{i:02}.rs"}}"#),
+            });
+            app.apply(UiEvent::ToolFinished {
+                call_id: format!("c{i}"),
+                name: "read_file".into(),
+                result: format!("contents of file {i:02}\nline two of {i:02}"),
+                status: ToolStatus::Ok,
+                changed_files: Vec::new(),
+            });
+        }
+    }
+
+    fn change(app: &mut App, path: &str, kind: harness_tools::FileChangeKind) {
+        app.apply(UiEvent::ToolFinished {
+            call_id: format!("w-{path}"),
+            name: "edit_file".into(),
+            result: "ok".into(),
+            status: ToolStatus::Ok,
+            changed_files: vec![harness_tools::FileChange {
+                path: path.into(),
+                kind,
+            }],
+        });
+    }
+
+    #[test]
+    fn tab_moves_focus_through_every_panel_and_the_border_follows() {
+        let mut app = App::new("work".into(), "model".into(), &[], Vec::new(), Vec::new());
+        drawn(&app);
+        let order: Vec<Panel> = (0..4)
+            .map(|_| {
+                app.cycle_focus(false);
+                app.focus
+            })
+            .collect();
+        assert_eq!(
+            order,
+            [
+                Panel::Tasks,
+                Panel::Tools,
+                Panel::Files,
+                Panel::Conversation
+            ]
+        );
+        app.cycle_focus(true);
+        assert_eq!(app.focus, Panel::Files);
+
+        app.focus = Panel::Tools;
+        let mut terminal = Terminal::new(TestBackend::new(140, 42)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let tools = app.layout.get().tools;
+        let corner = &terminal.backend().buffer()[(tools.x, tools.y)];
+        assert_eq!(corner.fg, ACCENT, "the focused panel has the accent border");
+
+        app.sidebar_visible = false;
+        drawn(&app);
+        app.cycle_focus(false);
+        assert_eq!(
+            app.focus,
+            Panel::Conversation,
+            "hidden panels can't take focus"
+        );
+    }
+
+    #[test]
+    fn enter_on_a_tool_opens_its_full_request_and_result() {
+        let mut app = App::new("work".into(), "model".into(), &[], Vec::new(), Vec::new());
+        start_tools(&mut app, 3);
+        app.focus = Panel::Tools;
+        app.step_focused(-1);
+        app.open_focused(&FakeFiles::default());
+        assert_eq!(
+            app.detail.as_ref().map(|d| d.kind.clone()),
+            Some(DetailKind::Tool("c1".into()))
+        );
+        let text = drawn(&app);
+        assert!(text.contains("read_file · Completed"));
+        assert!(text.contains("line two of 01"), "the whole result is shown");
+
+        app.step_detail(true, &FakeFiles::default());
+        assert!(
+            drawn(&app).contains("line two of 02"),
+            "→ moves to the next call"
+        );
+    }
+
+    #[test]
+    fn changed_files_show_counts_and_open_as_a_diff() {
+        let mut app = App::new("work".into(), "model".into(), &[], Vec::new(), Vec::new());
+        change(
+            &mut app,
+            "src/a.rs",
+            harness_tools::FileChangeKind::Modified,
+        );
+        change(&mut app, "new.txt", harness_tools::FileChangeKind::Created);
+        let files = FakeFiles::default()
+            .with(
+                "src/a.rs",
+                Some(Some("one\ntwo\nthree")),
+                Some("one\n2\nthree"),
+            )
+            .with("new.txt", Some(None), Some("x\ny"));
+        app.refresh_file_stats(&files);
+        assert_eq!(app.changed_files[0].stats, Some((1, 1)));
+        assert_eq!(app.changed_files[1].stats, Some((2, 0)));
+        let panel = drawn(&app);
+        assert!(panel.contains("src/a.rs") && panel.contains("+1") && panel.contains("−1"));
+
+        app.focus = Panel::Files;
+        app.open_focused(&files);
+        let diff = drawn(&app);
+        assert!(diff.contains(" - two") && diff.contains(" + 2"));
+
+        app.step_detail(true, &files);
+        assert!(drawn(&app).contains("New file · 2 lines"));
+    }
+
+    #[test]
+    fn slash_diff_lists_every_changed_file() {
+        let mut app = App::new("work".into(), "model".into(), &[], Vec::new(), Vec::new());
+        change(&mut app, "a.rs", harness_tools::FileChangeKind::Modified);
+        change(&mut app, "b.rs", harness_tools::FileChangeKind::Modified);
+        let files = FakeFiles::default()
+            .with("a.rs", Some(Some("1")), Some("2"))
+            .with("b.rs", Some(Some("x")), Some("y"));
+        app.open_all_changes(&files);
+        let text = drawn(&app);
+        assert!(text.contains("Changes this session · 2 file(s)"));
+        assert!(text.contains(" + 2") && text.contains(" + y"));
+    }
+
+    #[test]
+    fn the_detail_view_scrolls_within_its_content() {
+        let mut app = App::new("work".into(), "model".into(), &[], Vec::new(), Vec::new());
+        app.apply(UiEvent::ToolStarted {
+            call_id: "big".into(),
+            name: "run_shell".into(),
+            args: r#"{"command":"seq 200"}"#.into(),
+        });
+        let output = (1..=200)
+            .map(|i| format!("row-{i:03}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.apply(UiEvent::ToolFinished {
+            call_id: "big".into(),
+            name: "run_shell".into(),
+            result: output,
+            status: ToolStatus::Ok,
+            changed_files: Vec::new(),
+        });
+        app.focus = Panel::Tools;
+        app.open_focused(&FakeFiles::default());
+        assert!(!drawn(&app).contains("row-200"));
+        app.scroll_detail(isize::MAX / 2);
+        let bottom = drawn(&app);
+        assert!(bottom.contains("row-200") && !bottom.contains("row-001"));
+        let layout = app.layout.get();
+        assert_eq!(
+            app.detail.as_ref().unwrap().scroll,
+            layout.detail_max_scroll
+        );
+    }
+
+    #[test]
+    fn clicking_a_tool_selects_it_and_a_second_click_opens_it() {
+        let mut app = App::new("work".into(), "model".into(), &[], Vec::new(), Vec::new());
+        start_tools(&mut app, 5);
+        drawn(&app);
+        let tools = app.layout.get().tools;
+        // Card 1 starts on the list's third row (two rows per card).
+        assert!(!app.click_at(tools.x + 3, tools.y + 1 + 2));
+        assert_eq!((app.focus, app.selected_tool), (Panel::Tools, 1));
+        assert!(
+            app.click_at(tools.x + 3, tools.y + 1 + 3),
+            "same card again"
+        );
+    }
+
+    #[test]
+    fn the_wheel_over_tools_moves_the_list_not_just_the_highlight() {
+        let mut app = App::new("work".into(), "model".into(), &[], Vec::new(), Vec::new());
+        start_tools(&mut app, 40);
+        let at_end = drawn(&app);
+        assert!(at_end.contains("file_39.rs") && !at_end.contains("file_00.rs"));
+        let tools = app.layout.get().tools;
+        for _ in 0..60 {
+            app.scroll_at(tools.x + 2, tools.y + 2, false);
+        }
+        let top = drawn(&app);
+        assert!(top.contains("file_00.rs") && !top.contains("file_39.rs"));
+        assert_eq!(app.tools_offset.get(), 0);
+    }
 
     #[test]
     fn narrow_layout_and_unicode_render_without_panicking() {

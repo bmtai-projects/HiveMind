@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -109,6 +110,8 @@ pub(crate) struct TuiBridge {
     queue: Arc<EventQueue>,
     approvals: Mutex<std::collections::HashMap<String, std::sync::mpsc::Sender<bool>>>,
     next_request_id: AtomicU64,
+    /// Each file's contents before the session first edited it.
+    baselines: Mutex<std::collections::HashMap<PathBuf, Option<String>>>,
 }
 
 impl TuiBridge {
@@ -117,7 +120,17 @@ impl TuiBridge {
             queue: Arc::new(EventQueue::default()),
             approvals: Mutex::new(std::collections::HashMap::new()),
             next_request_id: AtomicU64::new(1),
+            baselines: Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    /// `None`: never snapshotted. `Some(None)`: the file didn't exist before.
+    pub(crate) fn baseline(&self, path: &Path) -> Option<Option<String>> {
+        self.baselines
+            .lock()
+            .expect("TUI baselines poisoned")
+            .get(path)
+            .cloned()
     }
 
     pub(crate) fn drain(&self) -> Vec<UiEvent> {
@@ -200,6 +213,15 @@ impl Ui for TuiBridge {
 
     fn assistant_done(&self) {
         self.queue.push(UiEvent::AssistantDone);
+    }
+
+    fn file_snapshot(&self, path: &Path, before: Option<&str>) {
+        // First touch wins, so a diff spans the whole session.
+        self.baselines
+            .lock()
+            .expect("TUI baselines poisoned")
+            .entry(path.to_path_buf())
+            .or_insert_with(|| before.map(str::to_string));
     }
 
     // Unused: `tool_start_detailed` below adds the tool card instead.
@@ -341,6 +363,18 @@ mod tests {
         assert!(queue.drain().iter().any(
             |event| matches!(event, UiEvent::ApprovalRequested { request_id, .. } if request_id == "approval-2")
         ));
+    }
+
+    #[test]
+    fn the_first_snapshot_of_a_file_is_kept_for_the_whole_session() {
+        let bridge = TuiBridge::new();
+        let path = Path::new("/work/a.txt");
+        assert_eq!(bridge.baseline(path), None);
+        bridge.file_snapshot(path, Some("v1"));
+        bridge.file_snapshot(path, Some("v2"));
+        assert_eq!(bridge.baseline(path), Some(Some("v1".to_string())));
+        bridge.file_snapshot(Path::new("/work/new.txt"), None);
+        assert_eq!(bridge.baseline(Path::new("/work/new.txt")), Some(None));
     }
 
     #[test]

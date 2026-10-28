@@ -56,6 +56,20 @@ impl Checkpoint {
         }
     }
 
+    pub fn snapshot_count(&self) -> usize {
+        self.files.len()
+    }
+
+    /// Snapshots taken after the first `start`, in capture order.
+    pub fn snapshots_since(
+        &self,
+        start: usize,
+    ) -> impl Iterator<Item = (&std::path::Path, Option<&str>)> {
+        self.files[start.min(self.files.len())..]
+            .iter()
+            .map(|f| (f.path.as_path(), f.before.as_deref()))
+    }
+
     pub async fn capture(&mut self, workspace: &Workspace, calls: &[ToolCall]) {
         for call in calls {
             if !MUTATING_TOOLS.contains(&call.name.as_str()) {
@@ -268,6 +282,40 @@ mod tests {
         .await;
         assert_eq!(cp.files.len(), 1, "same path must not be captured twice");
         assert_eq!(cp.files[0].before.as_deref(), Some("v1"));
+    }
+
+    #[tokio::test]
+    async fn snapshots_since_yields_only_the_newly_captured_files() {
+        let w = ws();
+        std::fs::write(w.root.join("a.txt"), "a").unwrap();
+        let mut cp = Checkpoint::open("two files", 0);
+        cp.capture(
+            &w,
+            &[call(
+                "write_file",
+                serde_json::json!({"path": "a.txt", "content": "x"}),
+            )],
+        )
+        .await;
+        let known = cp.snapshot_count();
+        cp.capture(
+            &w,
+            &[
+                call(
+                    "write_file",
+                    serde_json::json!({"path": "a.txt", "content": "y"}),
+                ),
+                call(
+                    "write_file",
+                    serde_json::json!({"path": "b.txt", "content": "z"}),
+                ),
+            ],
+        )
+        .await;
+        let new: Vec<_> = cp.snapshots_since(known).collect();
+        assert_eq!(new.len(), 1);
+        assert!(new[0].0.ends_with("b.txt"));
+        assert_eq!(new[0].1, None);
     }
 
     #[tokio::test]

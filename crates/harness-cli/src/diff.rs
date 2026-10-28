@@ -213,7 +213,7 @@ pub fn render(lines: &[Line<'_>], max_lines: usize) -> String {
 
 /// Marks each line as worth printing: every change, plus [`CONTEXT`] lines
 /// either side of one.
-fn lines_worth_showing(lines: &[Line<'_>]) -> Vec<bool> {
+pub(crate) fn lines_worth_showing(lines: &[Line<'_>]) -> Vec<bool> {
     let mut keep = vec![false; lines.len()];
     for (i, l) in lines.iter().enumerate() {
         if l.op == Op::Same {
