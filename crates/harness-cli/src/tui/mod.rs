@@ -6,6 +6,7 @@ mod app;
 mod detail;
 mod events;
 mod listview;
+mod markdown;
 mod render;
 
 use std::io::{self, Stdout};
@@ -36,6 +37,69 @@ pub(crate) use events::TuiBridge;
 pub(crate) struct TuiConfig {
     pub(crate) workdir: PathBuf,
     pub(crate) workspace_label: String,
+    /// Shown in the header; see [`connection_label`].
+    pub(crate) connection: String,
+}
+
+/// Where requests go, without paths or secrets: "hosted", the provider's
+/// host, or "local · host:port".
+pub(crate) fn connection_label(backend: harness_config::Backend, base_url: &str) -> String {
+    let host = base_url
+        .split_once("://")
+        .map_or(base_url, |(_, rest)| rest)
+        .split('/')
+        .next()
+        .unwrap_or_default();
+    match backend {
+        harness_config::Backend::Hosted => "hosted".to_string(),
+        harness_config::Backend::Byok => host.to_string(),
+        harness_config::Backend::Local => format!("local · {host}"),
+    }
+}
+
+/// OSC 52 asks the terminal itself to set the clipboard, so it works over SSH too.
+fn osc52(text: &str) -> String {
+    format!("\x1b]52;c;{}\x07", base64(text.as_bytes()))
+}
+
+fn base64(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let n = chunk
+            .iter()
+            .enumerate()
+            .fold(0u32, |acc, (i, b)| acc | (u32::from(*b) << (16 - 8 * i)));
+        for i in 0..4 {
+            out.push(if i <= chunk.len() {
+                TABLE[(n >> (18 - 6 * i) & 63) as usize] as char
+            } else {
+                '='
+            });
+        }
+    }
+    out
+}
+
+fn copy_last_reply(app: &mut App) {
+    use std::io::Write;
+    let reply = app.last_reply.trim();
+    if reply.is_empty() {
+        app.apply(events::UiEvent::Notice("Nothing to copy yet".into()));
+        return;
+    }
+    let chars = reply.chars().count();
+    let sent = {
+        let mut out = io::stdout();
+        out.write_all(osc52(reply).as_bytes())
+            .and_then(|()| out.flush())
+    };
+    app.apply(events::UiEvent::Notice(match sent {
+        Ok(()) => format!(
+            "Copied the last reply ({chars} characters). Needs a terminal that allows clipboard access (OSC 52)."
+        ),
+        Err(error) => format!("Could not copy: {error}"),
+    }));
 }
 
 enum InputEvent {
@@ -110,6 +174,7 @@ pub(crate) async fn run(
         sessions,
         reviews,
     );
+    app.connection = config.connection;
     let interjections = agent.interjections();
     let (controller_tx, controller_rx) = tokio::sync::mpsc::channel(32);
     let controller = tokio::spawn(agent_controller(agent, bridge.clone(), controller_rx));
@@ -118,6 +183,7 @@ pub(crate) async fn run(
     let input_stop = Arc::new(AtomicBool::new(false));
     let input_task = spawn_input_pump(input_tx, input_stop.clone());
     let mut redraw = true;
+    let mut ticks: u64 = 0;
     let mut frame_clock = tokio::time::interval(Duration::from_millis(33));
     frame_clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -138,8 +204,12 @@ pub(crate) async fn run(
 
             tokio::select! {
                 _ = frame_clock.tick() => {
-                    // A capped tick drains coalesced agent events without redrawing
-                    // an unchanged frame.
+                    // Drains coalesced agent events; while running, ~10 redraws a
+                    // second keep the spinner and timer alive.
+                    ticks += 1;
+                    if app.run_state != app::RunState::Idle && ticks.is_multiple_of(3) {
+                        redraw = true;
+                    }
                 }
                 maybe_input = input_rx.recv() => {
                     let Some(input) = maybe_input else { break; };
@@ -287,6 +357,7 @@ async fn handle_input(
                     KeyCode::Char('l') => app.clear_local_conversation(),
                     KeyCode::Char('s') => app.sidebar_visible = !app.sidebar_visible,
                     KeyCode::Char('p') => app.palette_visible = true,
+                    KeyCode::Char('o') => app.open_transcript(),
                     _ => {}
                 }
                 return InputOutcome::Continue;
@@ -306,7 +377,12 @@ async fn handle_input(
                         app.cycle_focus(backwards);
                     }
                 }
-                KeyCode::Esc => app.focus = Panel::Conversation,
+                // Leave a side panel first; from the conversation, stop the run.
+                KeyCode::Esc if app.focus != Panel::Conversation => app.focus = Panel::Conversation,
+                KeyCode::Esc if app.run_state != app::RunState::Idle => {
+                    let _ = controller.send(ControllerCommand::Interrupt).await;
+                }
+                KeyCode::Char('?') if app.composer.is_empty() => app.open_help(),
                 KeyCode::Up => app.step_focused(-1),
                 KeyCode::Down => app.step_focused(1),
                 KeyCode::PageUp => app.page_focused(false),
@@ -365,14 +441,10 @@ async fn handle_command(
     let command = parts.next().unwrap_or_default();
     let argument = parts.next();
     match command {
-        "/help" => {
-            let list: Vec<String> = app::SLASH_COMMANDS
-                .iter()
-                .map(|(name, what)| format!("{name}  {what}"))
-                .collect();
-            app.apply(events::UiEvent::Notice(list.join("\n")));
-        }
+        "/help" => app.open_help(),
         "/diff" => app.open_all_changes(files),
+        "/transcript" => app.open_transcript(),
+        "/copy" => copy_last_reply(app),
         "/work" => app.view = View::Work,
         "/sessions" => app.view = View::Sessions,
         "/reviews" => app.view = View::Reviews,
@@ -674,6 +746,37 @@ fn cleanup_terminal_output(writer: &mut impl io::Write) -> io::Result<()> {
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;
+
+    #[test]
+    fn base64_matches_the_standard_alphabet_and_padding() {
+        assert_eq!(base64(b""), "");
+        assert_eq!(base64(b"f"), "Zg==");
+        assert_eq!(base64(b"fo"), "Zm8=");
+        assert_eq!(base64(b"foo"), "Zm9v");
+        assert_eq!(base64("नमस्ते".as_bytes()), "4KSo4KSu4KS44KWN4KSk4KWH");
+    }
+
+    #[test]
+    fn osc52_wraps_the_text_for_the_terminal_clipboard() {
+        assert_eq!(osc52("hi"), "\x1b]52;c;aGk=\x07");
+    }
+
+    #[test]
+    fn the_connection_label_names_the_destination_without_paths_or_secrets() {
+        use harness_config::Backend;
+        assert_eq!(
+            connection_label(Backend::Hosted, "https://api.hivemind.bmtai.in"),
+            "hosted"
+        );
+        assert_eq!(
+            connection_label(Backend::Byok, "https://openrouter.ai/api/v1"),
+            "openrouter.ai"
+        );
+        assert_eq!(
+            connection_label(Backend::Local, "http://127.0.0.1:11434/v1"),
+            "local · 127.0.0.1:11434"
+        );
+    }
 
     #[test]
     fn cleanup_writes_the_commands_that_restore_the_normal_terminal_screen() {

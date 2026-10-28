@@ -51,6 +51,9 @@ pub(crate) enum DetailKind {
     Tool(String),
     File(usize),
     Changes,
+    /// The whole conversation with every tool call expanded.
+    Transcript,
+    Help,
 }
 
 /// A scrollable view over the body. Diffs are frozen when opened; a tool's
@@ -75,7 +78,7 @@ pub(crate) enum CostStatus {
 
 /// Listed as you type `/` -- VS Code's terminal swallows Ctrl+P and F1.
 pub(crate) const SLASH_COMMANDS: &[(&str, &str)] = &[
-    ("/help", "list commands"),
+    ("/help", "keys and commands"),
     ("/model", "<id>  switch model"),
     ("/reasoning", "<level|off>"),
     ("/budget", "<amount|off>"),
@@ -84,6 +87,8 @@ pub(crate) const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/compact", "summarize older context"),
     ("/undo", "[n]  undo recent turns"),
     ("/diff", "every change this session"),
+    ("/transcript", "everything, tool calls expanded"),
+    ("/copy", "copy the last reply"),
     ("/cost", "spend so far"),
     ("/status", "session status"),
     ("/work", "conversation view"),
@@ -270,9 +275,34 @@ pub(crate) struct ConversationLine {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ConversationKind {
+    /// "You" or "HiveMind" above a message.
+    Heading,
     User,
     Assistant,
     Notice,
+    /// One tool call in the narrative; `text` holds its call id.
+    Tool,
+}
+
+/// How a tool reads in the conversation: "Edit script.js", not "edit_file".
+pub(crate) fn tool_verb(name: &str) -> &str {
+    match name {
+        "read_file" | "read_program" => "Read",
+        "write_file" => "Write",
+        "edit_file" => "Edit",
+        "run_shell" => "Shell",
+        "list_dir" => "List",
+        "search" | "semantic_search" => "Search",
+        "project_map" => "Map",
+        "todo_write" => "Plan",
+        "web_search" => "Web search",
+        "web_fetch" => "Fetch",
+        "create_pdf" => "PDF",
+        "create_spreadsheet" => "Spreadsheet",
+        "create_diagram" => "Diagram",
+        "read_artifact" => "Artifact",
+        other => other,
+    }
 }
 
 pub(crate) struct App {
@@ -309,6 +339,14 @@ pub(crate) struct App {
     assistant_stream_open: bool,
     /// One "HiveMind" heading per reply, not one per stream segment.
     reply_heading_shown: bool,
+    /// When the current request started, for the live status line.
+    pub(crate) run_started: Option<std::time::Instant>,
+    /// The latest reply's raw text, for `/copy`.
+    pub(crate) last_reply: String,
+    /// The latest request's prompt size, for context usage.
+    pub(crate) last_prompt_tokens: u64,
+    /// Where requests go, e.g. "openrouter.ai" or "local · 127.0.0.1:11434".
+    pub(crate) connection: String,
     pub(crate) sessions: Vec<harness_agent::SessionSummary>,
     pub(crate) reviews: Vec<ReviewReport>,
 }
@@ -351,6 +389,10 @@ impl App {
             cost_status: CostStatus::Known,
             assistant_stream_open: false,
             reply_heading_shown: false,
+            run_started: None,
+            last_reply: String::new(),
+            last_prompt_tokens: 0,
+            connection: String::new(),
             sessions,
             reviews,
         };
@@ -380,7 +422,10 @@ impl App {
 
     pub(crate) fn apply(&mut self, event: UiEvent) {
         match event {
-            UiEvent::TurnStarted => self.run_state = RunState::Working,
+            UiEvent::TurnStarted => {
+                self.run_state = RunState::Working;
+                self.run_started.get_or_insert_with(std::time::Instant::now);
+            }
             UiEvent::AssistantDelta(text) => self.append_assistant_delta(&text),
             UiEvent::AssistantDone => self.assistant_stream_open = false,
             UiEvent::ToolStarted {
@@ -390,6 +435,7 @@ impl App {
             } => {
                 // Auto-follow only if the newest call was selected, so browsing isn't interrupted.
                 let following = self.selected_tool + 1 >= self.tools.len();
+                self.push_tool_row(&call_id);
                 self.tools.push_back(ToolCard {
                     call_id,
                     summary: tool_summary(&name, &args),
@@ -419,6 +465,7 @@ impl App {
                     card.result = result.clone();
                     card.state = tool_state(status);
                 } else {
+                    self.push_tool_row(&call_id);
                     self.tools.push_back(ToolCard {
                         call_id,
                         name: name.clone(),
@@ -449,6 +496,7 @@ impl App {
                 session_cost_usd,
             } => {
                 self.model = model;
+                self.last_prompt_tokens = prompt_tokens;
                 self.session_prompt_tokens += prompt_tokens;
                 self.session_completion_tokens += completion_tokens;
                 self.session_cost_usd = session_cost_usd;
@@ -481,6 +529,7 @@ impl App {
             UiEvent::Notice(message) => self.push_notice(message),
             UiEvent::RunStopped { message } => {
                 self.run_state = RunState::Idle;
+                self.run_started = None;
                 self.push_notice(message);
             }
         }
@@ -492,6 +541,42 @@ impl App {
         self.conversation_top = None;
         self.reply_heading_shown = false;
         self.assistant_stream_open = false;
+        self.last_reply.clear();
+    }
+
+    fn push_tool_row(&mut self, call_id: &str) {
+        self.assistant_stream_open = false;
+        self.conversation.push_back(ConversationLine {
+            text: call_id.to_string(),
+            kind: ConversationKind::Tool,
+        });
+        self.trim_conversation();
+    }
+
+    /// What the agent is doing right now, for the status line; `None` when idle.
+    pub(crate) fn activity(&self) -> Option<String> {
+        if self.run_state == RunState::Idle {
+            return None;
+        }
+        if self.run_state == RunState::WaitingForApproval {
+            return Some("Waiting for your approval".into());
+        }
+        if let Some(card) = self
+            .tools
+            .iter()
+            .rev()
+            .find(|card| card.state == ToolState::Running)
+        {
+            return Some(format!("{} {}", tool_verb(&card.name), card.summary));
+        }
+        Some(
+            if self.assistant_stream_open {
+                "Writing"
+            } else {
+                "Thinking"
+            }
+            .into(),
+        )
     }
 
     /// Positive `rows` scrolls toward newer output. Reaching the bottom resumes following.
@@ -698,6 +783,26 @@ impl App {
         });
     }
 
+    /// Ctrl+O: everything so far, every tool call expanded, opened at the end.
+    pub(crate) fn open_transcript(&mut self) {
+        self.detail = Some(Detail {
+            kind: DetailKind::Transcript,
+            title: " Transcript · every tool call expanded ".into(),
+            lines: Vec::new(),
+            scroll: usize::MAX / 2,
+        });
+    }
+
+    /// `?` or `/help`: every key and command.
+    pub(crate) fn open_help(&mut self) {
+        self.detail = Some(Detail {
+            kind: DetailKind::Help,
+            title: " Keys and commands ".into(),
+            lines: super::detail::help_lines(),
+            scroll: 0,
+        });
+    }
+
     /// `/diff`: every file this session changed, one after another.
     pub(crate) fn open_all_changes(&mut self, files: &dyn FileSource) {
         let entries: Vec<_> = self
@@ -741,7 +846,7 @@ impl App {
                     self.open_file(next, files);
                 }
             }
-            DetailKind::Changes => {}
+            DetailKind::Changes | DetailKind::Transcript | DetailKind::Help => {}
         }
     }
 
@@ -778,6 +883,7 @@ impl App {
     pub(crate) fn run_finished(&mut self, result: Result<(), String>) {
         if self.approval.is_none() {
             self.run_state = RunState::Idle;
+            self.run_started = None;
         }
         if let Err(error) = result {
             self.push_notice(error);
@@ -815,7 +921,7 @@ impl App {
             if !self.reply_heading_shown {
                 self.conversation.push_back(ConversationLine {
                     text: "HiveMind".into(),
-                    kind: ConversationKind::Assistant,
+                    kind: ConversationKind::Heading,
                 });
                 self.reply_heading_shown = true;
             } else if self.conversation.back().is_some_and(|l| !l.text.is_empty()) {
@@ -831,6 +937,7 @@ impl App {
             });
             self.assistant_stream_open = true;
         }
+        self.last_reply.push_str(delta);
         for part in delta.split_inclusive('\n') {
             if part.ends_with('\n') {
                 if let Some(line) = self.conversation.back_mut() {
@@ -849,13 +956,14 @@ impl App {
 
     fn push_message(&mut self, kind: ConversationKind, text: &str, heading: bool) {
         if heading {
-            let title = match kind {
-                ConversationKind::User => "You",
-                ConversationKind::Assistant | ConversationKind::Notice => "HiveMind",
+            let title = if kind == ConversationKind::User {
+                "You"
+            } else {
+                "HiveMind"
             };
             self.conversation.push_back(ConversationLine {
                 text: title.into(),
-                kind,
+                kind: ConversationKind::Heading,
             });
         }
         for line in text.lines().chain(text.is_empty().then_some("")) {
