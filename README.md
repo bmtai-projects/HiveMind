@@ -200,8 +200,16 @@ Useful keys:
   lists every key.
 
 The same slash commands as the plain REPL work here too, plus `/copy` to copy
-the last reply. The interface captures the mouse so the wheel can scroll each
-panel, so select text with `Shift`+drag (`Option`+drag in iTerm2).
+the last reply. `/model` and `/reasoning` open a list: `↑`/`↓` to move, `Enter`
+to choose, `Esc` to cancel, and type to filter the models. With your own key the
+model list comes from your provider when it publishes one. OpenRouter also says
+which reasoning levels each model accepts, size and price included. Where a
+provider doesn't say, `/reasoning` offers `low`, `medium` and `high`, marked as
+unverified, and sends your choice as-is. You can still type `/model <id>` or
+`/reasoning <level>` directly.
+
+The interface captures the mouse so the wheel can scroll each panel, so select
+text with `Shift`+drag (`Option`+drag in iTerm2).
 
 **For editors and other tools**
 

@@ -81,6 +81,19 @@ impl ChatClient {
         });
     }
 
+    /// Ask the server which models it offers (`GET {base}/models`). Servers
+    /// without that route answer with an error, which callers treat as "unknown".
+    pub async fn list_models(&self) -> Result<Vec<crate::RemoteModel>, ProviderError> {
+        let mut req = self
+            .http
+            .get(format!("{}/models", self.base_url))
+            .header("Accept", "application/json");
+        if !self.api_key.is_empty() {
+            req = req.header("Authorization", format!("Bearer {}", self.api_key));
+        }
+        crate::models::fetch_models(req).await
+    }
+
     /// Start one streaming sampling request. Borrows `req` only long enough
     /// to serialize it (synchronously, before any `.await`) — the caller
     /// gets `req`'s ownership straight back, so driving a multi-turn
@@ -401,6 +414,45 @@ mod tests {
         assert!(
             sent.to_lowercase().contains("authorization: bearer sk-abc"),
             "expected a bearer token:\n{sent}"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_models_gets_the_models_route_with_the_bearer_token() {
+        let (url, rx) = crate::models::test_server::serve_json(
+            "200 OK",
+            r#"{"data":[{"id":"m1","reasoning":{"supported_efforts":["high","none"]}}]}"#,
+        )
+        .await;
+        let models = ChatClient::new(format!("{url}/v1"), "sk-abc")
+            .list_models()
+            .await
+            .unwrap();
+        let sent = rx.await.unwrap();
+        assert!(sent.starts_with("GET /v1/models "), "{sent}");
+        assert!(
+            sent.to_lowercase().contains("authorization: bearer sk-abc"),
+            "{sent}"
+        );
+        assert_eq!(models[0].id, "m1");
+        assert_eq!(models[0].reasoning_efforts.as_ref().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_keyless_list_request_carries_no_auth_header() {
+        let (url, rx) = crate::models::test_server::serve_json("200 OK", r#"{"data":[]}"#).await;
+        ChatClient::new(url, "").list_models().await.unwrap();
+        assert!(!rx.await.unwrap().to_lowercase().contains("authorization"));
+    }
+
+    #[tokio::test]
+    async fn a_server_without_a_model_list_is_an_error_not_an_empty_list() {
+        let (url, _rx) =
+            crate::models::test_server::serve_json("404 Not Found", "no such route").await;
+        let err = ChatClient::new(url, "k").list_models().await.unwrap_err();
+        assert!(
+            matches!(err, ProviderError::Http { status: 404, .. }),
+            "{err}"
         );
     }
 

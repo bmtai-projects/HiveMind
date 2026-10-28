@@ -1389,28 +1389,45 @@ async fn repl(
                 }
                 SlashCommand::Model(ModelArg::Show) => {
                     println!("model: {}", agent.current_model());
-                    print_model_catalog();
+                    if agent.backend().is_hosted() {
+                        print_model_catalog();
+                    } else {
+                        match agent.refresh_models().await {
+                            Ok(_) => {
+                                print_listed_models(agent.listed_models(), agent.current_model())
+                            }
+                            Err(_) => println!(
+                                "  this provider doesn't publish a model list; use /model <id>"
+                            ),
+                        }
+                    }
                 }
                 SlashCommand::Model(ModelArg::Set(id)) => {
                     agent.set_model(id.clone());
                     println!("model set to {id}");
                 }
                 SlashCommand::Reasoning(ReasoningArg::Show) => {
+                    load_models_once(agent).await;
                     match agent.reasoning_effort() {
                         Some(level) => println!("reasoning: {level}"),
                         None => println!("reasoning: off"),
                     }
-                    let valid = agent.reasoning_efforts_for_current_model();
-                    if valid.is_empty() {
+                    let options = agent.reasoning_options();
+                    if options.unsupported() {
                         println!(
                             "  {} doesn't support adjustable reasoning effort",
                             agent.current_model()
                         );
                     } else {
                         println!(
-                            "  valid for {}: {} (or \"off\")",
+                            "  valid for {}: {} (or \"off\"){}",
                             agent.current_model(),
-                            valid.join(", ")
+                            options.levels.join(", "),
+                            if options.verified {
+                                ""
+                            } else {
+                                " -- not verified: the provider doesn't say, so a choice is sent as-is"
+                            }
                         );
                     }
                 }
@@ -1419,20 +1436,28 @@ async fn repl(
                     println!("reasoning off");
                 }
                 SlashCommand::Reasoning(ReasoningArg::Set(level)) => {
-                    let valid = agent.reasoning_efforts_for_current_model();
-                    if valid.is_empty() {
+                    load_models_once(agent).await;
+                    let options = agent.reasoning_options();
+                    if options.unsupported() {
                         println!(
                             "{} doesn't support adjustable reasoning effort",
                             agent.current_model()
                         );
-                    } else if valid.contains(&level.as_str()) {
+                    } else if options.allows(&level) {
                         agent.set_reasoning_effort(Some(level.clone()));
-                        println!("reasoning set to {level}");
+                        println!(
+                            "reasoning set to {level}{}",
+                            if options.verified {
+                                ""
+                            } else {
+                                " (not verified for this model; sent as-is)"
+                            }
+                        );
                     } else {
                         println!(
                             "invalid reasoning level {level:?} for {} -- valid: {}",
                             agent.current_model(),
-                            valid.join(", ")
+                            options.levels.join(", ")
                         );
                     }
                 }
@@ -1627,6 +1652,31 @@ fn context_gauge(used: u64, window: u64, width: usize) -> (u64, usize) {
 /// my workspace". Deliberately includes the change list: cost and model are
 /// easy to remember, but "which files has it touched" is the thing a user
 /// actually loses track of during a long session.
+/// Asks the provider for its model list once; hosted sessions use the catalog.
+async fn load_models_once(agent: &mut Agent) {
+    if !agent.backend().is_hosted() && !agent.models_loaded() {
+        let _ = agent.refresh_models().await;
+    }
+}
+
+/// The first few models a provider lists, with the one in use marked.
+fn print_listed_models(models: &[harness_agent::RemoteModel], current: &str) {
+    const SHOWN: usize = 40;
+    for model in models.iter().take(SHOWN) {
+        let marker = if model.id == current { "*" } else { " " };
+        match model.context_window {
+            Some(window) => println!("  {marker} {}  ({}k context)", model.id, window / 1000),
+            None => println!("  {marker} {}", model.id),
+        }
+    }
+    if models.len() > SHOWN {
+        println!(
+            "  ... and {} more. Switch with /model <id>.",
+            models.len() - SHOWN
+        );
+    }
+}
+
 fn print_status(agent: &Agent) {
     println!("\x1b[1mmodel\x1b[0m      {}", agent.current_model());
     println!(

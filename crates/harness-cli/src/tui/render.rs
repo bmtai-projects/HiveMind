@@ -8,8 +8,8 @@ use ratatui::widgets::{
 };
 
 use super::app::{
-    App, ConversationKind, CostStatus, Panel, RunState, TodoState, ToolCard, ToolState, View,
-    failure_reason, slash_matches, tool_verb,
+    App, ConversationKind, CostStatus, Panel, PickerKind, RunState, TodoState, ToolCard, ToolState,
+    View, failure_reason, slash_matches, tool_verb,
 };
 use super::{listview, markdown};
 
@@ -28,6 +28,8 @@ pub(crate) fn draw(frame: &mut Frame, app: &App) {
     layout.tasks = Rect::default();
     layout.files = Rect::default();
     layout.sidebar_shown = false;
+    layout.picker = Rect::default();
+    layout.picker_list = Rect::default();
     app.layout.set(layout);
 
     let area = frame.area();
@@ -61,9 +63,10 @@ pub(crate) fn draw(frame: &mut Frame, app: &App) {
     render_composer(frame, app, chunks[2]);
     render_footer(frame, app, chunks[3], compact);
 
-    if app.approval.is_none() && !app.palette_visible {
+    if app.approval.is_none() && !app.palette_visible && app.picker.is_none() {
         render_slash_hints(frame, app, chunks[2]);
     }
+    render_picker(frame, app);
     if let Some(approval) = &app.approval {
         render_approval(frame, approval.command.as_str());
     } else if app.palette_visible {
@@ -101,7 +104,10 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
         ),
         Span::styled("│  ", Style::default().fg(BORDER)),
         Span::raw("workspace: "),
-        Span::styled(shorten(&app.workspace, 44), Style::default().fg(ACCENT)),
+        Span::styled(
+            shorten(&display_workspace(&app.workspace), 44),
+            Style::default().fg(ACCENT),
+        ),
         Span::raw("     "),
     ];
     if !app.connection.is_empty() {
@@ -115,6 +121,12 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
         shorten(&app.model, 28),
         Style::default().fg(Color::White),
     ));
+    if let Some(level) = &app.reasoning {
+        spans.push(Span::styled(
+            format!(" · reasoning {level}"),
+            Style::default().fg(MUTED),
+        ));
+    }
     if let Some(percent) = context_percent(app) {
         let color = match percent {
             0..60 => MUTED,
@@ -590,7 +602,7 @@ fn render_composer(frame: &mut Frame, app: &App, area: Rect) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
     // Approval and the palette take the keyboard, so no cursor there.
-    let wants_cursor = app.approval.is_none() && !app.palette_visible;
+    let wants_cursor = app.approval.is_none() && !app.palette_visible && app.picker.is_none();
 
     if app.composer.is_empty() {
         // Starts one column in, so the cursor doesn't cover its first letter.
@@ -811,6 +823,144 @@ pub(crate) fn tool_style(state: ToolState) -> Style {
     }
 }
 
+/// Windows hands back paths as `\\?\C:\...`; show the one a person would type.
+fn display_workspace(path: &str) -> String {
+    match path.strip_prefix(r"\\?\") {
+        Some(rest) => match rest.strip_prefix(r"UNC\") {
+            Some(share) => format!(r"\\{share}"),
+            None => rest.to_string(),
+        },
+        None => path.to_string(),
+    }
+}
+
+/// The `/model` and `/reasoning` list: a title, an optional note and filter,
+/// then the rows, scrolled so the highlighted one stays in view.
+fn render_picker(frame: &mut Frame, app: &App) {
+    let Some(picker) = &app.picker else {
+        return;
+    };
+    let area = frame.area();
+    let rows_wanted = picker.items.len().clamp(3, 14) as u16;
+    let note_rows = picker.note.as_ref().map_or(0, |note| {
+        let width = (area.width * 72 / 100).saturating_sub(4).max(10) as usize;
+        wrap_rows(note, width).len().min(3) as u16
+    });
+    let filter_row = u16::from(picker.kind == PickerKind::Model);
+    let height = (rows_wanted + note_rows + filter_row + 2).min(area.height);
+    let rect = centered_rect(72, height, area);
+    let hint = match picker.kind {
+        PickerKind::Model => " ↑↓ choose · Enter select · type to filter · Esc cancel ",
+        PickerKind::Reasoning => " ↑↓ choose · Enter select · Esc cancel ",
+    };
+    frame.render_widget(Clear, rect);
+    let block = boxed(picker.title.clone())
+        .border_style(Style::default().fg(ACCENT))
+        .title_bottom(hint);
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+
+    let parts = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(note_rows),
+            Constraint::Length(filter_row),
+            Constraint::Min(1),
+        ])
+        .split(inner);
+    if let Some(note) = &picker.note {
+        frame.render_widget(
+            Paragraph::new(note.clone())
+                .style(Style::default().fg(YELLOW))
+                .wrap(Wrap { trim: true }),
+            parts[0],
+        );
+    }
+    if filter_row == 1 {
+        let shown = picker.visible().len();
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("Filter: ", Style::default().fg(MUTED)),
+                Span::raw(picker.filter.clone()),
+                Span::styled("▌", Style::default().fg(ACCENT)),
+                Span::styled(
+                    format!("   {shown} of {}", picker.items.len()),
+                    Style::default().fg(MUTED),
+                ),
+            ])),
+            parts[1],
+        );
+    }
+
+    let list_area = parts[2];
+    let mut layout = app.layout.get();
+    layout.picker = rect;
+    layout.picker_list = list_area;
+    app.layout.set(layout);
+
+    let visible = picker.visible();
+    if picker.loading || visible.is_empty() {
+        let text = if picker.loading {
+            "Loading…".to_string()
+        } else {
+            format!("Nothing matches \"{}\".", picker.filter)
+        };
+        frame.render_widget(
+            Paragraph::new(Line::styled(text, Style::default().fg(MUTED))),
+            list_area,
+        );
+        return;
+    }
+    let width = list_area.width as usize;
+    let label_width = visible
+        .iter()
+        .map(|&i| display_width(&picker.items[i].label))
+        .max()
+        .unwrap_or(0)
+        .min(width / 2);
+    let items: Vec<ListItem<'static>> = visible
+        .iter()
+        .map(|&index| {
+            let item = &picker.items[index];
+            let marker = if item.current { "● " } else { "  " };
+            let label = shorten(&item.label, label_width);
+            let pad = " ".repeat(label_width.saturating_sub(display_width(&label)) + 2);
+            let detail_room = width.saturating_sub(2 + label_width + 2 + 2);
+            ListItem::new(Line::from(vec![
+                Span::styled(marker, Style::default().fg(GREEN)),
+                Span::styled(label, Style::default().add_modifier(Modifier::BOLD)),
+                Span::raw(pad),
+                Span::styled(
+                    shorten(&item.detail, detail_room),
+                    Style::default().fg(MUTED),
+                ),
+            ]))
+        })
+        .collect();
+    let rows = list_area.height as usize;
+    let heights = vec![1; visible.len()];
+    let selected = picker.selected.min(visible.len() - 1);
+    let offset = listview::offset_showing(&heights, picker.offset.get(), selected, rows);
+    picker.offset.set(offset);
+    let mut state = ListState::default()
+        .with_offset(offset)
+        .with_selected(Some(selected));
+    frame.render_stateful_widget(
+        List::new(items)
+            .highlight_style(Style::default().bg(Color::Rgb(38, 50, 62)))
+            .highlight_symbol(""),
+        list_area,
+        &mut state,
+    );
+    let max = listview::max_offset(&heights, rows);
+    if max > 0 {
+        let mut bar = ScrollbarState::new(max + 1)
+            .viewport_content_length(rows)
+            .position(offset.min(max));
+        render_scrollbar(frame, rect, &mut bar);
+    }
+}
+
 fn centered_rect(percent_x: u16, height: u16, area: Rect) -> Rect {
     let width = area
         .width
@@ -841,8 +991,9 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
+    use super::super::app::PickerChoice;
     use super::super::app::{DetailKind, FileSource};
-    use super::super::events::UiEvent;
+    use super::super::events::{ModelChoice, UiEvent};
     use super::*;
 
     #[derive(Default)]
@@ -1493,6 +1644,362 @@ mod tests {
         let buffer = terminal.backend().buffer();
         assert_eq!(buffer[(cursor.x, cursor.y)].symbol(), " ");
         assert!(screen(&terminal).contains("Ask HiveMind"));
+    }
+
+    fn choice(
+        id: &str,
+        name: Option<&str>,
+        window: Option<u64>,
+        prices: Option<(f64, f64)>,
+    ) -> ModelChoice {
+        ModelChoice {
+            id: id.into(),
+            name: name.map(str::to_string),
+            context_window: window,
+            input_per_m: prices.map(|p| p.0),
+            output_per_m: prices.map(|p| p.1),
+        }
+    }
+
+    fn picker_app(current: &str, choices: Vec<ModelChoice>) -> App {
+        let mut app = App::new("work".into(), current.into(), &[], Vec::new(), Vec::new());
+        app.open_model_picker();
+        app.apply(UiEvent::ModelChoices {
+            current: current.into(),
+            result: Ok(choices),
+        });
+        app
+    }
+
+    #[test]
+    fn the_workspace_path_loses_the_windows_verbatim_prefix() {
+        assert_eq!(
+            display_workspace(r"\\?\C:\Users\me\proj"),
+            r"C:\Users\me\proj"
+        );
+        assert_eq!(
+            display_workspace(r"\\?\UNC\server\share\proj"),
+            r"\\server\share\proj"
+        );
+        assert_eq!(display_workspace(r"C:\plain"), r"C:\plain");
+        assert_eq!(display_workspace("/home/me/proj"), "/home/me/proj");
+        let app = App::new(
+            r"\\?\C:\Users\me\proj".into(),
+            "m".into(),
+            &[],
+            Vec::new(),
+            Vec::new(),
+        );
+        let text = drawn(&app);
+        assert!(text.contains(r"workspace: C:\Users\me\proj"), "{text}");
+        assert!(!text.contains(r"\\?\"));
+    }
+
+    #[test]
+    fn the_model_picker_shows_loading_then_real_choices_with_size_and_price() {
+        let mut app = App::new(
+            "work".into(),
+            "deepseek/deepseek-v4-flash".into(),
+            &[],
+            Vec::new(),
+            Vec::new(),
+        );
+        app.open_model_picker();
+        let loading = drawn(&app);
+        assert!(
+            loading.contains("Choose a model") && loading.contains("Loading"),
+            "{loading}"
+        );
+
+        app.apply(UiEvent::ModelChoices {
+            current: "deepseek/deepseek-v4-flash".into(),
+            result: Ok(vec![
+                choice(
+                    "anthropic/claude-sonnet-5",
+                    Some("Claude Sonnet 5"),
+                    Some(1_000_000),
+                    Some((3.0, 15.0)),
+                ),
+                choice(
+                    "deepseek/deepseek-v4-flash",
+                    Some("DeepSeek V4 Flash"),
+                    Some(1_048_576),
+                    Some((0.14, 0.28)),
+                ),
+                choice("tiny/model", None, None, None),
+            ]),
+        });
+        let text = drawn(&app);
+        assert!(
+            text.contains("● deepseek/deepseek-v4-flash"),
+            "the model in use is marked: {text}"
+        );
+        assert!(
+            text.contains("1M ctx") && text.contains("$0.14 in / $0.28 out per 1M"),
+            "{text}"
+        );
+        assert!(text.contains("anthropic/claude-sonnet-5") && text.contains("tiny/model"));
+        assert!(text.contains("Filter:") && text.contains("3 of 3"));
+        let order: Vec<usize> = [
+            "deepseek/deepseek-v4-flash",
+            "anthropic/claude-sonnet-5",
+            "tiny/model",
+        ]
+        .iter()
+        .map(|id| text.find(id).unwrap())
+        .collect();
+        assert!(
+            order[0] < order[1] && order[1] < order[2],
+            "the current model leads the list"
+        );
+    }
+
+    #[test]
+    fn typing_filters_the_models_and_enter_picks_the_top_match() {
+        let mut app = picker_app(
+            "a/one",
+            vec![
+                choice("a/one", None, None, None),
+                choice("b/claude-sonnet", None, None, None),
+                choice("c/claude-haiku", None, None, None),
+            ],
+        );
+        for ch in "claude".chars() {
+            app.picker.as_mut().unwrap().type_char(ch);
+        }
+        let list = drawn_in(&app, |a| a.layout.get().picker);
+        assert!(list.contains("2 of 3") && !list.contains("a/one"), "{list}");
+        app.picker.as_mut().unwrap().move_by(1);
+        assert_eq!(
+            app.apply_picker(),
+            Some(PickerChoice::Model("c/claude-haiku".into()))
+        );
+        assert!(app.picker.is_none(), "choosing closes the list");
+
+        let mut none = picker_app("a/one", vec![choice("a/one", None, None, None)]);
+        for ch in "zzz".chars() {
+            none.picker.as_mut().unwrap().type_char(ch);
+        }
+        assert!(drawn(&none).contains("Nothing matches"));
+        assert_eq!(none.apply_picker(), None, "no match, nothing to pick");
+        none.picker.as_mut().unwrap().backspace();
+        none.picker.as_mut().unwrap().backspace();
+        none.picker.as_mut().unwrap().backspace();
+        assert!(none.apply_picker().is_some());
+    }
+
+    #[test]
+    fn a_long_model_list_scrolls_and_keeps_the_highlight_in_view() {
+        let many: Vec<ModelChoice> = (0..464)
+            .map(|i| choice(&format!("vendor/model-{i:03}"), None, None, None))
+            .collect();
+        let mut app = picker_app("vendor/model-000", many);
+        assert!(drawn(&app).contains("464 of 464"));
+        app.picker.as_mut().unwrap().move_by(isize::MAX / 2);
+        let end = drawn(&app);
+        assert!(
+            end.contains("vendor/model-463"),
+            "End reaches the last model: {end}"
+        );
+        assert!(!end.contains("vendor/model-001"));
+        app.picker.as_mut().unwrap().move_by(-5);
+        assert!(drawn(&app).contains("vendor/model-458"));
+    }
+
+    #[test]
+    fn a_provider_that_lists_nothing_still_lets_you_keep_or_type_a_model() {
+        let mut app = App::new(
+            "work".into(),
+            "my/model".into(),
+            &[],
+            Vec::new(),
+            Vec::new(),
+        );
+        app.open_model_picker();
+        app.apply(UiEvent::ModelChoices {
+            current: "my/model".into(),
+            result: Err("This provider doesn't publish a list of its models".into()),
+        });
+        let text = drawn(&app);
+        assert!(
+            text.contains("doesn't publish a list of its models"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Use /model <id>") && text.contains("● my/model"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn the_reasoning_picker_lists_off_and_exactly_the_levels_the_model_accepts() {
+        let mut app = App::new(
+            "work".into(),
+            "deepseek/deepseek-v4-flash".into(),
+            &[],
+            Vec::new(),
+            Vec::new(),
+        );
+        app.open_reasoning_picker();
+        app.apply(UiEvent::ReasoningChoices {
+            model: "deepseek/deepseek-v4-flash".into(),
+            current: Some("high".into()),
+            levels: vec!["xhigh".into(), "high".into(), "none".into()],
+            verified: true,
+        });
+        let text = drawn(&app);
+        assert!(
+            text.contains("How much should deepseek/deepseek-v4-flash think?"),
+            "{text}"
+        );
+        for level in ["off", "xhigh", "high", "none"] {
+            assert!(text.contains(level), "{level} missing: {text}");
+        }
+        assert!(
+            !text.contains("medium"),
+            "only levels the model accepts: {text}"
+        );
+        assert!(text.contains("● high") && !text.contains("● off"), "{text}");
+        assert!(
+            !text.contains("sent as-is"),
+            "verified levels carry no warning"
+        );
+        assert!(!text.contains("Filter:"), "a short list needs no filter");
+
+        assert_eq!(
+            app.picker.as_ref().unwrap().chosen().unwrap().value,
+            "high",
+            "starts on the current level"
+        );
+        app.picker.as_mut().unwrap().move_by(1);
+        assert_eq!(
+            app.apply_picker(),
+            Some(PickerChoice::Reasoning(Some("none".into())))
+        );
+    }
+
+    #[test]
+    fn choosing_off_turns_reasoning_off() {
+        let mut app = App::new("work".into(), "m".into(), &[], Vec::new(), Vec::new());
+        app.open_reasoning_picker();
+        app.apply(UiEvent::ReasoningChoices {
+            model: "m".into(),
+            current: Some("high".into()),
+            levels: vec!["high".into()],
+            verified: true,
+        });
+        app.picker.as_mut().unwrap().move_by(-1);
+        assert_eq!(app.apply_picker(), Some(PickerChoice::Reasoning(None)));
+    }
+
+    #[test]
+    fn unverified_levels_say_they_are_a_guess() {
+        let mut app = App::new("work".into(), "llama3".into(), &[], Vec::new(), Vec::new());
+        app.open_reasoning_picker();
+        app.apply(UiEvent::ReasoningChoices {
+            model: "llama3".into(),
+            current: None,
+            levels: vec!["low".into(), "medium".into(), "high".into()],
+            verified: false,
+        });
+        let text = drawn(&app);
+        assert!(
+            text.contains("can't tell which levels this model accepts"),
+            "{text}"
+        );
+        assert!(
+            text.contains("sent as-is") && text.contains("● off"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_model_with_no_reasoning_gets_a_note_instead_of_an_empty_list() {
+        let mut app = App::new(
+            "work".into(),
+            "grok-build".into(),
+            &[],
+            Vec::new(),
+            Vec::new(),
+        );
+        app.open_reasoning_picker();
+        app.apply(UiEvent::ReasoningChoices {
+            model: "grok-build".into(),
+            current: None,
+            levels: Vec::new(),
+            verified: true,
+        });
+        assert!(app.picker.is_none());
+        assert!(app.conversation.iter().any(|l| {
+            l.text
+                .contains("grok-build has no adjustable reasoning level")
+        }));
+    }
+
+    #[test]
+    fn a_reply_that_arrives_after_the_picker_was_closed_is_ignored() {
+        let mut app = App::new("work".into(), "m".into(), &[], Vec::new(), Vec::new());
+        app.open_model_picker();
+        app.close_picker();
+        app.apply(UiEvent::ModelChoices {
+            current: "m".into(),
+            result: Ok(vec![choice("x/y", None, None, None)]),
+        });
+        assert!(app.picker.is_none());
+    }
+
+    #[test]
+    fn clicking_a_row_chooses_it_and_the_wheel_moves_the_highlight() {
+        let mut app = picker_app(
+            "a/one",
+            vec![
+                choice("a/one", None, None, None),
+                choice("b/two", None, None, None),
+                choice("c/three", None, None, None),
+            ],
+        );
+        drawn(&app);
+        let list = app.layout.get().picker_list;
+        app.scroll_at(list.x + 2, list.y, true);
+        assert_eq!(
+            app.picker.as_ref().unwrap().selected,
+            2,
+            "the wheel moves the highlight, clamped"
+        );
+        assert!(app.picker.is_some(), "scrolling alone does not choose");
+        assert_eq!(
+            app.click_picker(list.x + 4, list.y + 1),
+            Some(PickerChoice::Model("b/two".into()))
+        );
+        assert!(app.picker.is_none());
+
+        let mut outside = picker_app("a/one", vec![choice("a/one", None, None, None)]);
+        drawn(&outside);
+        assert_eq!(
+            outside.click_picker(0, 0),
+            None,
+            "a click outside the rows chooses nothing"
+        );
+        assert!(outside.picker.is_some());
+    }
+
+    #[test]
+    fn the_command_hints_step_aside_while_a_picker_is_open() {
+        let mut app = picker_app("a/one", vec![choice("a/one", None, None, None)]);
+        app.composer = "/mo".into();
+        assert!(!drawn(&app).contains("Tab completes"));
+        app.close_picker();
+        assert!(drawn(&app).contains("Tab completes"));
+    }
+
+    #[test]
+    fn the_header_shows_the_reasoning_level_once_one_is_set() {
+        let mut app = App::new("work".into(), "m".into(), &[], Vec::new(), Vec::new());
+        assert!(!drawn(&app).contains("reasoning "));
+        app.apply(UiEvent::ReasoningChanged(Some("high".into())));
+        assert!(drawn(&app).contains("reasoning high"));
+        app.apply(UiEvent::ReasoningChanged(None));
+        assert!(!drawn(&app).contains("reasoning high"));
     }
 
     #[test]

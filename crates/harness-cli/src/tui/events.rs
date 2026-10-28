@@ -11,6 +11,16 @@ use harness_types::Usage;
 
 const MAX_QUEUED_EVENTS: usize = 512;
 
+/// One model the picker can offer.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub(crate) struct ModelChoice {
+    pub(crate) id: String,
+    pub(crate) name: Option<String>,
+    pub(crate) context_window: Option<u64>,
+    pub(crate) input_per_m: Option<f64>,
+    pub(crate) output_per_m: Option<f64>,
+}
+
 /// Events produced by the agent and consumed by the TUI event loop.  Keeping
 /// this boundary typed means the screen never has to infer a tool outcome by
 /// inspecting its printed output.
@@ -41,6 +51,19 @@ pub(crate) enum UiEvent {
         session_cost_usd: f64,
     },
     ModelChanged(String),
+    /// The answer to `/model`: what can be chosen, or why that is unknown.
+    ModelChoices {
+        current: String,
+        result: Result<Vec<ModelChoice>, String>,
+    },
+    /// The answer to `/reasoning`. `verified` is false when `levels` is a guess.
+    ReasoningChoices {
+        model: String,
+        current: Option<String>,
+        levels: Vec<String>,
+        verified: bool,
+    },
+    ReasoningChanged(Option<String>),
     RunFinished {
         error: Option<String>,
     },
@@ -184,6 +207,29 @@ impl TuiBridge {
 
     pub(crate) fn model_changed(&self, model: impl Into<String>) {
         self.queue.push(UiEvent::ModelChanged(model.into()));
+    }
+
+    pub(crate) fn model_choices(&self, current: String, result: Result<Vec<ModelChoice>, String>) {
+        self.queue.push(UiEvent::ModelChoices { current, result });
+    }
+
+    pub(crate) fn reasoning_choices(
+        &self,
+        model: String,
+        current: Option<String>,
+        levels: Vec<String>,
+        verified: bool,
+    ) {
+        self.queue.push(UiEvent::ReasoningChoices {
+            model,
+            current,
+            levels,
+            verified,
+        });
+    }
+
+    pub(crate) fn reasoning_changed(&self, level: Option<String>) {
+        self.queue.push(UiEvent::ReasoningChanged(level));
     }
 
     pub(crate) fn run_finished(&self, result: anyhow::Result<()>) {
