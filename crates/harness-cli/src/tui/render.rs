@@ -8,10 +8,10 @@ use ratatui::widgets::{
 };
 
 use super::app::{
-    App, ConversationKind, CostStatus, Panel, RunState, TodoState, ToolState, View, failure_reason,
-    slash_matches,
+    App, ConversationKind, CostStatus, Panel, RunState, TodoState, ToolCard, ToolState, View,
+    failure_reason, slash_matches, tool_verb,
 };
-use super::listview;
+use super::{listview, markdown};
 
 pub(crate) const BORDER: Color = Color::Rgb(83, 101, 119);
 pub(crate) const MUTED: Color = Color::Rgb(159, 173, 189);
@@ -94,7 +94,7 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
         RunState::Working => Style::default().fg(GREEN).add_modifier(Modifier::BOLD),
         RunState::WaitingForApproval => Style::default().fg(YELLOW).add_modifier(Modifier::BOLD),
     };
-    let title = Line::from(vec![
+    let mut spans = vec![
         Span::styled(
             " HiveMind ",
             Style::default().fg(GREEN).add_modifier(Modifier::BOLD),
@@ -102,12 +102,60 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
         Span::styled("│  ", Style::default().fg(BORDER)),
         Span::raw("workspace: "),
         Span::styled(shorten(&app.workspace, 44), Style::default().fg(ACCENT)),
-        Span::raw("     model: "),
-        Span::styled(shorten(&app.model, 28), Style::default().fg(Color::White)),
-        Span::raw("     state: "),
-        Span::styled(format!("● {}", app.run_state.label()), state_style),
-    ]);
-    frame.render_widget(Paragraph::new(title).block(boxed("")), area);
+        Span::raw("     "),
+    ];
+    if !app.connection.is_empty() {
+        spans.push(Span::styled(
+            format!("{} · ", shorten(&app.connection, 30)),
+            Style::default().fg(MUTED),
+        ));
+    }
+    spans.push(Span::raw("model: "));
+    spans.push(Span::styled(
+        shorten(&app.model, 28),
+        Style::default().fg(Color::White),
+    ));
+    if let Some(percent) = context_percent(app) {
+        let color = match percent {
+            0..60 => MUTED,
+            60..85 => YELLOW,
+            _ => RED,
+        };
+        spans.push(Span::styled(
+            format!("     ctx {percent}%"),
+            Style::default().fg(color),
+        ));
+    }
+    spans.push(Span::raw("     state: "));
+    spans.push(Span::styled(
+        format!("● {}", app.run_state.label()),
+        state_style,
+    ));
+    frame.render_widget(Paragraph::new(Line::from(spans)).block(boxed("")), area);
+}
+
+/// How full the model's context was on the latest request. Only shown for
+/// models with a known window; a guessed one would mislead.
+fn context_percent(app: &App) -> Option<u64> {
+    let window = harness_config::lookup_model(&app.model)?.context_window;
+    (window > 0 && app.last_prompt_tokens > 0)
+        .then(|| (app.last_prompt_tokens * 100 / window).min(100))
+}
+
+const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/// The message box title while a run is going: what is happening, for how long.
+fn activity_title(app: &App, width: u16) -> Option<Line<'static>> {
+    let activity = app.activity()?;
+    let elapsed = app.run_started.map(|t| t.elapsed()).unwrap_or_default();
+    let frame = SPINNER[(elapsed.as_millis() / 100) as usize % SPINNER.len()];
+    let tail = format!(" · {}s · Esc to stop ", elapsed.as_secs());
+    let room = (width as usize).saturating_sub(display_width(&tail) + 8);
+    Some(Line::from(vec![
+        Span::styled(format!(" {frame} "), Style::default().fg(GREEN)),
+        Span::styled(shorten(&activity, room), Style::default().fg(Color::White)),
+        Span::styled(tail, Style::default().fg(MUTED)),
+    ]))
 }
 
 fn render_main(frame: &mut Frame, app: &App, area: Rect) {
@@ -118,24 +166,76 @@ fn render_main(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
-fn render_conversation(frame: &mut Frame, app: &App, area: Rect) {
-    let lines: Vec<Line<'static>> = app
-        .conversation
+/// The conversation as drawn. `expand_tools` inlines each call's full
+/// request and result, for the transcript view.
+pub(crate) fn conversation_lines(app: &App, expand_tools: bool) -> Vec<Line<'static>> {
+    let cards: std::collections::HashMap<&str, &ToolCard> = app
+        .tools
         .iter()
-        .map(|line| match line.kind {
-            ConversationKind::User => Line::from(Span::styled(
-                line.text.clone(),
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-            )),
-            ConversationKind::Assistant => Line::from(Span::styled(
+        .map(|card| (card.call_id.as_str(), card))
+        .collect();
+    let mut in_code = false;
+    let mut out = Vec::with_capacity(app.conversation.len());
+    for line in &app.conversation {
+        match line.kind {
+            ConversationKind::Heading => {
+                in_code = false;
+                let color = if line.text == "You" { ACCENT } else { GREEN };
+                out.push(Line::styled(
+                    format!("▌{}", line.text),
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                ));
+            }
+            ConversationKind::User => out.push(Line::styled(
                 line.text.clone(),
                 Style::default().fg(Color::White),
             )),
-            ConversationKind::Notice => {
-                Line::from(Span::styled(line.text.clone(), Style::default().fg(MUTED)))
+            ConversationKind::Assistant => {
+                out.push(markdown::render_line(&line.text, &mut in_code))
             }
-        })
-        .collect();
+            ConversationKind::Notice => {
+                out.push(Line::styled(line.text.clone(), Style::default().fg(MUTED)))
+            }
+            ConversationKind::Tool => {
+                // Trimmed from the tool list long ago: nothing left to show.
+                let Some(card) = cards.get(line.text.as_str()) else {
+                    continue;
+                };
+                let style = tool_style(card.state);
+                out.push(Line::from(vec![
+                    Span::styled(format!("  {} ", card.state.symbol()), style),
+                    Span::styled(
+                        tool_verb(&card.name).to_string(),
+                        Style::default()
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(format!("  {}", card.summary), Style::default().fg(MUTED)),
+                ]));
+                if expand_tools {
+                    out.extend(super::detail::tool_lines(card).into_iter().map(indented));
+                    out.push(Line::raw(""));
+                } else if let Some(reason) = failure_reason(card) {
+                    out.push(Line::styled(
+                        format!("    ↳ {reason}"),
+                        Style::default().fg(RED),
+                    ));
+                }
+            }
+        }
+    }
+    out
+}
+
+fn indented(line: Line<'static>) -> Line<'static> {
+    let mut spans = vec![Span::styled("    │ ", Style::default().fg(BORDER))];
+    let style = line.style;
+    spans.extend(line.spans);
+    Line::from(spans).style(style)
+}
+
+fn render_conversation(frame: &mut Frame, app: &App, area: Rect) {
+    let lines = conversation_lines(app, false);
     let title = if app.conversation_top.is_some() {
         " Conversation · scrolled up · End for latest "
     } else {
@@ -481,9 +581,10 @@ fn render_reviews(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_composer(frame: &mut Frame, app: &App, area: Rect) {
-    let title = match app.view {
-        View::Work => " Message HiveMind ",
-        View::Sessions | View::Reviews => " Message HiveMind  (/work to go back) ",
+    let title = match (activity_title(app, area.width), app.view) {
+        (Some(activity), _) => activity,
+        (None, View::Work) => " Message HiveMind ".into(),
+        (None, View::Sessions | View::Reviews) => " Message HiveMind  (/work to go back) ".into(),
     };
     let block = boxed(title).border_style(Style::default().fg(ACCENT));
     let inner = block.inner(area);
@@ -599,9 +700,9 @@ fn wrap_rows(text: &str, width: usize) -> Vec<String> {
 fn render_footer(frame: &mut Frame, app: &App, area: Rect, compact: bool) {
     let text = match (app.detail.is_some(), compact) {
         (true, _) => "↑↓ PgUp PgDn scroll  ←→ previous/next  Esc close",
-        (false, true) => "Tab panel  ↑↓ scroll  Enter open  Ctrl+C stop",
+        (false, true) => "Tab panel  ↑↓ scroll  Enter open  ? help",
         (false, false) => {
-            "Enter send  Tab next panel  ↑↓ scroll  Enter open  /diff changes  Shift+drag select  Ctrl+C stop"
+            "Enter send  Tab panel  ↑↓ scroll  Enter open  Ctrl+O transcript  Esc stop  ? help"
         }
     };
     // Usage gets its space first; the key hints are what gets clipped.
@@ -952,19 +1053,156 @@ mod tests {
         );
     }
 
+    /// Text inside one panel, so other panels can't satisfy an assertion.
+    fn drawn_in(app: &App, area: impl Fn(&App) -> Rect) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(140, 42)).unwrap();
+        terminal.draw(|frame| draw(frame, app)).unwrap();
+        let rect = area(app);
+        let buffer = terminal.backend().buffer();
+        let mut out = String::new();
+        for y in rect.y..rect.bottom() {
+            for x in rect.x..rect.right() {
+                out.push_str(buffer[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
     #[test]
     fn the_wheel_over_tools_moves_the_list_not_just_the_highlight() {
         let mut app = App::new("work".into(), "model".into(), &[], Vec::new(), Vec::new());
         start_tools(&mut app, 40);
-        let at_end = drawn(&app);
+        let tools_panel = |app: &App| app.layout.get().tools;
+        let at_end = drawn_in(&app, tools_panel);
         assert!(at_end.contains("file_39.rs") && !at_end.contains("file_00.rs"));
         let tools = app.layout.get().tools;
         for _ in 0..60 {
             app.scroll_at(tools.x + 2, tools.y + 2, false);
         }
-        let top = drawn(&app);
+        let top = drawn_in(&app, tools_panel);
         assert!(top.contains("file_00.rs") && !top.contains("file_39.rs"));
         assert_eq!(app.tools_offset.get(), 0);
+    }
+
+    #[test]
+    fn tool_calls_appear_in_the_conversation_where_they_happened() {
+        let mut app = App::new("work".into(), "model".into(), &[], Vec::new(), Vec::new());
+        app.submitted("check the site");
+        app.apply(UiEvent::AssistantDelta("Checking.\n".into()));
+        app.apply(UiEvent::ToolStarted {
+            call_id: "a".into(),
+            name: "edit_file".into(),
+            args: r#"{"path":"script.js","old_string":"a","new_string":"b"}"#.into(),
+        });
+        app.apply(UiEvent::ToolStarted {
+            call_id: "b".into(),
+            name: "run_shell".into(),
+            args: r#"{"command":"node --check script.js"}"#.into(),
+        });
+        app.apply(UiEvent::ToolFinished {
+            call_id: "b".into(),
+            name: "run_shell".into(),
+            result: "SyntaxError: Unexpected token".into(),
+            status: ToolStatus::Failed,
+            changed_files: Vec::new(),
+        });
+        app.apply(UiEvent::AssistantDelta("Fixed it.".into()));
+        let chat = drawn_in(&app, |app| app.layout.get().conversation);
+        let edit = chat.find("Edit  script.js  +1 −1").expect("edit row");
+        let shell = chat
+            .find("Shell  node --check script.js")
+            .expect("shell row");
+        let reason = chat
+            .find("↳ SyntaxError: Unexpected token")
+            .expect("failure reason");
+        let after = chat.find("Fixed it.").expect("reply after the tools");
+        assert!(chat.find("Checking.").unwrap() < edit && edit < shell);
+        assert!(shell < reason && reason < after);
+    }
+
+    #[test]
+    fn replies_render_markdown_and_headings_are_marked() {
+        let mut app = App::new("work".into(), "model".into(), &[], Vec::new(), Vec::new());
+        app.submitted("explain");
+        app.apply(UiEvent::AssistantDelta(
+            "## Key features\n- **Cart** persists\n```js\nlet x = **y**;\n```\n".into(),
+        ));
+        let chat = drawn_in(&app, |app| app.layout.get().conversation);
+        assert!(chat.contains("▌You") && chat.contains("▌HiveMind"));
+        assert!(chat.contains("Key features") && !chat.contains("## Key"));
+        assert!(chat.contains("• Cart persists"));
+        assert!(chat.contains("│ let x = **y**;"), "code is left verbatim");
+    }
+
+    #[test]
+    fn the_message_box_title_says_what_is_running_and_how_to_stop_it() {
+        let mut app = App::new("work".into(), "model".into(), &[], Vec::new(), Vec::new());
+        app.apply(UiEvent::TurnStarted);
+        assert!(drawn(&app).contains("Thinking"));
+        app.apply(UiEvent::ToolStarted {
+            call_id: "a".into(),
+            name: "run_shell".into(),
+            args: r#"{"command":"curl -s http://localhost:8080"}"#.into(),
+        });
+        let text = drawn(&app);
+        assert!(text.contains("Shell curl -s http://localhost:8080"));
+        assert!(text.contains("Esc to stop"));
+        app.apply(UiEvent::RunFinished { error: None });
+        let idle = drawn(&app);
+        assert!(idle.contains("Message HiveMind") && !idle.contains("Esc to stop"));
+    }
+
+    #[test]
+    fn the_transcript_expands_every_tool_call_inline() {
+        let mut app = App::new("work".into(), "model".into(), &[], Vec::new(), Vec::new());
+        app.submitted("look");
+        start_tools(&mut app, 2);
+        app.open_transcript();
+        let text = drawn(&app);
+        assert!(text.contains("Transcript · every tool call expanded"));
+        assert!(text.contains("line two of 00") && text.contains("line two of 01"));
+    }
+
+    #[test]
+    fn question_mark_help_lists_keys_and_commands() {
+        let mut app = App::new("work".into(), "model".into(), &[], Vec::new(), Vec::new());
+        app.open_help();
+        let text = drawn(&app);
+        assert!(text.contains("Keys and commands"));
+        assert!(text.contains("Ctrl+O") && text.contains("next / previous panel"));
+    }
+
+    #[test]
+    fn the_header_shows_the_connection_and_known_context_use() {
+        let mut app = App::new(
+            "work".into(),
+            "hivemind".into(),
+            &[],
+            Vec::new(),
+            Vec::new(),
+        );
+        app.connection = "openrouter.ai".into();
+        let window = harness_config::lookup_model("hivemind")
+            .unwrap()
+            .context_window;
+        app.apply(UiEvent::Usage {
+            model: "hivemind".into(),
+            prompt_tokens: window / 4,
+            completion_tokens: 10,
+            turn_cost_usd: Some(0.01),
+            billed: true,
+            session_cost_usd: 0.01,
+        });
+        let text = drawn(&app);
+        assert!(text.contains("openrouter.ai · model: hivemind"));
+        assert!(text.contains("ctx 25%"));
+
+        app.model = "some/unknown-model".into();
+        assert!(
+            !drawn(&app).contains("ctx "),
+            "no guess for an unknown window"
+        );
     }
 
     #[test]

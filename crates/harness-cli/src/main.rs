@@ -994,6 +994,7 @@ async fn run(args: ActivateArgs) -> anyhow::Result<()> {
             TuiConfig {
                 workdir,
                 workspace_label: workspace,
+                connection: tui::connection_label(resolved.backend, &resolved.endpoint.base_url),
             },
         )
         .await;
