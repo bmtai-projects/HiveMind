@@ -8,21 +8,26 @@ use ratatui::widgets::{
 };
 
 use super::app::{
-    App, ConversationKind, CostStatus, RunState, TodoState, ToolState, View, slash_matches,
+    App, ConversationKind, CostStatus, Panel, RunState, TodoState, ToolCard, ToolState, View,
+    failure_reason, slash_matches, tool_verb,
 };
+use super::{listview, markdown};
 
-const BORDER: Color = Color::Rgb(83, 101, 119);
-const MUTED: Color = Color::Rgb(159, 173, 189);
-const ACCENT: Color = Color::Rgb(99, 208, 225);
-const GREEN: Color = Color::Rgb(113, 239, 157);
-const YELLOW: Color = Color::Rgb(250, 198, 79);
-const RED: Color = Color::Rgb(246, 120, 111);
+pub(crate) const BORDER: Color = Color::Rgb(83, 101, 119);
+pub(crate) const MUTED: Color = Color::Rgb(159, 173, 189);
+pub(crate) const ACCENT: Color = Color::Rgb(99, 208, 225);
+pub(crate) const GREEN: Color = Color::Rgb(113, 239, 157);
+pub(crate) const YELLOW: Color = Color::Rgb(250, 198, 79);
+pub(crate) const RED: Color = Color::Rgb(246, 120, 111);
 
 pub(crate) fn draw(frame: &mut Frame, app: &App) {
-    // Hidden panels must not keep catching the mouse wheel.
+    // Hidden panels must not keep catching the mouse or Tab focus.
     let mut layout = app.layout.get();
     layout.conversation = Rect::default();
     layout.tools = Rect::default();
+    layout.tasks = Rect::default();
+    layout.files = Rect::default();
+    layout.sidebar_shown = false;
     app.layout.set(layout);
 
     let area = frame.area();
@@ -51,6 +56,8 @@ pub(crate) fn draw(frame: &mut Frame, app: &App) {
         render_main(frame, app, body[0]);
         render_sidebar(frame, app, body[1]);
     }
+    // Over the body only, so the message box and footer stay usable.
+    super::detail::render_detail(frame, app, chunks[1]);
     render_composer(frame, app, chunks[2]);
     render_footer(frame, app, chunks[3], compact);
 
@@ -61,16 +68,24 @@ pub(crate) fn draw(frame: &mut Frame, app: &App) {
         render_approval(frame, approval.command.as_str());
     } else if app.palette_visible {
         render_palette(frame);
-    } else if app.details_visible {
-        render_tool_details(frame, app);
     }
 }
 
-fn boxed(title: impl Into<Line<'static>>) -> Block<'static> {
+pub(crate) fn boxed(title: impl Into<Line<'static>>) -> Block<'static> {
     Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(BORDER))
         .title(title)
+}
+
+/// A side or main panel; the focused one gets the accent border.
+fn panel(app: &App, which: Panel, title: impl Into<Line<'static>>) -> Block<'static> {
+    let block = boxed(title);
+    if app.focus == which && app.detail.is_none() {
+        block.border_style(Style::default().fg(ACCENT))
+    } else {
+        block
+    }
 }
 
 fn render_header(frame: &mut Frame, app: &App, area: Rect) {
@@ -79,7 +94,7 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
         RunState::Working => Style::default().fg(GREEN).add_modifier(Modifier::BOLD),
         RunState::WaitingForApproval => Style::default().fg(YELLOW).add_modifier(Modifier::BOLD),
     };
-    let title = Line::from(vec![
+    let mut spans = vec![
         Span::styled(
             " HiveMind ",
             Style::default().fg(GREEN).add_modifier(Modifier::BOLD),
@@ -87,12 +102,60 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
         Span::styled("│  ", Style::default().fg(BORDER)),
         Span::raw("workspace: "),
         Span::styled(shorten(&app.workspace, 44), Style::default().fg(ACCENT)),
-        Span::raw("     model: "),
-        Span::styled(shorten(&app.model, 28), Style::default().fg(Color::White)),
-        Span::raw("     state: "),
-        Span::styled(format!("● {}", app.run_state.label()), state_style),
-    ]);
-    frame.render_widget(Paragraph::new(title).block(boxed("")), area);
+        Span::raw("     "),
+    ];
+    if !app.connection.is_empty() {
+        spans.push(Span::styled(
+            format!("{} · ", shorten(&app.connection, 30)),
+            Style::default().fg(MUTED),
+        ));
+    }
+    spans.push(Span::raw("model: "));
+    spans.push(Span::styled(
+        shorten(&app.model, 28),
+        Style::default().fg(Color::White),
+    ));
+    if let Some(percent) = context_percent(app) {
+        let color = match percent {
+            0..60 => MUTED,
+            60..85 => YELLOW,
+            _ => RED,
+        };
+        spans.push(Span::styled(
+            format!("     ctx {percent}%"),
+            Style::default().fg(color),
+        ));
+    }
+    spans.push(Span::raw("     state: "));
+    spans.push(Span::styled(
+        format!("● {}", app.run_state.label()),
+        state_style,
+    ));
+    frame.render_widget(Paragraph::new(Line::from(spans)).block(boxed("")), area);
+}
+
+/// How full the model's context was on the latest request. Only shown for
+/// models with a known window; a guessed one would mislead.
+fn context_percent(app: &App) -> Option<u64> {
+    let window = harness_config::lookup_model(&app.model)?.context_window;
+    (window > 0 && app.last_prompt_tokens > 0)
+        .then(|| (app.last_prompt_tokens * 100 / window).min(100))
+}
+
+const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/// The message box title while a run is going: what is happening, for how long.
+fn activity_title(app: &App, width: u16) -> Option<Line<'static>> {
+    let activity = app.activity()?;
+    let elapsed = app.run_started.map(|t| t.elapsed()).unwrap_or_default();
+    let frame = SPINNER[(elapsed.as_millis() / 100) as usize % SPINNER.len()];
+    let tail = format!(" · {}s · Esc to stop ", elapsed.as_secs());
+    let room = (width as usize).saturating_sub(display_width(&tail) + 8);
+    Some(Line::from(vec![
+        Span::styled(format!(" {frame} "), Style::default().fg(GREEN)),
+        Span::styled(shorten(&activity, room), Style::default().fg(Color::White)),
+        Span::styled(tail, Style::default().fg(MUTED)),
+    ]))
 }
 
 fn render_main(frame: &mut Frame, app: &App, area: Rect) {
@@ -103,30 +166,82 @@ fn render_main(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
-fn render_conversation(frame: &mut Frame, app: &App, area: Rect) {
-    let lines: Vec<Line<'static>> = app
-        .conversation
+/// The conversation as drawn. `expand_tools` inlines each call's full
+/// request and result, for the transcript view.
+pub(crate) fn conversation_lines(app: &App, expand_tools: bool) -> Vec<Line<'static>> {
+    let cards: std::collections::HashMap<&str, &ToolCard> = app
+        .tools
         .iter()
-        .map(|line| match line.kind {
-            ConversationKind::User => Line::from(Span::styled(
-                line.text.clone(),
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-            )),
-            ConversationKind::Assistant => Line::from(Span::styled(
+        .map(|card| (card.call_id.as_str(), card))
+        .collect();
+    let mut in_code = false;
+    let mut out = Vec::with_capacity(app.conversation.len());
+    for line in &app.conversation {
+        match line.kind {
+            ConversationKind::Heading => {
+                in_code = false;
+                let color = if line.text == "You" { ACCENT } else { GREEN };
+                out.push(Line::styled(
+                    format!("▌{}", line.text),
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                ));
+            }
+            ConversationKind::User => out.push(Line::styled(
                 line.text.clone(),
                 Style::default().fg(Color::White),
             )),
-            ConversationKind::Notice => {
-                Line::from(Span::styled(line.text.clone(), Style::default().fg(MUTED)))
+            ConversationKind::Assistant => {
+                out.push(markdown::render_line(&line.text, &mut in_code))
             }
-        })
-        .collect();
+            ConversationKind::Notice => {
+                out.push(Line::styled(line.text.clone(), Style::default().fg(MUTED)))
+            }
+            ConversationKind::Tool => {
+                // Trimmed from the tool list long ago: nothing left to show.
+                let Some(card) = cards.get(line.text.as_str()) else {
+                    continue;
+                };
+                let style = tool_style(card.state);
+                out.push(Line::from(vec![
+                    Span::styled(format!("  {} ", card.state.symbol()), style),
+                    Span::styled(
+                        tool_verb(&card.name).to_string(),
+                        Style::default()
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(format!("  {}", card.summary), Style::default().fg(MUTED)),
+                ]));
+                if expand_tools {
+                    out.extend(super::detail::tool_lines(card).into_iter().map(indented));
+                    out.push(Line::raw(""));
+                } else if let Some(reason) = failure_reason(card) {
+                    out.push(Line::styled(
+                        format!("    ↳ {reason}"),
+                        Style::default().fg(RED),
+                    ));
+                }
+            }
+        }
+    }
+    out
+}
+
+fn indented(line: Line<'static>) -> Line<'static> {
+    let mut spans = vec![Span::styled("    │ ", Style::default().fg(BORDER))];
+    let style = line.style;
+    spans.extend(line.spans);
+    Line::from(spans).style(style)
+}
+
+fn render_conversation(frame: &mut Frame, app: &App, area: Rect) {
+    let lines = conversation_lines(app, false);
     let title = if app.conversation_top.is_some() {
         " Conversation · scrolled up · End for latest "
     } else {
         " Conversation "
     };
-    let block = boxed(title);
+    let block = panel(app, Panel::Conversation, title);
     let inner = block.inner(area);
     let paragraph = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
     // Counted in wrapped rows, so long lines can't push the newest text out of view.
@@ -155,7 +270,7 @@ fn render_conversation(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
-fn render_scrollbar(frame: &mut Frame, area: Rect, state: &mut ScrollbarState) {
+pub(crate) fn render_scrollbar(frame: &mut Frame, area: Rect, state: &mut ScrollbarState) {
     frame.render_stateful_widget(
         Scrollbar::new(ScrollbarOrientation::VerticalRight)
             .begin_symbol(None)
@@ -171,15 +286,18 @@ fn render_scrollbar(frame: &mut Frame, area: Rect, state: &mut ScrollbarState) {
 }
 
 fn render_sidebar(frame: &mut Frame, app: &App, area: Rect) {
-    // Tasks take up to two fifths of the panel; past that the list scrolls.
+    let mut layout = app.layout.get();
+    layout.sidebar_shown = true;
+    app.layout.set(layout);
+    // Tasks and files each take a share; past it their lists scroll.
     let tasks = (app.todos.len().max(1) as u16 + 2).min((area.height * 2 / 5).max(3));
-    let changes = app.changed_files.len().min(5) as u16;
+    let files = (app.changed_files.len().max(1) as u16 + 2).min((area.height / 4).max(3));
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(tasks),
-            Constraint::Min(8),
-            Constraint::Length((changes + 3).max(4)),
+            Constraint::Min(6),
+            Constraint::Length(files),
         ])
         .split(area);
     render_tasks(frame, app, chunks[0]);
@@ -228,7 +346,8 @@ fn render_tasks(frame: &mut Frame, app: &App, area: Rect) {
             .collect()
     };
     let mut state = ListState::default().with_offset(offset);
-    frame.render_stateful_widget(List::new(items).block(boxed(title)), area, &mut state);
+    let block = panel(app, Panel::Tasks, title);
+    frame.render_stateful_widget(List::new(items).block(block), area, &mut state);
     if max_offset > 0 {
         let mut bar = ScrollbarState::new(max_offset + 1)
             .viewport_content_length(visible)
@@ -237,12 +356,35 @@ fn render_tasks(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
+/// Highlights the selected row only while its panel has focus.
+fn selectable_list<'a>(items: Vec<ListItem<'a>>, block: Block<'a>, focused: bool) -> List<'a> {
+    let list = List::new(items).block(block);
+    if focused {
+        list.highlight_style(Style::default().bg(Color::Rgb(38, 50, 62)))
+            .highlight_symbol("›")
+    } else {
+        list.highlight_symbol(" ")
+    }
+}
+
 fn render_tools(frame: &mut Frame, app: &App, area: Rect) {
+    let rows = area.height.saturating_sub(2) as usize;
     let mut layout = app.layout.get();
     layout.tools = area;
+    layout.tools_rows = rows;
     app.layout.set(layout);
 
-    let block = boxed(format!(" Tools ({})  Tab details ", app.tools.len()));
+    let focused = app.focus == Panel::Tools;
+    let hint = if focused {
+        "· ↑↓ select · Enter details "
+    } else {
+        ""
+    };
+    let block = panel(
+        app,
+        Panel::Tools,
+        format!(" Tools {} {hint}", app.tools.len()),
+    );
     if app.tools.is_empty() {
         frame.render_widget(
             Paragraph::new(Line::styled(
@@ -275,56 +417,95 @@ fn render_tools(frame: &mut Frame, app: &App, area: Rect) {
                 ),
             ];
             // A failure says why right on the card.
-            if matches!(tool.state, ToolState::Failed | ToolState::TimedOut)
-                && let Some(reason) = tool.result.lines().find(|line| !line.trim().is_empty())
-            {
+            if let Some(reason) = failure_reason(tool) {
                 lines.push(Line::styled(
-                    format!("  {}", shorten(reason.trim(), detail_width)),
+                    format!("  {}", shorten(reason, detail_width)),
                     Style::default().fg(RED),
                 ));
             }
             ListItem::new(lines)
         })
         .collect();
-    let selected = app.selected_tool.min(app.tools.len().saturating_sub(1));
-    // Stateful so ratatui keeps the selected call scrolled into view.
-    let mut state = ListState::default().with_selected(Some(selected));
-    let list = List::new(items)
-        .block(block)
-        .highlight_style(Style::default().bg(Color::Rgb(38, 50, 62)))
-        .highlight_symbol("›");
-    frame.render_stateful_widget(list, area, &mut state);
-    // Each card is two rows.
-    if app.tools.len() * 2 > area.height.saturating_sub(2) as usize {
-        let mut bar = ScrollbarState::new(app.tools.len()).position(selected);
+    let heights = app.tool_heights();
+    let selected = app.selected_tool.min(app.tools.len() - 1);
+    let offset = listview::offset_showing(&heights, app.tools_offset.get(), selected, rows);
+    app.tools_offset.set(offset);
+    let mut state = ListState::default()
+        .with_offset(offset)
+        .with_selected(Some(selected));
+    frame.render_stateful_widget(selectable_list(items, block, focused), area, &mut state);
+    let max = listview::max_offset(&heights, rows);
+    if max > 0 {
+        let mut bar = ScrollbarState::new(max + 1).position(offset.min(max));
         render_scrollbar(frame, area, &mut bar);
     }
 }
 
 fn render_changes(frame: &mut Frame, app: &App, area: Rect) {
-    let items: Vec<ListItem<'static>> = if app.changed_files.is_empty() {
-        vec![ListItem::new(Line::styled(
-            "No files changed",
-            Style::default().fg(MUTED),
-        ))]
-    } else {
-        app.changed_files
-            .iter()
-            .take(5)
-            .map(|file| {
-                let (kind, color) = match file.kind {
-                    harness_tools::FileChangeKind::Created => ("A", GREEN),
-                    harness_tools::FileChangeKind::Modified => ("M", YELLOW),
-                    harness_tools::FileChangeKind::Deleted => ("D", RED),
-                };
-                ListItem::new(Line::from(vec![
-                    Span::styled(format!("{kind}  "), Style::default().fg(color)),
-                    Span::raw(shorten(&file.path, 44)),
-                ]))
-            })
-            .collect()
+    let rows = area.height.saturating_sub(2) as usize;
+    let mut layout = app.layout.get();
+    layout.files = area;
+    layout.files_rows = rows;
+    app.layout.set(layout);
+
+    let focused = app.focus == Panel::Files;
+    let count = app.changed_files.len();
+    let title = match (count, focused) {
+        (0, _) => " Changed files ".to_string(),
+        (_, true) => format!(" Changed files {count} · Enter diff "),
+        (_, false) => format!(" Changed files {count} "),
     };
-    frame.render_widget(List::new(items).block(boxed(" Changed files ")), area);
+    let block = panel(app, Panel::Files, title);
+    if count == 0 {
+        frame.render_widget(
+            Paragraph::new(Line::styled("No files changed", Style::default().fg(MUTED)))
+                .block(block),
+            area,
+        );
+        return;
+    }
+    let width = area.width.saturating_sub(5) as usize;
+    let items: Vec<ListItem<'static>> = app
+        .changed_files
+        .iter()
+        .map(|file| {
+            let (kind, color) = match file.kind {
+                harness_tools::FileChangeKind::Created => ("A", GREEN),
+                harness_tools::FileChangeKind::Modified => ("M", YELLOW),
+                harness_tools::FileChangeKind::Deleted => ("D", RED),
+            };
+            let mut spans = vec![Span::styled(format!("{kind} "), Style::default().fg(color))];
+            match file.stats {
+                Some((added, removed)) => {
+                    let (plus, minus) = (format!(" +{added}"), format!(" −{removed}"));
+                    let room =
+                        width.saturating_sub(display_width(&plus) + display_width(&minus) + 2);
+                    let path = shorten(&file.path, room);
+                    let pad = room.saturating_sub(display_width(&path));
+                    spans.push(Span::raw(format!("{path}{}", " ".repeat(pad))));
+                    spans.push(Span::styled(plus, Style::default().fg(GREEN)));
+                    spans.push(Span::styled(minus, Style::default().fg(RED)));
+                }
+                None => spans.push(Span::raw(shorten(&file.path, width.saturating_sub(2)))),
+            }
+            ListItem::new(Line::from(spans))
+        })
+        .collect();
+    let heights = vec![1; count];
+    let selected = app.selected_file.min(count - 1);
+    let offset = listview::offset_showing(&heights, app.files_offset.get(), selected, rows);
+    app.files_offset.set(offset);
+    let mut state = ListState::default()
+        .with_offset(offset)
+        .with_selected(Some(selected));
+    frame.render_stateful_widget(selectable_list(items, block, focused), area, &mut state);
+    let max = listview::max_offset(&heights, rows);
+    if max > 0 {
+        let mut bar = ScrollbarState::new(max + 1)
+            .viewport_content_length(rows)
+            .position(offset.min(max));
+        render_scrollbar(frame, area, &mut bar);
+    }
 }
 
 fn render_sessions(frame: &mut Frame, app: &App, area: Rect) {
@@ -400,9 +581,10 @@ fn render_reviews(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_composer(frame: &mut Frame, app: &App, area: Rect) {
-    let title = match app.view {
-        View::Work => " Message HiveMind ",
-        View::Sessions | View::Reviews => " Message HiveMind  (/work to go back) ",
+    let title = match (activity_title(app, area.width), app.view) {
+        (Some(activity), _) => activity,
+        (None, View::Work) => " Message HiveMind ".into(),
+        (None, View::Sessions | View::Reviews) => " Message HiveMind  (/work to go back) ".into(),
     };
     let block = boxed(title).border_style(Style::default().fg(ACCENT));
     let inner = block.inner(area);
@@ -516,10 +698,12 @@ fn wrap_rows(text: &str, width: usize) -> Vec<String> {
 }
 
 fn render_footer(frame: &mut Frame, app: &App, area: Rect, compact: bool) {
-    let text = if compact {
-        "Enter send  / commands  ↑↓ scroll  End latest  Ctrl+C stop"
-    } else {
-        "Enter send  / commands  ↑↓ PgUp PgDn scroll  End latest  Shift+↑↓ tools  Tab details  Shift+drag select  Ctrl+C stop"
+    let text = match (app.detail.is_some(), compact) {
+        (true, _) => "↑↓ PgUp PgDn scroll  ←→ previous/next  Esc close",
+        (false, true) => "Tab panel  ↑↓ scroll  Enter open  ? help",
+        (false, false) => {
+            "Enter send  Tab panel  ↑↓ scroll  Enter open  Ctrl+O transcript  Esc stop  ? help"
+        }
     };
     // Usage gets its space first; the key hints are what gets clipped.
     let usage = usage_summary(app);
@@ -618,50 +802,7 @@ fn render_palette(frame: &mut Frame) {
     );
 }
 
-fn render_tool_details(frame: &mut Frame, app: &App) {
-    let Some(tool) = app.tools.get(app.selected_tool) else {
-        return;
-    };
-    let area = centered_rect(76, 17, frame.area());
-    frame.render_widget(Clear, area);
-    let output = if tool.result.is_empty() {
-        "No result yet.".to_string()
-    } else {
-        shorten(&tool.result, 1_600)
-    };
-    let text = Text::from(vec![
-        Line::from(vec![
-            Span::styled("Call: ", Style::default().fg(MUTED)),
-            Span::styled(tool.call_id.clone(), Style::default().fg(ACCENT)),
-        ]),
-        Line::from(vec![
-            Span::styled("Arguments: ", Style::default().fg(MUTED)),
-            Span::raw(shorten(&tool.args, 700)),
-        ]),
-        Line::raw(""),
-        Line::styled(
-            "Result",
-            Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
-        ),
-        Line::raw(output),
-        Line::raw(""),
-        Line::styled(
-            "Tab next · Shift+Tab previous · Esc close",
-            Style::default().fg(MUTED),
-        ),
-    ]);
-    frame.render_widget(
-        Paragraph::new(text)
-            .block(
-                boxed(format!(" Tool: {} · {} ", tool.name, tool.state.label()))
-                    .border_style(tool_style(tool.state)),
-            )
-            .wrap(Wrap { trim: false }),
-        area,
-    );
-}
-
-fn tool_style(state: ToolState) -> Style {
+pub(crate) fn tool_style(state: ToolState) -> Style {
     match state {
         ToolState::Completed => Style::default().fg(GREEN),
         ToolState::WaitingForApproval => Style::default().fg(YELLOW),
@@ -700,8 +841,369 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
+    use super::super::app::{DetailKind, FileSource};
     use super::super::events::UiEvent;
     use super::*;
+
+    #[derive(Default)]
+    struct FakeFiles(std::collections::HashMap<String, (Option<Option<String>>, Option<String>)>);
+
+    impl FakeFiles {
+        fn with(mut self, path: &str, before: Option<Option<&str>>, now: Option<&str>) -> Self {
+            self.0.insert(
+                path.into(),
+                (
+                    before.map(|b| b.map(str::to_string)),
+                    now.map(str::to_string),
+                ),
+            );
+            self
+        }
+    }
+
+    impl FileSource for FakeFiles {
+        fn before(&self, path: &str) -> Option<Option<String>> {
+            self.0.get(path).and_then(|(before, _)| before.clone())
+        }
+        fn now(&self, path: &str) -> Option<String> {
+            self.0.get(path).and_then(|(_, now)| now.clone())
+        }
+    }
+
+    fn start_tools(app: &mut App, count: usize) {
+        for i in 0..count {
+            app.apply(UiEvent::ToolStarted {
+                call_id: format!("c{i}"),
+                name: "read_file".into(),
+                args: format!(r#"{{"path":"file_{i:02}.rs"}}"#),
+            });
+            app.apply(UiEvent::ToolFinished {
+                call_id: format!("c{i}"),
+                name: "read_file".into(),
+                result: format!("contents of file {i:02}\nline two of {i:02}"),
+                status: ToolStatus::Ok,
+                changed_files: Vec::new(),
+            });
+        }
+    }
+
+    fn change(app: &mut App, path: &str, kind: harness_tools::FileChangeKind) {
+        app.apply(UiEvent::ToolFinished {
+            call_id: format!("w-{path}"),
+            name: "edit_file".into(),
+            result: "ok".into(),
+            status: ToolStatus::Ok,
+            changed_files: vec![harness_tools::FileChange {
+                path: path.into(),
+                kind,
+            }],
+        });
+    }
+
+    #[test]
+    fn tab_moves_focus_through_every_panel_and_the_border_follows() {
+        let mut app = App::new("work".into(), "model".into(), &[], Vec::new(), Vec::new());
+        drawn(&app);
+        let order: Vec<Panel> = (0..4)
+            .map(|_| {
+                app.cycle_focus(false);
+                app.focus
+            })
+            .collect();
+        assert_eq!(
+            order,
+            [
+                Panel::Tasks,
+                Panel::Tools,
+                Panel::Files,
+                Panel::Conversation
+            ]
+        );
+        app.cycle_focus(true);
+        assert_eq!(app.focus, Panel::Files);
+
+        app.focus = Panel::Tools;
+        let mut terminal = Terminal::new(TestBackend::new(140, 42)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let tools = app.layout.get().tools;
+        let corner = &terminal.backend().buffer()[(tools.x, tools.y)];
+        assert_eq!(corner.fg, ACCENT, "the focused panel has the accent border");
+
+        app.sidebar_visible = false;
+        drawn(&app);
+        app.cycle_focus(false);
+        assert_eq!(
+            app.focus,
+            Panel::Conversation,
+            "hidden panels can't take focus"
+        );
+    }
+
+    #[test]
+    fn enter_on_a_tool_opens_its_full_request_and_result() {
+        let mut app = App::new("work".into(), "model".into(), &[], Vec::new(), Vec::new());
+        start_tools(&mut app, 3);
+        app.focus = Panel::Tools;
+        app.step_focused(-1);
+        app.open_focused(&FakeFiles::default());
+        assert_eq!(
+            app.detail.as_ref().map(|d| d.kind.clone()),
+            Some(DetailKind::Tool("c1".into()))
+        );
+        let text = drawn(&app);
+        assert!(text.contains("read_file · Completed"));
+        assert!(text.contains("line two of 01"), "the whole result is shown");
+
+        app.step_detail(true, &FakeFiles::default());
+        assert!(
+            drawn(&app).contains("line two of 02"),
+            "→ moves to the next call"
+        );
+    }
+
+    #[test]
+    fn changed_files_show_counts_and_open_as_a_diff() {
+        let mut app = App::new("work".into(), "model".into(), &[], Vec::new(), Vec::new());
+        change(
+            &mut app,
+            "src/a.rs",
+            harness_tools::FileChangeKind::Modified,
+        );
+        change(&mut app, "new.txt", harness_tools::FileChangeKind::Created);
+        let files = FakeFiles::default()
+            .with(
+                "src/a.rs",
+                Some(Some("one\ntwo\nthree")),
+                Some("one\n2\nthree"),
+            )
+            .with("new.txt", Some(None), Some("x\ny"));
+        app.refresh_file_stats(&files);
+        assert_eq!(app.changed_files[0].stats, Some((1, 1)));
+        assert_eq!(app.changed_files[1].stats, Some((2, 0)));
+        let panel = drawn(&app);
+        assert!(panel.contains("src/a.rs") && panel.contains("+1") && panel.contains("−1"));
+
+        app.focus = Panel::Files;
+        app.open_focused(&files);
+        let diff = drawn(&app);
+        assert!(diff.contains(" - two") && diff.contains(" + 2"));
+
+        app.step_detail(true, &files);
+        assert!(drawn(&app).contains("New file · 2 lines"));
+    }
+
+    #[test]
+    fn slash_diff_lists_every_changed_file() {
+        let mut app = App::new("work".into(), "model".into(), &[], Vec::new(), Vec::new());
+        change(&mut app, "a.rs", harness_tools::FileChangeKind::Modified);
+        change(&mut app, "b.rs", harness_tools::FileChangeKind::Modified);
+        let files = FakeFiles::default()
+            .with("a.rs", Some(Some("1")), Some("2"))
+            .with("b.rs", Some(Some("x")), Some("y"));
+        app.open_all_changes(&files);
+        let text = drawn(&app);
+        assert!(text.contains("Changes this session · 2 file(s)"));
+        assert!(text.contains(" + 2") && text.contains(" + y"));
+    }
+
+    #[test]
+    fn the_detail_view_scrolls_within_its_content() {
+        let mut app = App::new("work".into(), "model".into(), &[], Vec::new(), Vec::new());
+        app.apply(UiEvent::ToolStarted {
+            call_id: "big".into(),
+            name: "run_shell".into(),
+            args: r#"{"command":"seq 200"}"#.into(),
+        });
+        let output = (1..=200)
+            .map(|i| format!("row-{i:03}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.apply(UiEvent::ToolFinished {
+            call_id: "big".into(),
+            name: "run_shell".into(),
+            result: output,
+            status: ToolStatus::Ok,
+            changed_files: Vec::new(),
+        });
+        app.focus = Panel::Tools;
+        app.open_focused(&FakeFiles::default());
+        assert!(!drawn(&app).contains("row-200"));
+        app.scroll_detail(isize::MAX / 2);
+        let bottom = drawn(&app);
+        assert!(bottom.contains("row-200") && !bottom.contains("row-001"));
+        let layout = app.layout.get();
+        assert_eq!(
+            app.detail.as_ref().unwrap().scroll,
+            layout.detail_max_scroll
+        );
+    }
+
+    #[test]
+    fn clicking_a_tool_selects_it_and_a_second_click_opens_it() {
+        let mut app = App::new("work".into(), "model".into(), &[], Vec::new(), Vec::new());
+        start_tools(&mut app, 5);
+        drawn(&app);
+        let tools = app.layout.get().tools;
+        // Card 1 starts on the list's third row (two rows per card).
+        assert!(!app.click_at(tools.x + 3, tools.y + 1 + 2));
+        assert_eq!((app.focus, app.selected_tool), (Panel::Tools, 1));
+        assert!(
+            app.click_at(tools.x + 3, tools.y + 1 + 3),
+            "same card again"
+        );
+    }
+
+    /// Text inside one panel, so other panels can't satisfy an assertion.
+    fn drawn_in(app: &App, area: impl Fn(&App) -> Rect) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(140, 42)).unwrap();
+        terminal.draw(|frame| draw(frame, app)).unwrap();
+        let rect = area(app);
+        let buffer = terminal.backend().buffer();
+        let mut out = String::new();
+        for y in rect.y..rect.bottom() {
+            for x in rect.x..rect.right() {
+                out.push_str(buffer[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    #[test]
+    fn the_wheel_over_tools_moves_the_list_not_just_the_highlight() {
+        let mut app = App::new("work".into(), "model".into(), &[], Vec::new(), Vec::new());
+        start_tools(&mut app, 40);
+        let tools_panel = |app: &App| app.layout.get().tools;
+        let at_end = drawn_in(&app, tools_panel);
+        assert!(at_end.contains("file_39.rs") && !at_end.contains("file_00.rs"));
+        let tools = app.layout.get().tools;
+        for _ in 0..60 {
+            app.scroll_at(tools.x + 2, tools.y + 2, false);
+        }
+        let top = drawn_in(&app, tools_panel);
+        assert!(top.contains("file_00.rs") && !top.contains("file_39.rs"));
+        assert_eq!(app.tools_offset.get(), 0);
+    }
+
+    #[test]
+    fn tool_calls_appear_in_the_conversation_where_they_happened() {
+        let mut app = App::new("work".into(), "model".into(), &[], Vec::new(), Vec::new());
+        app.submitted("check the site");
+        app.apply(UiEvent::AssistantDelta("Checking.\n".into()));
+        app.apply(UiEvent::ToolStarted {
+            call_id: "a".into(),
+            name: "edit_file".into(),
+            args: r#"{"path":"script.js","old_string":"a","new_string":"b"}"#.into(),
+        });
+        app.apply(UiEvent::ToolStarted {
+            call_id: "b".into(),
+            name: "run_shell".into(),
+            args: r#"{"command":"node --check script.js"}"#.into(),
+        });
+        app.apply(UiEvent::ToolFinished {
+            call_id: "b".into(),
+            name: "run_shell".into(),
+            result: "SyntaxError: Unexpected token".into(),
+            status: ToolStatus::Failed,
+            changed_files: Vec::new(),
+        });
+        app.apply(UiEvent::AssistantDelta("Fixed it.".into()));
+        let chat = drawn_in(&app, |app| app.layout.get().conversation);
+        let edit = chat.find("Edit  script.js  +1 −1").expect("edit row");
+        let shell = chat
+            .find("Shell  node --check script.js")
+            .expect("shell row");
+        let reason = chat
+            .find("↳ SyntaxError: Unexpected token")
+            .expect("failure reason");
+        let after = chat.find("Fixed it.").expect("reply after the tools");
+        assert!(chat.find("Checking.").unwrap() < edit && edit < shell);
+        assert!(shell < reason && reason < after);
+    }
+
+    #[test]
+    fn replies_render_markdown_and_headings_are_marked() {
+        let mut app = App::new("work".into(), "model".into(), &[], Vec::new(), Vec::new());
+        app.submitted("explain");
+        app.apply(UiEvent::AssistantDelta(
+            "## Key features\n- **Cart** persists\n```js\nlet x = **y**;\n```\n".into(),
+        ));
+        let chat = drawn_in(&app, |app| app.layout.get().conversation);
+        assert!(chat.contains("▌You") && chat.contains("▌HiveMind"));
+        assert!(chat.contains("Key features") && !chat.contains("## Key"));
+        assert!(chat.contains("• Cart persists"));
+        assert!(chat.contains("│ let x = **y**;"), "code is left verbatim");
+    }
+
+    #[test]
+    fn the_message_box_title_says_what_is_running_and_how_to_stop_it() {
+        let mut app = App::new("work".into(), "model".into(), &[], Vec::new(), Vec::new());
+        app.apply(UiEvent::TurnStarted);
+        assert!(drawn(&app).contains("Thinking"));
+        app.apply(UiEvent::ToolStarted {
+            call_id: "a".into(),
+            name: "run_shell".into(),
+            args: r#"{"command":"curl -s http://localhost:8080"}"#.into(),
+        });
+        let text = drawn(&app);
+        assert!(text.contains("Shell curl -s http://localhost:8080"));
+        assert!(text.contains("Esc to stop"));
+        app.apply(UiEvent::RunFinished { error: None });
+        let idle = drawn(&app);
+        assert!(idle.contains("Message HiveMind") && !idle.contains("Esc to stop"));
+    }
+
+    #[test]
+    fn the_transcript_expands_every_tool_call_inline() {
+        let mut app = App::new("work".into(), "model".into(), &[], Vec::new(), Vec::new());
+        app.submitted("look");
+        start_tools(&mut app, 2);
+        app.open_transcript();
+        let text = drawn(&app);
+        assert!(text.contains("Transcript · every tool call expanded"));
+        assert!(text.contains("line two of 00") && text.contains("line two of 01"));
+    }
+
+    #[test]
+    fn question_mark_help_lists_keys_and_commands() {
+        let mut app = App::new("work".into(), "model".into(), &[], Vec::new(), Vec::new());
+        app.open_help();
+        let text = drawn(&app);
+        assert!(text.contains("Keys and commands"));
+        assert!(text.contains("Ctrl+O") && text.contains("next / previous panel"));
+    }
+
+    #[test]
+    fn the_header_shows_the_connection_and_known_context_use() {
+        let mut app = App::new(
+            "work".into(),
+            "hivemind".into(),
+            &[],
+            Vec::new(),
+            Vec::new(),
+        );
+        app.connection = "openrouter.ai".into();
+        let window = harness_config::lookup_model("hivemind")
+            .unwrap()
+            .context_window;
+        app.apply(UiEvent::Usage {
+            model: "hivemind".into(),
+            prompt_tokens: window / 4,
+            completion_tokens: 10,
+            turn_cost_usd: Some(0.01),
+            billed: true,
+            session_cost_usd: 0.01,
+        });
+        let text = drawn(&app);
+        assert!(text.contains("openrouter.ai · model: hivemind"));
+        assert!(text.contains("ctx 25%"));
+
+        app.model = "some/unknown-model".into();
+        assert!(
+            !drawn(&app).contains("ctx "),
+            "no guess for an unknown window"
+        );
+    }
 
     #[test]
     fn narrow_layout_and_unicode_render_without_panicking() {

@@ -3,7 +3,10 @@
 //! input only while this module is active.
 
 mod app;
+mod detail;
 mod events;
+mod listview;
+mod markdown;
 mod render;
 
 use std::io::{self, Stdout};
@@ -16,7 +19,7 @@ use std::time::Duration;
 use anyhow::Context;
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers, MouseEventKind,
+    KeyModifiers, MouseButton, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -27,20 +30,110 @@ use harness_tools::Workspace;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
-use self::app::{App, View};
+use self::app::{App, Panel, View};
 
 pub(crate) use events::TuiBridge;
 
 pub(crate) struct TuiConfig {
     pub(crate) workdir: PathBuf,
     pub(crate) workspace_label: String,
+    /// Shown in the header; see [`connection_label`].
+    pub(crate) connection: String,
+}
+
+/// Where requests go, without paths or secrets: "hosted", the provider's
+/// host, or "local · host:port".
+pub(crate) fn connection_label(backend: harness_config::Backend, base_url: &str) -> String {
+    let host = base_url
+        .split_once("://")
+        .map_or(base_url, |(_, rest)| rest)
+        .split('/')
+        .next()
+        .unwrap_or_default();
+    match backend {
+        harness_config::Backend::Hosted => "hosted".to_string(),
+        harness_config::Backend::Byok => host.to_string(),
+        harness_config::Backend::Local => format!("local · {host}"),
+    }
+}
+
+/// OSC 52 asks the terminal itself to set the clipboard, so it works over SSH too.
+fn osc52(text: &str) -> String {
+    format!("\x1b]52;c;{}\x07", base64(text.as_bytes()))
+}
+
+fn base64(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let n = chunk
+            .iter()
+            .enumerate()
+            .fold(0u32, |acc, (i, b)| acc | (u32::from(*b) << (16 - 8 * i)));
+        for i in 0..4 {
+            out.push(if i <= chunk.len() {
+                TABLE[(n >> (18 - 6 * i) & 63) as usize] as char
+            } else {
+                '='
+            });
+        }
+    }
+    out
+}
+
+fn copy_last_reply(app: &mut App) {
+    use std::io::Write;
+    let reply = app.last_reply.trim();
+    if reply.is_empty() {
+        app.apply(events::UiEvent::Notice("Nothing to copy yet".into()));
+        return;
+    }
+    let chars = reply.chars().count();
+    let sent = {
+        let mut out = io::stdout();
+        out.write_all(osc52(reply).as_bytes())
+            .and_then(|()| out.flush())
+    };
+    app.apply(events::UiEvent::Notice(match sent {
+        Ok(()) => format!(
+            "Copied the last reply ({chars} characters). Needs a terminal that allows clipboard access (OSC 52)."
+        ),
+        Err(error) => format!("Could not copy: {error}"),
+    }));
 }
 
 enum InputEvent {
     Key(KeyEvent),
     Paste(String),
     Wheel { column: u16, row: u16, down: bool },
+    Click { column: u16, row: u16 },
     Resize,
+}
+
+/// Changed files as the agent first saw them, and as they are now on disk.
+struct WorkspaceFiles<'a> {
+    bridge: &'a TuiBridge,
+    workspace: &'a Workspace,
+}
+
+impl WorkspaceFiles<'_> {
+    fn absolute(&self, path: &str) -> PathBuf {
+        // `resolve` matches how the agent keyed its snapshot; a deleted
+        // file's parent may be gone too, hence the plain join fallback.
+        self.workspace
+            .resolve(path)
+            .unwrap_or_else(|_| self.workspace.root.join(path))
+    }
+}
+
+impl app::FileSource for WorkspaceFiles<'_> {
+    fn before(&self, path: &str) -> Option<Option<String>> {
+        self.bridge.baseline(&self.absolute(path))
+    }
+
+    fn now(&self, path: &str) -> Option<String> {
+        std::fs::read_to_string(self.absolute(path)).ok()
+    }
 }
 
 type TuiTerminal = Terminal<CrosstermBackend<Stdout>>;
@@ -81,6 +174,7 @@ pub(crate) async fn run(
         sessions,
         reviews,
     );
+    app.connection = config.connection;
     let interjections = agent.interjections();
     let (controller_tx, controller_rx) = tokio::sync::mpsc::channel(32);
     let controller = tokio::spawn(agent_controller(agent, bridge.clone(), controller_rx));
@@ -89,6 +183,7 @@ pub(crate) async fn run(
     let input_stop = Arc::new(AtomicBool::new(false));
     let input_task = spawn_input_pump(input_tx, input_stop.clone());
     let mut redraw = true;
+    let mut ticks: u64 = 0;
     let mut frame_clock = tokio::time::interval(Duration::from_millis(33));
     frame_clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -98,6 +193,10 @@ pub(crate) async fn run(
                 app.apply(event);
                 redraw = true;
             }
+            app.refresh_file_stats(&WorkspaceFiles {
+                bridge: &bridge,
+                workspace: &workspace,
+            });
             if redraw {
                 terminal.draw(|frame| render::draw(frame, &app))?;
                 redraw = false;
@@ -105,8 +204,12 @@ pub(crate) async fn run(
 
             tokio::select! {
                 _ = frame_clock.tick() => {
-                    // A capped tick drains coalesced agent events without redrawing
-                    // an unchanged frame.
+                    // Drains coalesced agent events; while running, ~10 redraws a
+                    // second keep the spinner and timer alive.
+                    ticks += 1;
+                    if app.run_state != app::RunState::Idle && ticks.is_multiple_of(3) {
+                        redraw = true;
+                    }
                 }
                 maybe_input = input_rx.recv() => {
                     let Some(input) = maybe_input else { break; };
@@ -153,10 +256,17 @@ async fn handle_input(
     workspace: &Workspace,
     interjections: &harness_agent::InterjectionQueue,
 ) -> InputOutcome {
+    let files = WorkspaceFiles { bridge, workspace };
     match input {
         InputEvent::Resize => return InputOutcome::Continue,
         InputEvent::Wheel { column, row, down } => {
             app.scroll_at(column, row, down);
+            return InputOutcome::Continue;
+        }
+        InputEvent::Click { column, row } => {
+            if app.approval.is_none() && !app.palette_visible && app.click_at(column, row) {
+                app.open_focused(&files);
+            }
             return InputOutcome::Continue;
         }
         InputEvent::Paste(text) => {
@@ -213,7 +323,28 @@ async fn handle_input(
                 return InputOutcome::Continue;
             }
 
-            if key.modifiers.contains(KeyModifiers::CONTROL) {
+            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+            if app.detail.is_some() {
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('q') => app.detail = None,
+                    KeyCode::Up => app.scroll_detail(-1),
+                    KeyCode::Down => app.scroll_detail(1),
+                    KeyCode::PageUp => app.page_detail(false),
+                    KeyCode::PageDown => app.page_detail(true),
+                    KeyCode::Home => app.scroll_detail(isize::MIN / 2),
+                    KeyCode::End => app.scroll_detail(isize::MAX / 2),
+                    KeyCode::Left | KeyCode::BackTab => app.step_detail(false, &files),
+                    KeyCode::Right | KeyCode::Tab => app.step_detail(true, &files),
+                    // Ctrl+C still stops a run: close the view and fall through.
+                    KeyCode::Char('c') if ctrl => app.detail = None,
+                    _ => {}
+                }
+                if !(ctrl && key.code == KeyCode::Char('c')) {
+                    return InputOutcome::Continue;
+                }
+            }
+
+            if ctrl {
                 match key.code {
                     KeyCode::Char('c') => {
                         if app.run_state != app::RunState::Idle {
@@ -226,6 +357,7 @@ async fn handle_input(
                     KeyCode::Char('l') => app.clear_local_conversation(),
                     KeyCode::Char('s') => app.sidebar_visible = !app.sidebar_visible,
                     KeyCode::Char('p') => app.palette_visible = true,
+                    KeyCode::Char('o') => app.open_transcript(),
                     _ => {}
                 }
                 return InputOutcome::Continue;
@@ -239,26 +371,24 @@ async fn handle_input(
                     // While typing a command name, Tab completes it.
                     if let Some((name, _)) = app::slash_matches(&app.composer).first() {
                         app.composer = format!("{name} ");
-                    } else if !app.tools.is_empty() {
-                        // Opening details shows the current call first;
-                        // further presses browse, and the list scrolls along.
-                        if app.details_visible {
-                            let backwards = key.code == KeyCode::BackTab
-                                || key.modifiers.contains(KeyModifiers::SHIFT);
-                            app.select_next_tool(backwards);
-                        }
-                        app.details_visible = true;
+                    } else {
+                        let backwards = key.code == KeyCode::BackTab
+                            || key.modifiers.contains(KeyModifiers::SHIFT);
+                        app.cycle_focus(backwards);
                     }
                 }
-                KeyCode::Esc => app.details_visible = false,
-                KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => app.scroll_tools(-1),
-                KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => app.scroll_tools(1),
-                KeyCode::Up => app.scroll_conversation(-app::SCROLL_ROWS),
-                KeyCode::Down => app.scroll_conversation(app::SCROLL_ROWS),
-                KeyCode::PageUp => app.page_conversation(false),
-                KeyCode::PageDown => app.page_conversation(true),
-                KeyCode::Home => app.scroll_conversation_to_top(),
-                KeyCode::End => app.scroll_conversation_to_latest(),
+                // Leave a side panel first; from the conversation, stop the run.
+                KeyCode::Esc if app.focus != Panel::Conversation => app.focus = Panel::Conversation,
+                KeyCode::Esc if app.run_state != app::RunState::Idle => {
+                    let _ = controller.send(ControllerCommand::Interrupt).await;
+                }
+                KeyCode::Char('?') if app.composer.is_empty() => app.open_help(),
+                KeyCode::Up => app.step_focused(-1),
+                KeyCode::Down => app.step_focused(1),
+                KeyCode::PageUp => app.page_focused(false),
+                KeyCode::PageDown => app.page_focused(true),
+                KeyCode::Home => app.jump_focused(false),
+                KeyCode::End => app.jump_focused(true),
                 KeyCode::Backspace => {
                     app.composer.pop();
                 }
@@ -268,6 +398,7 @@ async fn handle_input(
                 KeyCode::Enter => {
                     let text = app.composer.trim().to_string();
                     if text.is_empty() {
+                        app.open_focused(&files);
                         return InputOutcome::Continue;
                     }
                     if app.run_state != app::RunState::Idle {
@@ -276,7 +407,9 @@ async fn handle_input(
                         return InputOutcome::Continue;
                     }
                     if text.starts_with('/') {
-                        if handle_command(app, controller, &text).await == InputOutcome::Quit {
+                        if handle_command(app, controller, &files, &text).await
+                            == InputOutcome::Quit
+                        {
                             return InputOutcome::Quit;
                         }
                     } else {
@@ -286,7 +419,11 @@ async fn handle_input(
                         let _ = controller.send(ControllerCommand::Run(expanded)).await;
                     }
                 }
-                KeyCode::Char(character) => app.composer.push(character),
+                KeyCode::Char(character) => {
+                    // Typing means writing a message, so arrows return to the conversation.
+                    app.focus = Panel::Conversation;
+                    app.composer.push(character);
+                }
                 _ => {}
             }
         }
@@ -297,19 +434,17 @@ async fn handle_input(
 async fn handle_command(
     app: &mut App,
     controller: &tokio::sync::mpsc::Sender<ControllerCommand>,
+    files: &dyn app::FileSource,
     text: &str,
 ) -> InputOutcome {
     let mut parts = text.split_whitespace();
     let command = parts.next().unwrap_or_default();
     let argument = parts.next();
     match command {
-        "/help" => {
-            let list: Vec<String> = app::SLASH_COMMANDS
-                .iter()
-                .map(|(name, what)| format!("{name}  {what}"))
-                .collect();
-            app.apply(events::UiEvent::Notice(list.join("\n")));
-        }
+        "/help" => app.open_help(),
+        "/diff" => app.open_all_changes(files),
+        "/transcript" => app.open_transcript(),
+        "/copy" => copy_last_reply(app),
         "/work" => app.view = View::Work,
         "/sessions" => app.view = View::Sessions,
         "/reviews" => app.view = View::Reviews,
@@ -507,19 +642,26 @@ fn spawn_input_pump(
                             break;
                         }
                     }
-                    // Only the wheel; pointer moves would flood the queue.
+                    // Wheel and left click only; pointer moves would flood the queue.
                     Ok(Event::Mouse(mouse)) => {
-                        let down = match mouse.kind {
-                            MouseEventKind::ScrollDown => true,
-                            MouseEventKind::ScrollUp => false,
+                        let (column, row) = (mouse.column, mouse.row);
+                        let input = match mouse.kind {
+                            MouseEventKind::ScrollDown => InputEvent::Wheel {
+                                column,
+                                row,
+                                down: true,
+                            },
+                            MouseEventKind::ScrollUp => InputEvent::Wheel {
+                                column,
+                                row,
+                                down: false,
+                            },
+                            MouseEventKind::Down(MouseButton::Left) => {
+                                InputEvent::Click { column, row }
+                            }
                             _ => continue,
                         };
-                        let wheel = InputEvent::Wheel {
-                            column: mouse.column,
-                            row: mouse.row,
-                            down,
-                        };
-                        if sender.blocking_send(wheel).is_err() {
+                        if sender.blocking_send(input).is_err() {
                             break;
                         }
                     }
@@ -604,6 +746,37 @@ fn cleanup_terminal_output(writer: &mut impl io::Write) -> io::Result<()> {
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;
+
+    #[test]
+    fn base64_matches_the_standard_alphabet_and_padding() {
+        assert_eq!(base64(b""), "");
+        assert_eq!(base64(b"f"), "Zg==");
+        assert_eq!(base64(b"fo"), "Zm8=");
+        assert_eq!(base64(b"foo"), "Zm9v");
+        assert_eq!(base64("नमस्ते".as_bytes()), "4KSo4KSu4KS44KWN4KSk4KWH");
+    }
+
+    #[test]
+    fn osc52_wraps_the_text_for_the_terminal_clipboard() {
+        assert_eq!(osc52("hi"), "\x1b]52;c;aGk=\x07");
+    }
+
+    #[test]
+    fn the_connection_label_names_the_destination_without_paths_or_secrets() {
+        use harness_config::Backend;
+        assert_eq!(
+            connection_label(Backend::Hosted, "https://api.hivemind.bmtai.in"),
+            "hosted"
+        );
+        assert_eq!(
+            connection_label(Backend::Byok, "https://openrouter.ai/api/v1"),
+            "openrouter.ai"
+        );
+        assert_eq!(
+            connection_label(Backend::Local, "http://127.0.0.1:11434/v1"),
+            "local · 127.0.0.1:11434"
+        );
+    }
 
     #[test]
     fn cleanup_writes_the_commands_that_restore_the_normal_terminal_screen() {
