@@ -40,6 +40,10 @@ self-replace = "1"
 # in the dependency graph itself.
 zip = { version = "7", default-features = false, features = ["deflate"] }
 
+[features]
+# PDF reading in `read_file`; see harness-tools. Off by default.
+pdf = ["harness-tools/pdf"]
+
 [dev-dependencies]
 # Test-only: confirms `hooks_config`'s generated `[[hooks]]` blocks are
 # actually valid TOML, not just strings that look plausible.
