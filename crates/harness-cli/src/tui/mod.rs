@@ -7,6 +7,7 @@ mod detail;
 mod events;
 mod listview;
 mod markdown;
+mod picks;
 mod render;
 
 use std::io::{self, Stdout};
@@ -145,6 +146,8 @@ enum ControllerCommand {
     Interrupt,
     SetModel(String),
     SetReasoning(Option<String>),
+    ListModels,
+    ListReasoning,
     SetBudget(Option<f64>),
     SetWeb(bool),
     ClearSkill,
@@ -175,6 +178,7 @@ pub(crate) async fn run(
         reviews,
     );
     app.connection = config.connection;
+    app.reasoning = agent.reasoning_effort().map(str::to_string);
     let interjections = agent.interjections();
     let (controller_tx, controller_rx) = tokio::sync::mpsc::channel(32);
     let controller = tokio::spawn(agent_controller(agent, bridge.clone(), controller_rx));
@@ -264,6 +268,12 @@ async fn handle_input(
             return InputOutcome::Continue;
         }
         InputEvent::Click { column, row } => {
+            if app.picker.is_some() {
+                if let Some(choice) = app.click_picker(column, row) {
+                    apply_choice(choice, app, controller).await;
+                }
+                return InputOutcome::Continue;
+            }
             if app.approval.is_none() && !app.palette_visible && app.click_at(column, row) {
                 app.open_focused(&files);
             }
@@ -324,6 +334,32 @@ async fn handle_input(
             }
 
             let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+            if let Some(picker) = app.picker.as_mut() {
+                let page = app.layout.get().picker_list.height.max(2) as isize - 1;
+                match key.code {
+                    KeyCode::Esc => app.close_picker(),
+                    KeyCode::Char('c') if ctrl => app.close_picker(),
+                    KeyCode::Up => picker.move_by(-1),
+                    KeyCode::Down => picker.move_by(1),
+                    KeyCode::Left | KeyCode::BackTab => picker.next_view(false),
+                    KeyCode::Right | KeyCode::Tab => picker.next_view(true),
+                    KeyCode::PageUp => picker.move_by(-page),
+                    KeyCode::PageDown => picker.move_by(page),
+                    KeyCode::Home => picker.move_by(isize::MIN / 2),
+                    KeyCode::End => picker.move_by(isize::MAX / 2),
+                    KeyCode::Backspace => picker.backspace(),
+                    KeyCode::Char(c) if !ctrl && !key.modifiers.contains(KeyModifiers::ALT) => {
+                        picker.type_char(c)
+                    }
+                    KeyCode::Enter => {
+                        if let Some(choice) = app.apply_picker() {
+                            apply_choice(choice, app, controller).await;
+                        }
+                    }
+                    _ => {}
+                }
+                return InputOutcome::Continue;
+            }
             if app.detail.is_some() {
                 match key.code {
                     KeyCode::Esc | KeyCode::Char('q') => app.detail = None,
@@ -431,6 +467,24 @@ async fn handle_input(
     InputOutcome::Continue
 }
 
+async fn apply_choice(
+    choice: app::PickerChoice,
+    app: &mut App,
+    controller: &tokio::sync::mpsc::Sender<ControllerCommand>,
+) {
+    match choice {
+        app::PickerChoice::Model(id) => {
+            app.model = id.clone();
+            let _ = controller.send(ControllerCommand::SetModel(id)).await;
+        }
+        app::PickerChoice::Reasoning(level) => {
+            let _ = controller
+                .send(ControllerCommand::SetReasoning(level))
+                .await;
+        }
+    }
+}
+
 async fn handle_command(
     app: &mut App,
     controller: &tokio::sync::mpsc::Sender<ControllerCommand>,
@@ -438,8 +492,19 @@ async fn handle_command(
     text: &str,
 ) -> InputOutcome {
     let mut parts = text.split_whitespace();
-    let command = parts.next().unwrap_or_default();
+    let typed = parts.next().unwrap_or_default();
     let argument = parts.next();
+    let command = match app::resolve_command(typed) {
+        app::Resolved::Command(name) => name,
+        app::Resolved::Ambiguous(names) => {
+            app.apply(events::UiEvent::Notice(format!(
+                "{typed} could be {}. Keep typing, or press Tab to complete.",
+                names.join(" or ")
+            )));
+            return InputOutcome::Continue;
+        }
+        app::Resolved::Unknown => typed,
+    };
     match command {
         "/help" => app.open_help(),
         "/diff" => app.open_all_changes(files),
@@ -455,10 +520,10 @@ async fn handle_command(
                     .send(ControllerCommand::SetModel(model.to_string()))
                     .await;
             }
-            None => app.apply(events::UiEvent::Notice(format!(
-                "Active model: {}",
-                app.model
-            ))),
+            None => {
+                app.open_model_picker();
+                let _ = controller.send(ControllerCommand::ListModels).await;
+            }
         },
         "/reasoning" => match argument {
             Some("off") => {
@@ -469,7 +534,10 @@ async fn handle_command(
                     .send(ControllerCommand::SetReasoning(Some(level.to_string())))
                     .await;
             }
-            None => app.apply(events::UiEvent::Notice("Set a level or use off".into())),
+            None => {
+                app.open_reasoning_picker();
+                let _ = controller.send(ControllerCommand::ListReasoning).await;
+            }
         },
         "/budget" => match argument {
             Some("off") => {
@@ -519,6 +587,63 @@ async fn handle_command(
     InputOutcome::Continue
 }
 
+/// Asks the provider for its model list once; hosted sessions use the catalog.
+async fn load_models_once(agent: &mut Agent) {
+    if !agent.backend().is_hosted() && !agent.models_loaded() {
+        let _ = agent.refresh_models().await;
+    }
+}
+
+fn model_choice(model: &harness_agent::RemoteModel, popular: &[String]) -> events::ModelChoice {
+    events::ModelChoice {
+        id: model.id.clone(),
+        name: model.name.clone(),
+        context_window: model.context_window,
+        input_per_m: model.input_per_m,
+        output_per_m: model.output_per_m,
+        created: model.created,
+        supports_tools: model.supports_tools,
+        text_output: model.text_output,
+        intelligence: model.intelligence,
+        thinks: model
+            .reasoning_efforts
+            .as_ref()
+            .is_some_and(|e| !e.is_empty()),
+        popular_rank: popular.iter().position(|id| *id == model.id),
+    }
+}
+
+/// HiveMind's own models, priced as a hosted user pays for them.
+fn catalog_choices() -> Vec<events::ModelChoice> {
+    harness_config::KNOWN_MODELS
+        .iter()
+        .map(|entry| events::ModelChoice {
+            id: entry.id.to_string(),
+            name: Some(entry.display_name.to_string()),
+            context_window: Some(entry.context_window),
+            input_per_m: Some(
+                entry.wholesale_pricing.input_per_m * harness_config::HOSTED_MARKUP_MULTIPLIER,
+            ),
+            output_per_m: Some(
+                entry.wholesale_pricing.output_per_m * harness_config::HOSTED_MARKUP_MULTIPLIER,
+            ),
+            thinks: !entry.reasoning_efforts.is_empty(),
+            ..events::ModelChoice::default()
+        })
+        .collect()
+}
+
+/// The provider's raw error, put in terms of what the user can do next.
+fn friendly_models_error(raw: &str) -> String {
+    if raw.contains("401") || raw.contains("403") {
+        "The provider rejected the API key when asked for its models".to_string()
+    } else if raw.contains("404") {
+        "This provider doesn't publish a list of its models".to_string()
+    } else {
+        "Could not get the provider's model list".to_string()
+    }
+}
+
 async fn agent_controller(
     mut agent: Agent,
     bridge: Arc<TuiBridge>,
@@ -560,25 +685,70 @@ async fn agent_controller(
                 agent.set_model(model.clone());
                 bridge.model_changed(model.clone());
                 bridge.notice(format!("Model set to {model}"));
-            }
-            ControllerCommand::SetReasoning(level) => match level {
-                None => {
-                    agent.set_reasoning_effort(None);
-                    bridge.notice("Reasoning effort disabled");
-                }
-                Some(level)
-                    if agent
-                        .reasoning_efforts_for_current_model()
-                        .contains(&level.as_str()) =>
+                if let Some(level) = agent.reasoning_effort().map(str::to_string)
+                    && !agent.reasoning_options().allows(&level)
                 {
-                    agent.set_reasoning_effort(Some(level.clone()));
-                    bridge.notice(format!("Reasoning effort set to {level}"));
+                    bridge.notice(format!(
+                        "Reasoning {level} isn't offered by {model}, so it won't be sent. Use /reasoning to choose again."
+                    ));
                 }
-                Some(level) => bridge.notice(format!(
-                    "{level} is not available for {}",
-                    agent.current_model()
-                )),
-            },
+            }
+            ControllerCommand::ListModels => {
+                let current = agent.current_model().to_string();
+                let result = if agent.backend().is_hosted() {
+                    Ok(catalog_choices())
+                } else {
+                    agent
+                        .refresh_models()
+                        .await
+                        .map(|_| {
+                            let popular = agent.popular_ids();
+                            agent
+                                .listed_models()
+                                .iter()
+                                .map(|model| model_choice(model, popular))
+                                .collect()
+                        })
+                        .map_err(|why| friendly_models_error(&why))
+                };
+                bridge.model_choices(current, result);
+            }
+            ControllerCommand::ListReasoning => {
+                load_models_once(&mut agent).await;
+                let options = agent.reasoning_options();
+                bridge.reasoning_choices(
+                    agent.current_model().to_string(),
+                    agent.reasoning_effort().map(str::to_string),
+                    options.levels,
+                    options.verified,
+                );
+            }
+            ControllerCommand::SetReasoning(None) => {
+                agent.set_reasoning_effort(None);
+                bridge.reasoning_changed(None);
+                bridge.notice("Reasoning is off");
+            }
+            ControllerCommand::SetReasoning(Some(level)) => {
+                load_models_once(&mut agent).await;
+                let options = agent.reasoning_options();
+                let model = agent.current_model().to_string();
+                if options.unsupported() {
+                    bridge.notice(format!("{model} has no adjustable reasoning level."));
+                } else if options.allows(&level) {
+                    agent.set_reasoning_effort(Some(level.clone()));
+                    bridge.reasoning_changed(Some(level.clone()));
+                    bridge.notice(if options.verified {
+                        format!("Reasoning set to {level}")
+                    } else {
+                        format!("Reasoning set to {level}. {model} may not accept it; if it errors, choose off.")
+                    });
+                } else {
+                    bridge.notice(format!(
+                        "{level} isn't available for {model}. Choose one of: {}, or off.",
+                        options.levels.join(", ")
+                    ));
+                }
+            }
             ControllerCommand::SetBudget(budget) => {
                 agent.set_budget_usd(budget);
                 match budget {
@@ -746,6 +916,263 @@ fn cleanup_terminal_output(writer: &mut impl io::Write) -> io::Result<()> {
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;
+
+    struct Keys {
+        app: App,
+        bridge: TuiBridge,
+        tx: tokio::sync::mpsc::Sender<ControllerCommand>,
+        rx: tokio::sync::mpsc::Receiver<ControllerCommand>,
+        workspace: Workspace,
+        interjections: harness_agent::InterjectionQueue,
+    }
+
+    impl Keys {
+        fn new(model: &str) -> Self {
+            let (tx, rx) = tokio::sync::mpsc::channel(8);
+            Self {
+                app: App::new("w".into(), model.into(), &[], Vec::new(), Vec::new()),
+                bridge: TuiBridge::new(),
+                tx,
+                rx,
+                workspace: Workspace::new(std::env::temp_dir()),
+                interjections: harness_agent::InterjectionQueue::new(),
+            }
+        }
+
+        async fn press(&mut self, code: KeyCode) {
+            let key = KeyEvent::new(code, KeyModifiers::NONE);
+            handle_input(
+                InputEvent::Key(key),
+                &mut self.app,
+                &self.bridge,
+                &self.tx,
+                &self.workspace,
+                &self.interjections,
+            )
+            .await;
+        }
+
+        async fn type_text(&mut self, text: &str) {
+            for ch in text.chars() {
+                self.press(KeyCode::Char(ch)).await;
+            }
+        }
+    }
+
+    fn models(ids: &[&str]) -> events::UiEvent {
+        events::UiEvent::ModelChoices {
+            current: ids[0].into(),
+            result: Ok(ids
+                .iter()
+                .map(|id| events::ModelChoice {
+                    id: id.to_string(),
+                    ..events::ModelChoice::default()
+                })
+                .collect()),
+        }
+    }
+
+    #[tokio::test]
+    async fn slash_model_opens_the_picker_and_enter_switches_to_the_highlighted_model() {
+        let mut k = Keys::new("a/one");
+        k.type_text("/model").await;
+        k.press(KeyCode::Enter).await;
+        assert!(
+            k.app.picker.is_some(),
+            "the list opens at once, showing it is loading"
+        );
+        assert!(matches!(k.rx.try_recv(), Ok(ControllerCommand::ListModels)));
+
+        k.app.apply(models(&["a/one", "b/two", "c/three"]));
+        k.press(KeyCode::Down).await;
+        k.press(KeyCode::Enter).await;
+        assert!(k.app.picker.is_none());
+        assert_eq!(k.app.model, "b/two");
+        assert!(matches!(k.rx.try_recv(), Ok(ControllerCommand::SetModel(id)) if id == "b/two"));
+    }
+
+    #[tokio::test]
+    async fn typing_in_the_model_picker_filters_it_and_escape_leaves_everything_alone() {
+        let mut k = Keys::new("a/one");
+        k.type_text("/model").await;
+        k.press(KeyCode::Enter).await;
+        k.app.apply(models(&["a/one", "b/claude", "c/other"]));
+        k.type_text("clau").await;
+        assert_eq!(k.app.picker.as_ref().unwrap().visible().len(), 1);
+        assert_eq!(
+            k.app.composer, "",
+            "keys go to the filter, not the message box"
+        );
+        k.press(KeyCode::Backspace).await;
+        k.press(KeyCode::Backspace).await;
+        k.press(KeyCode::Backspace).await;
+        k.press(KeyCode::Backspace).await;
+        assert_eq!(k.app.picker.as_ref().unwrap().visible().len(), 3);
+
+        k.press(KeyCode::Esc).await;
+        assert!(k.app.picker.is_none());
+        assert_eq!(k.app.model, "a/one");
+        let _ = k.rx.try_recv();
+        assert!(
+            k.rx.try_recv().is_err(),
+            "cancelling sends nothing to the agent"
+        );
+    }
+
+    /// Twenty models the provider scores, so the ranked views exist.
+    fn ranked_models() -> events::UiEvent {
+        let choices = (0..20)
+            .map(|i| events::ModelChoice {
+                id: format!("v/m{i:02}"),
+                context_window: Some(1_000_000),
+                input_per_m: Some(0.5 + f64::from(i) * 0.1),
+                output_per_m: Some(2.0),
+                supports_tools: Some(true),
+                text_output: Some(true),
+                // m19 is the smartest, m00 the weakest.
+                intelligence: Some(10.0 + f64::from(i) * 2.0),
+                created: Some(1_000 + i64::from(i)),
+                ..events::ModelChoice::default()
+            })
+            .collect();
+        events::UiEvent::ModelChoices {
+            current: "v/m00".into(),
+            result: Ok(choices),
+        }
+    }
+
+    #[tokio::test]
+    async fn tab_and_the_arrows_switch_views_and_a_ranked_row_can_be_chosen() {
+        let mut k = Keys::new("v/m00");
+        k.type_text("/model").await;
+        k.press(KeyCode::Enter).await;
+        let _ = k.rx.try_recv();
+        k.app.apply(ranked_models());
+        assert_eq!(k.app.picker.as_ref().unwrap().view, app::ModelView::Top);
+
+        k.press(KeyCode::Tab).await;
+        assert_eq!(
+            k.app.picker.as_ref().unwrap().view,
+            app::ModelView::Smartest
+        );
+        k.press(KeyCode::Right).await;
+        assert_eq!(
+            k.app.picker.as_ref().unwrap().view,
+            app::ModelView::Cheapest
+        );
+        k.press(KeyCode::Left).await;
+        k.press(KeyCode::BackTab).await;
+        assert_eq!(k.app.picker.as_ref().unwrap().view, app::ModelView::Top);
+
+        k.press(KeyCode::Tab).await;
+        // Row 0 is the model in use, then the smartest, then the next smartest.
+        k.press(KeyCode::Down).await;
+        k.press(KeyCode::Down).await;
+        k.press(KeyCode::Enter).await;
+        assert!(
+            matches!(k.rx.try_recv(), Ok(ControllerCommand::SetModel(id)) if id == "v/m18"),
+            "the second smartest model"
+        );
+        assert_eq!(k.app.model, "v/m18");
+    }
+
+    #[tokio::test]
+    async fn typing_in_a_ranked_view_searches_all_models_instead() {
+        let mut k = Keys::new("v/m00");
+        k.type_text("/model").await;
+        k.press(KeyCode::Enter).await;
+        k.app.apply(ranked_models());
+        k.type_text("m07").await;
+        let picker = k.app.picker.as_ref().unwrap();
+        assert_eq!(picker.view, app::ModelView::All);
+        assert_eq!(picker.filter, "m07");
+        assert_eq!(picker.chosen().unwrap().value, "v/m07");
+        k.press(KeyCode::Tab).await;
+        assert_eq!(
+            k.app.picker.as_ref().unwrap().view,
+            app::ModelView::Top,
+            "Tab still moves on from the search view"
+        );
+    }
+
+    #[tokio::test]
+    async fn slash_reasoning_opens_its_picker_and_enter_sets_the_level() {
+        let mut k = Keys::new("m");
+        k.type_text("/reasoning").await;
+        k.press(KeyCode::Enter).await;
+        assert!(matches!(
+            k.rx.try_recv(),
+            Ok(ControllerCommand::ListReasoning)
+        ));
+        k.app.apply(events::UiEvent::ReasoningChoices {
+            model: "m".into(),
+            current: None,
+            levels: vec!["low".into(), "high".into()],
+            verified: true,
+        });
+        k.press(KeyCode::Down).await;
+        k.press(KeyCode::Down).await;
+        k.type_text("x").await;
+        k.press(KeyCode::Enter).await;
+        assert!(matches!(
+            k.rx.try_recv(),
+            Ok(ControllerCommand::SetReasoning(Some(level))) if level == "high"
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_command_prefix_runs_when_unique_and_asks_when_it_is_not() {
+        let mut k = Keys::new("m");
+        k.type_text("/rea").await;
+        k.press(KeyCode::Enter).await;
+        assert!(k.app.picker.is_some(), "/rea can only mean /reasoning");
+
+        let mut k = Keys::new("m");
+        k.type_text("/re").await;
+        k.press(KeyCode::Enter).await;
+        assert!(k.app.picker.is_none());
+        assert!(
+            k.app
+                .conversation
+                .iter()
+                .any(|l| l.text.contains("/re could be /reasoning or /reviews")),
+            "the notice names the choices"
+        );
+        assert_eq!(
+            k.app.composer, "/re",
+            "what was typed stays so it can be finished"
+        );
+
+        let mut k = Keys::new("m");
+        k.type_text("/zzz").await;
+        k.press(KeyCode::Enter).await;
+        assert!(
+            k.app
+                .conversation
+                .iter()
+                .any(|l| l.text.contains("Unknown command /zzz"))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_model_and_a_level_can_still_be_set_by_name() {
+        let mut k = Keys::new("m");
+        k.type_text("/model vendor/new").await;
+        k.press(KeyCode::Enter).await;
+        assert!(
+            matches!(k.rx.try_recv(), Ok(ControllerCommand::SetModel(id)) if id == "vendor/new")
+        );
+        k.type_text("/reasoning off").await;
+        k.press(KeyCode::Enter).await;
+        assert!(matches!(
+            k.rx.try_recv(),
+            Ok(ControllerCommand::SetReasoning(None))
+        ));
+        assert!(
+            k.app.picker.is_none(),
+            "with an argument there is nothing to choose"
+        );
+    }
 
     #[test]
     fn base64_matches_the_standard_alphabet_and_padding() {

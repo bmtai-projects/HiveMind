@@ -10,9 +10,10 @@
                              # provider key recognizes (e.g. "deepseek-v4-pro")
 # dialect = "anthropic"     # only for a direct Anthropic key; the default speaks the OpenAI-style API
 # reasoning_effort = "high" # off by default (reasoning-capable models cost more / run slower).
-                             # Valid values differ per model -- `hivemind models` lists them,
-                             # or run `/reasoning` with no argument in the REPL. Silently not
-                             # sent if the active model doesn't support the value you set.
+                             # Valid values differ per model -- run `/reasoning` with no
+                             # argument to see them. Not sent if HiveMind's catalog or your
+                             # provider's model list says the model doesn't accept it; for any
+                             # other model it is sent as-is.
 
 [agent]
 max_turns = 60                      # hard cap on sample<->tool cycles per input (one turn can batch several tool calls)

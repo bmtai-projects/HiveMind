@@ -14,6 +14,7 @@
 mod anthropic;
 mod client;
 mod error;
+mod models;
 mod retry;
 mod wire;
 
@@ -22,6 +23,7 @@ use harness_types::ChatRequest;
 pub use anthropic::AnthropicClient;
 pub use client::{ChatClient, EventStream, RetryHook};
 pub use error::ProviderError;
+pub use models::{ModelsFuture, RemoteModel};
 pub use retry::{DEFAULT_MAX_RETRIES, backoff_delay};
 
 /// One dialect that can stream a sampling request, behind a single object
@@ -34,6 +36,20 @@ pub trait Provider: Send + Sync {
     /// Pre-open the TLS connection. A no-op default so this stays optional
     /// per dialect rather than forcing every implementor to care.
     fn warm(&self) {}
+    /// The models this provider offers, as it describes them. Providers that
+    /// have no such list answer with an error, which callers treat as "unknown".
+    fn list_models(&self) -> ModelsFuture<'_> {
+        Box::pin(async {
+            Err(ProviderError::Request(
+                "this provider does not list its models".into(),
+            ))
+        })
+    }
+    /// The models people most use for programming, best first, when the
+    /// provider keeps such a list. Empty when it does not.
+    fn list_popular(&self) -> ModelsFuture<'_> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
 }
 
 impl Provider for ChatClient {
@@ -43,6 +59,12 @@ impl Provider for ChatClient {
     fn warm(&self) {
         ChatClient::warm(self)
     }
+    fn list_models(&self) -> ModelsFuture<'_> {
+        Box::pin(ChatClient::list_models(self))
+    }
+    fn list_popular(&self) -> ModelsFuture<'_> {
+        Box::pin(ChatClient::list_popular(self))
+    }
 }
 
 impl Provider for AnthropicClient {
@@ -51,5 +73,8 @@ impl Provider for AnthropicClient {
     }
     fn warm(&self) {
         AnthropicClient::warm(self)
+    }
+    fn list_models(&self) -> ModelsFuture<'_> {
+        Box::pin(AnthropicClient::list_models(self))
     }
 }

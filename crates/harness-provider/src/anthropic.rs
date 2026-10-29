@@ -75,6 +75,16 @@ impl AnthropicClient {
     /// Open the TLS connection now so the first real request doesn't pay
     /// for it -- see `ChatClient::warm` for the full rationale, identical
     /// here.
+    /// Ask Anthropic which models this key can use (`GET /v1/models`).
+    pub async fn list_models(&self) -> Result<Vec<crate::RemoteModel>, ProviderError> {
+        let req = self
+            .http
+            .get(format!("{}/v1/models?limit=1000", self.base_url))
+            .header("x-api-key", self.api_key.as_ref())
+            .header("anthropic-version", ANTHROPIC_VERSION);
+        crate::models::fetch_models(req).await
+    }
+
     pub fn warm(&self) {
         let http = self.http.clone();
         let url = self.base_url.to_string();
@@ -725,6 +735,27 @@ mod tests {
         assert!(sent.contains("x-api-key: ak-abc"), "{sent}");
         assert!(!sent.contains("authorization"), "{sent}");
         assert!(sent.contains("anthropic-version"), "{sent}");
+    }
+
+    #[tokio::test]
+    async fn list_models_uses_the_api_key_header_on_the_v1_models_route() {
+        let (url, rx) = crate::models::test_server::serve_json(
+            "200 OK",
+            r#"{"data":[{"id":"claude-x","display_name":"Claude X"}]}"#,
+        )
+        .await;
+        let models = AnthropicClient::new(url, "ak-abc")
+            .list_models()
+            .await
+            .unwrap();
+        let sent = rx.await.unwrap().to_lowercase();
+        assert!(sent.starts_with("get /v1/models?limit=1000 "), "{sent}");
+        assert!(
+            sent.contains("x-api-key: ak-abc") && !sent.contains("authorization"),
+            "{sent}"
+        );
+        assert!(sent.contains("anthropic-version"), "{sent}");
+        assert_eq!(models[0].name.as_deref(), Some("Claude X"));
     }
 
     #[tokio::test]
