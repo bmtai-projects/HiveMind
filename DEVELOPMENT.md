@@ -64,6 +64,16 @@ cargo test --workspace                                 # every test
 cargo build --workspace --release                      # CI also does a release build
 ```
 
+PDF reading is an optional feature that is off by default, because it adds
+about 15 MB to the binary. If you touched it, also run:
+
+```sh
+cargo clippy -p harness-tools -p harness-cli --all-targets --features harness-cli/pdf -- -D warnings
+cargo test -p harness-tools -p harness-cli --features harness-cli/pdf
+```
+
+To build a copy that can read PDFs: `cargo build --release -p harness-cli --features pdf`.
+
 Three tips:
 
 - To see formatting problems **without** changing files, run

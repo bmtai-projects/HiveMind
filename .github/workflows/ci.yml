@@ -36,5 +36,13 @@ jobs:
       - name: test
         run: cargo test --workspace
 
+      # The default build leaves PDF reading out, so its code and tests only
+      # run with the feature on.
+      - name: clippy (pdf feature)
+        run: cargo clippy -p harness-tools -p harness-cli --all-targets --features harness-cli/pdf -- -D warnings
+
+      - name: test (pdf feature)
+        run: cargo test -p harness-tools -p harness-cli --features harness-cli/pdf
+
       - name: build (release)
         run: cargo build --workspace --release
