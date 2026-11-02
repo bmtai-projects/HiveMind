@@ -6,7 +6,7 @@ use harness_tools::{FileChange, FileChangeKind, ToolStatus};
 use harness_types::{Message, Role};
 use ratatui::layout::{Position, Rect};
 
-use super::events::UiEvent;
+use super::events::{ModelChoice, UiEvent};
 use super::listview;
 
 const MAX_CONVERSATION_LINES: usize = 4_000;
@@ -28,6 +28,8 @@ pub(crate) struct LastLayout {
     pub(crate) sidebar_shown: bool,
     pub(crate) detail_page: usize,
     pub(crate) detail_max_scroll: usize,
+    pub(crate) picker: Rect,
+    pub(crate) picker_list: Rect,
 }
 
 /// The panel that arrow keys, PgUp/PgDn and Enter act on.
@@ -66,6 +68,240 @@ pub(crate) struct Detail {
     pub(crate) scroll: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PickerKind {
+    Model,
+    Reasoning,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct PickerItem {
+    /// What gets applied: a model id, or a reasoning level (`off` for none).
+    pub(crate) value: String,
+    pub(crate) label: String,
+    pub(crate) detail: String,
+    pub(crate) current: bool,
+    /// Why it is listed, in the top picks ("Smartest", "Best value").
+    pub(crate) tags: Vec<&'static str>,
+}
+
+/// The ways `/model` can order and narrow its list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ModelView {
+    Top,
+    Smartest,
+    Cheapest,
+    Context,
+    Popular,
+    All,
+}
+
+impl ModelView {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Top => "Top 5",
+            Self::Smartest => "Smartest",
+            Self::Cheapest => "Cheapest",
+            Self::Context => "Context",
+            Self::Popular => "Popular",
+            Self::All => "All",
+        }
+    }
+
+    /// One plain line saying what the view is, and where its numbers come from.
+    pub(crate) fn blurb(self) -> &'static str {
+        match self {
+            Self::Top => {
+                "Five good starting points; the tag says why. $ to $$$$ shows cost, with prices per 1M tokens (input/output)."
+            }
+            Self::Smartest => {
+                "Highest score on the Artificial Analysis intelligence index (0-100), as published by the provider."
+            }
+            Self::Cheapest => {
+                "Cheapest among the strongest quarter by score. Cost counts 3 parts input to 1 part output."
+            }
+            Self::Context => "Largest context window first, among the strongest quarter by score.",
+            Self::Popular => "What people use most for programming, according to the provider.",
+            Self::All => "Every model this provider lists. Type to search.",
+        }
+    }
+}
+
+/// A list to choose from, opened by `/model` and `/reasoning`.
+#[derive(Debug)]
+pub(crate) struct Picker {
+    pub(crate) kind: PickerKind,
+    pub(crate) title: String,
+    /// Shown above the list: a caveat, or why the list is short.
+    pub(crate) note: Option<String>,
+    pub(crate) items: Vec<PickerItem>,
+    pub(crate) filter: String,
+    /// Position within [`Picker::visible`].
+    pub(crate) selected: usize,
+    /// Corrected while drawing so the selection stays in view.
+    pub(crate) offset: Cell<usize>,
+    pub(crate) loading: bool,
+    /// The views on offer, in tab order. One entry means no tabs.
+    pub(crate) views: Vec<ModelView>,
+    pub(crate) view: ModelView,
+    /// Item indices for each ranked view; [`ModelView::All`] has no list.
+    pub(crate) lists: Vec<(ModelView, Vec<usize>)>,
+}
+
+/// What choosing a row asks for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PickerChoice {
+    Model(String),
+    /// `None` turns reasoning off.
+    Reasoning(Option<String>),
+}
+
+impl Picker {
+    fn loading(kind: PickerKind, title: &str) -> Self {
+        Self {
+            kind,
+            title: title.into(),
+            note: None,
+            items: Vec::new(),
+            filter: String::new(),
+            selected: 0,
+            offset: Cell::new(0),
+            loading: true,
+            views: vec![ModelView::All],
+            view: ModelView::All,
+            lists: Vec::new(),
+        }
+    }
+
+    /// Indices into `items` to show: the current view's list, or everything
+    /// that matches the filter. The model in use always comes first.
+    pub(crate) fn visible(&self) -> Vec<usize> {
+        let needle = self.filter.trim().to_lowercase();
+        let mut shown: Vec<usize> = match self.lists.iter().find(|(view, _)| *view == self.view) {
+            Some((_, list)) => list.clone(),
+            None => (0..self.items.len()).collect(),
+        };
+        shown.retain(|&index| {
+            let item = &self.items[index];
+            needle.is_empty()
+                || format!("{} {} {}", item.value, item.label, item.detail)
+                    .to_lowercase()
+                    .contains(&needle)
+        });
+        if self.kind == PickerKind::Model {
+            let current = self.items.iter().position(|item| item.current);
+            if let Some(current) = current {
+                match shown.iter().position(|&index| index == current) {
+                    Some(at) => {
+                        shown.remove(at);
+                        shown.insert(0, current);
+                    }
+                    None if needle.is_empty() => shown.insert(0, current),
+                    None => {}
+                }
+            }
+        }
+        shown
+    }
+
+    /// Switches to the next or previous view, wrapping around.
+    pub(crate) fn next_view(&mut self, forward: bool) {
+        if self.kind != PickerKind::Model || self.loading || self.views.len() < 2 {
+            return;
+        }
+        let at = self.views.iter().position(|v| *v == self.view).unwrap_or(0);
+        let count = self.views.len();
+        self.view = self.views[(if forward { at + 1 } else { at + count - 1 }) % count];
+        self.selected = 0;
+        self.offset.set(0);
+    }
+
+    pub(crate) fn chosen(&self) -> Option<&PickerItem> {
+        self.visible()
+            .get(self.selected)
+            .map(|&index| &self.items[index])
+    }
+
+    pub(crate) fn move_by(&mut self, delta: isize) {
+        let count = self.visible().len();
+        if count > 0 {
+            self.selected = self.selected.saturating_add_signed(delta).min(count - 1);
+        }
+    }
+
+    /// Typing searches everything, so it leaves any ranked view.
+    pub(crate) fn type_char(&mut self, c: char) {
+        if self.kind == PickerKind::Model && !self.loading {
+            self.view = ModelView::All;
+            self.filter.push(c);
+            self.selected = 0;
+        }
+    }
+
+    pub(crate) fn backspace(&mut self) {
+        if self.kind == PickerKind::Model && self.filter.pop().is_some() {
+            self.selected = 0;
+        }
+    }
+}
+
+/// "1M", "400k": a context size at a glance.
+fn compact_tokens(n: u64) -> String {
+    match n {
+        1_000_000.. => format!("{}M", n / 1_000_000),
+        1_000.. => format!("{}k", n / 1_000),
+        _ => n.to_string(),
+    }
+}
+
+fn price_label(per_million: f64) -> String {
+    if per_million >= 0.1 {
+        format!("${per_million:.2}")
+    } else {
+        format!("${per_million:.3}")
+    }
+}
+
+fn model_detail(choice: &ModelChoice) -> String {
+    let mut parts = Vec::new();
+    if let (Some(input), Some(output)) = (choice.input_per_m, choice.output_per_m) {
+        let tier = super::picks::blended_price(choice).map_or("", super::picks::cost_tier);
+        parts.push(format!(
+            "{tier} {}/{}",
+            price_label(input),
+            price_label(output)
+        ));
+    }
+    if let Some(window) = choice.context_window {
+        parts.push(format!("{} ctx", compact_tokens(window)));
+    }
+    if let Some(score) = choice.intelligence {
+        parts.push(format!("score {score:.0}"));
+    }
+    if choice.thinks {
+        parts.push("thinks".to_string());
+    }
+    if let Some(name) = choice.name.as_deref().filter(|n| *n != choice.id) {
+        parts.push(name.to_string());
+    }
+    parts.join("  ·  ")
+}
+
+/// A short plain-words reading of a reasoning level.
+fn level_blurb(level: &str) -> &'static str {
+    match level {
+        "off" => "don't ask the model to adjust its thinking",
+        "none" => "ask for no extra thinking",
+        "minimal" => "barely any extra thinking",
+        "low" => "quicker, lighter thinking",
+        "medium" => "balanced",
+        "high" => "slower, more thorough",
+        "xhigh" => "very thorough",
+        "max" => "the most thorough, and the slowest",
+        _ => "",
+    }
+}
+
 /// What the footer can honestly say about spend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CostStatus {
@@ -79,8 +315,8 @@ pub(crate) enum CostStatus {
 /// Listed as you type `/` -- VS Code's terminal swallows Ctrl+P and F1.
 pub(crate) const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/help", "keys and commands"),
-    ("/model", "<id>  switch model"),
-    ("/reasoning", "<level|off>"),
+    ("/model", "choose a model"),
+    ("/reasoning", "choose how much it thinks"),
     ("/budget", "<amount|off>"),
     ("/web", "<on|off>"),
     ("/skill", "off  clear the active skill"),
@@ -108,6 +344,34 @@ pub(crate) fn slash_matches(composer: &str) -> Vec<(&'static str, &'static str)>
         .copied()
         .filter(|(name, _)| name.starts_with(composer))
         .collect()
+}
+
+/// What a typed command name means: itself, a unique abbreviation of one,
+/// or a prefix several commands share.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Resolved {
+    Command(&'static str),
+    Ambiguous(Vec<&'static str>),
+    Unknown,
+}
+
+pub(crate) fn resolve_command(typed: &str) -> Resolved {
+    if let Some((name, _)) = SLASH_COMMANDS.iter().find(|(name, _)| *name == typed) {
+        return Resolved::Command(name);
+    }
+    if typed.len() < 2 || !typed.starts_with('/') {
+        return Resolved::Unknown;
+    }
+    let matches: Vec<&'static str> = SLASH_COMMANDS
+        .iter()
+        .map(|(name, _)| *name)
+        .filter(|name| name.starts_with(typed))
+        .collect();
+    match matches.as_slice() {
+        [] => Resolved::Unknown,
+        [only] => Resolved::Command(only),
+        _ => Resolved::Ambiguous(matches),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -314,6 +578,9 @@ pub(crate) struct App {
     pub(crate) palette_visible: bool,
     pub(crate) focus: Panel,
     pub(crate) detail: Option<Detail>,
+    pub(crate) picker: Option<Picker>,
+    /// The reasoning level in use, when one is set.
+    pub(crate) reasoning: Option<String>,
     pub(crate) composer: String,
     pub(crate) conversation: VecDeque<ConversationLine>,
     /// First visible wrapped row; `None` follows the newest output.
@@ -368,6 +635,8 @@ impl App {
             palette_visible: false,
             focus: Panel::Conversation,
             detail: None,
+            picker: None,
+            reasoning: None,
             composer: String::new(),
             conversation: VecDeque::new(),
             conversation_top: None,
@@ -507,6 +776,14 @@ impl App {
                 };
             }
             UiEvent::ModelChanged(model) => self.model = model,
+            UiEvent::ModelChoices { current, result } => self.fill_model_picker(&current, result),
+            UiEvent::ReasoningChoices {
+                model,
+                current,
+                levels,
+                verified,
+            } => self.fill_reasoning_picker(&model, current, levels, verified),
+            UiEvent::ReasoningChanged(level) => self.reasoning = level,
             UiEvent::RunFinished { error } => self.run_finished(error.map_or(Ok(()), Err)),
             UiEvent::ApprovalRequested {
                 request_id,
@@ -607,6 +884,171 @@ impl App {
         }
     }
 
+    pub(crate) fn open_model_picker(&mut self) {
+        self.picker = Some(Picker::loading(PickerKind::Model, " Choose a model "));
+    }
+
+    pub(crate) fn open_reasoning_picker(&mut self) {
+        self.picker = Some(Picker::loading(
+            PickerKind::Reasoning,
+            " How much should it think? ",
+        ));
+    }
+
+    pub(crate) fn close_picker(&mut self) {
+        self.picker = None;
+    }
+
+    fn fill_model_picker(&mut self, current: &str, result: Result<Vec<ModelChoice>, String>) {
+        let Some(picker) = self
+            .picker
+            .as_mut()
+            .filter(|p| p.kind == PickerKind::Model && p.loading)
+        else {
+            return;
+        };
+        let (choices, note) = match result {
+            Ok(choices) if choices.is_empty() => (
+                Vec::new(),
+                Some(
+                    "This provider returned no models. Use /model <id> to switch by name."
+                        .to_string(),
+                ),
+            ),
+            Ok(choices) => (choices, None),
+            Err(why) => (
+                Vec::new(),
+                Some(format!("{why}. Use /model <id> to switch by name.")),
+            ),
+        };
+        let mut items: Vec<PickerItem> = choices
+            .iter()
+            .map(|choice| PickerItem {
+                value: choice.id.clone(),
+                label: choice.id.clone(),
+                detail: model_detail(choice),
+                current: choice.id == current,
+                tags: Vec::new(),
+            })
+            .collect();
+        // The model in use is listed even when the provider doesn't list it.
+        if !items.iter().any(|item| item.current) {
+            items.push(PickerItem {
+                value: current.to_string(),
+                label: current.to_string(),
+                detail: "in use".into(),
+                current: true,
+                tags: Vec::new(),
+            });
+        }
+        let (views, lists) = match super::picks::rank(&choices) {
+            Some(ranking) => {
+                for (index, reasons) in &ranking.top {
+                    items[*index].tags = reasons.clone();
+                }
+                let mut views = Vec::new();
+                let mut lists = Vec::new();
+                let top: Vec<usize> = ranking.top.iter().map(|(index, _)| *index).collect();
+                for (view, list) in [
+                    (ModelView::Top, top),
+                    (ModelView::Smartest, ranking.smartest),
+                    (ModelView::Cheapest, ranking.cheapest),
+                    (ModelView::Context, ranking.context),
+                    (ModelView::Popular, ranking.popular),
+                ] {
+                    if !list.is_empty() {
+                        views.push(view);
+                        lists.push((view, list));
+                    }
+                }
+                views.push(ModelView::All);
+                (views, lists)
+            }
+            None => (vec![ModelView::All], Vec::new()),
+        };
+        picker.view = views[0];
+        picker.views = views;
+        picker.lists = lists;
+        picker.items = items;
+        picker.note = note;
+        picker.selected = 0;
+        picker.loading = false;
+    }
+
+    fn fill_reasoning_picker(
+        &mut self,
+        model: &str,
+        current: Option<String>,
+        levels: Vec<String>,
+        verified: bool,
+    ) {
+        if !self
+            .picker
+            .as_ref()
+            .is_some_and(|p| p.kind == PickerKind::Reasoning && p.loading)
+        {
+            return;
+        }
+        if verified && levels.is_empty() {
+            self.picker = None;
+            self.push_notice(format!("{model} has no adjustable reasoning level."));
+            return;
+        }
+        let item = |value: &str, is_current: bool| PickerItem {
+            value: value.to_string(),
+            label: value.to_string(),
+            detail: level_blurb(value).to_string(),
+            current: is_current,
+            tags: Vec::new(),
+        };
+        let mut items = vec![item("off", current.is_none())];
+        items.extend(
+            levels
+                .iter()
+                .map(|level| item(level, current.as_deref() == Some(level.as_str()))),
+        );
+        if let Some(picker) = self.picker.as_mut() {
+            picker.selected = items.iter().position(|i| i.current).unwrap_or(0);
+            picker.items = items;
+            picker.title = format!(" How much should {model} think? ");
+            picker.note = (!verified).then(|| {
+                "HiveMind can't tell which levels this model accepts, so your choice is sent as-is. \
+                 If the provider rejects it, choose off."
+                    .to_string()
+            });
+            picker.loading = false;
+        }
+    }
+
+    /// Takes the highlighted row, closing the picker. `None` while still loading.
+    pub(crate) fn apply_picker(&mut self) -> Option<PickerChoice> {
+        let picker = self.picker.as_ref().filter(|p| !p.loading)?;
+        let item = picker.chosen()?;
+        let choice = match picker.kind {
+            PickerKind::Model => PickerChoice::Model(item.value.clone()),
+            PickerKind::Reasoning => {
+                PickerChoice::Reasoning((item.value != "off").then(|| item.value.clone()))
+            }
+        };
+        self.picker = None;
+        Some(choice)
+    }
+
+    /// A click on a row selects and applies it.
+    pub(crate) fn click_picker(&mut self, column: u16, row: u16) -> Option<PickerChoice> {
+        let layout = self.layout.get();
+        if !layout.picker_list.contains(Position::new(column, row)) {
+            return None;
+        }
+        let picker = self.picker.as_mut()?;
+        let index = picker.offset.get() + (row - layout.picker_list.y) as usize;
+        if index >= picker.visible().len() {
+            return None;
+        }
+        picker.selected = index;
+        self.apply_picker()
+    }
+
     pub(crate) fn scroll_tasks(&mut self, rows: isize) {
         let max = self.layout.get().tasks_max_offset;
         self.tasks_offset = self
@@ -619,6 +1061,10 @@ impl App {
     /// Mouse wheel: scrolls whichever panel is under the pointer.
     pub(crate) fn scroll_at(&mut self, column: u16, row: u16, down: bool) {
         let step: isize = if down { 1 } else { -1 };
+        if let Some(picker) = &mut self.picker {
+            picker.move_by(step * SCROLL_ROWS);
+            return;
+        }
         if self.detail.is_some() {
             self.scroll_detail(step * SCROLL_ROWS);
             return;
@@ -1323,6 +1769,25 @@ mod tests {
                 .any(|l| l.text == "· read_file: line one")
         );
         assert!(!app.conversation.iter().any(|l| l.text.contains("line two")));
+    }
+
+    #[test]
+    fn command_names_resolve_by_exact_match_unique_prefix_or_ambiguity() {
+        assert_eq!(resolve_command("/model"), Resolved::Command("/model"));
+        assert_eq!(resolve_command("/rea"), Resolved::Command("/reasoning"));
+        assert_eq!(resolve_command("/mod"), Resolved::Command("/model"));
+        match resolve_command("/re") {
+            Resolved::Ambiguous(names) => {
+                assert!(
+                    names.contains(&"/reasoning") && names.contains(&"/reviews"),
+                    "{names:?}"
+                )
+            }
+            other => panic!("expected an ambiguity, got {other:?}"),
+        }
+        assert_eq!(resolve_command("/zzz"), Resolved::Unknown);
+        assert_eq!(resolve_command("/"), Resolved::Unknown);
+        assert_eq!(resolve_command("model"), Resolved::Unknown);
     }
 
     #[test]

@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use harness_config::{AgentPolicy, Backend, Dialect, HookSpec, Resolved};
-use harness_provider::{AnthropicClient, ChatClient, Provider, ProviderError};
+use harness_provider::{AnthropicClient, ChatClient, Provider, ProviderError, RemoteModel};
 use harness_tools::{
     ArtifactStore, DEFAULT_ARTIFACT_THRESHOLD_BYTES, Registry, ToolResult, Workspace,
 };
@@ -17,6 +17,7 @@ use crate::compaction::{CompactionPolicy, maybe_compact};
 use crate::hooks::{self, HookDecision};
 use crate::interjection::InterjectionQueue;
 use crate::latency_trace::LatencyTracer;
+use crate::reasoning::{self, ReasoningOptions};
 use crate::session::{SessionRecord, SessionStore, derive_title, unix_now};
 use crate::ui::Ui;
 
@@ -184,6 +185,13 @@ pub struct Agent {
     default_model: String,
     current_model: String,
     backend: Backend,
+    /// The provider's own list of models, once asked for. Empty until then.
+    listed_models: Vec<RemoteModel>,
+    models_loaded: bool,
+    /// Ids the provider ranks as most used for programming, best first.
+    popular_ids: Vec<String>,
+    /// The list described reasoning for at least one model.
+    list_reports_reasoning: bool,
     reasoning_effort: Option<String>,
     budget_usd: Option<f64>,
     session_cost_usd: f64,
@@ -323,6 +331,10 @@ impl Agent {
             current_model: default_model.clone(),
             default_model,
             backend: resolved.backend,
+            listed_models: Vec::new(),
+            models_loaded: false,
+            popular_ids: Vec::new(),
+            list_reports_reasoning: false,
             reasoning_effort: resolved.reasoning_effort,
             budget_usd: resolved.budget_usd,
             session_cost_usd: 0.0,
@@ -488,10 +500,51 @@ impl Agent {
         self.reasoning_effort.as_deref()
     }
 
-    pub fn reasoning_efforts_for_current_model(&self) -> &'static [&'static str] {
-        harness_config::lookup_model(&self.current_model)
-            .map(|m| m.reasoning_efforts)
-            .unwrap_or(&[])
+    pub fn backend(&self) -> Backend {
+        self.backend
+    }
+
+    pub fn models_loaded(&self) -> bool {
+        self.models_loaded
+    }
+
+    pub fn listed_models(&self) -> &[RemoteModel] {
+        &self.listed_models
+    }
+
+    /// Model ids the provider ranks as most used for programming, best first.
+    /// Empty when it keeps no such ranking.
+    pub fn popular_ids(&self) -> &[String] {
+        &self.popular_ids
+    }
+
+    /// Ask the provider which models it offers, and remember the answer.
+    /// Hosted sessions use the built-in catalog and make no request. A
+    /// failure is not remembered, so the next call tries again.
+    pub async fn refresh_models(&mut self) -> Result<usize, String> {
+        if self.backend.is_hosted() {
+            return Ok(0);
+        }
+        let (models, popular) = tokio::join!(self.client.list_models(), self.client.list_popular());
+        let models = models.map_err(|e| e.to_string())?;
+        self.list_reports_reasoning = models.iter().any(|m| m.reasoning_efforts.is_some());
+        self.models_loaded = true;
+        self.listed_models = models;
+        // The ranking is a bonus: without it the list is still complete.
+        self.popular_ids = popular
+            .map(|ranked| ranked.into_iter().map(|m| m.id).collect())
+            .unwrap_or_default();
+        Ok(self.listed_models.len())
+    }
+
+    /// The reasoning levels to offer for the current model, and whether they
+    /// are known or a guess.
+    pub fn reasoning_options(&self) -> ReasoningOptions {
+        reasoning::options_for(
+            &self.current_model,
+            &self.listed_models,
+            self.list_reports_reasoning,
+        )
     }
 
     /// Set the requested reasoning effort, sticky like `set_model`. Not
@@ -743,8 +796,8 @@ impl Agent {
             }
 
             let gated_reasoning_effort = self.reasoning_effort.as_deref().and_then(|effort| {
-                self.reasoning_efforts_for_current_model()
-                    .contains(&effort)
+                self.reasoning_options()
+                    .allows(effort)
                     .then(|| effort.to_string())
             });
 

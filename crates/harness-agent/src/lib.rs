@@ -5,6 +5,7 @@ mod cost;
 mod hooks;
 mod interjection;
 mod latency_trace;
+mod reasoning;
 mod review_orchestrator;
 mod session;
 pub mod skills;
@@ -17,8 +18,10 @@ pub use agent::Agent;
 pub use checkpoint::{OriginalState, UndoReport};
 pub use compaction::{CompactionPolicy, CompactionReport};
 pub use cost::estimate_cost_usd;
+pub use harness_provider::RemoteModel;
 pub use interjection::InterjectionQueue;
 pub use latency_trace::LatencyTracer;
+pub use reasoning::ReasoningOptions;
 pub use review_orchestrator::{
     AgentReviewSampler, ReviewProgressSink, ReviewSamplingProgress, ReviewSamplingStage,
 };
