@@ -11,7 +11,7 @@ use harness_types::{ChatRequest, ChatResponse, StreamEvent, Usage};
 
 use crate::error::ProviderError;
 use crate::retry::{DEFAULT_MAX_RETRIES, backoff_delay};
-use crate::wire::{self, WireRequest, WireStreamChunk, WireStreamOptions};
+use crate::wire::{self, WireCacheControl, WireRequest, WireStreamChunk, WireStreamOptions};
 
 pub type EventStream = UnboundedReceiver<Result<StreamEvent, ProviderError>>;
 
@@ -19,6 +19,25 @@ pub type EventStream = UnboundedReceiver<Result<StreamEvent, ProviderError>>;
 /// the CLI surface "rate limited, retrying in 2s..." without this crate
 /// depending on a logging framework or knowing about terminals.
 pub type RetryHook = Arc<dyn Fn(u32, u32, Duration, &ProviderError) + Send + Sync>;
+
+/// The request body for `req`, in the Chat Completions dialect.
+fn wire_request(req: &ChatRequest) -> WireRequest<'_> {
+    WireRequest {
+        model: &req.model,
+        messages: wire::to_wire_messages(&req.messages, req.cache_prompt_prefix),
+        tools: wire::to_wire_tools(&req.tools),
+        stream: true,
+        stream_options: WireStreamOptions {
+            include_usage: true,
+        },
+        temperature: req.temperature,
+        max_tokens: req.max_tokens,
+        reasoning_effort: req.reasoning_effort.as_deref(),
+        cache_control: req
+            .cache_conversation
+            .then_some(WireCacheControl { kind: "ephemeral" }),
+    }
+}
 
 /// Streaming Chat Completions client. Holds one [`reqwest::Client`] — cloning
 /// `ChatClient` clones an `Arc`-backed handle to the same connection
@@ -131,19 +150,7 @@ impl ChatClient {
     pub fn stream(&self, req: &ChatRequest) -> EventStream {
         let (tx, rx) = mpsc::unbounded_channel();
 
-        let wire_req = WireRequest {
-            model: &req.model,
-            messages: wire::to_wire_messages(&req.messages, req.cache_prompt_prefix),
-            tools: wire::to_wire_tools(&req.tools),
-            stream: true,
-            stream_options: WireStreamOptions {
-                include_usage: true,
-            },
-            temperature: req.temperature,
-            max_tokens: req.max_tokens,
-            reasoning_effort: req.reasoning_effort.as_deref(),
-        };
-        let body: Bytes = match serde_json::to_vec(&wire_req) {
+        let body: Bytes = match serde_json::to_vec(&wire_request(req)) {
             Ok(b) => Bytes::from(b),
             Err(e) => {
                 let _ = tx.send(Err(ProviderError::Request(e.to_string())));
@@ -525,7 +532,28 @@ mod tests {
             max_tokens: None,
             reasoning_effort: None,
             cache_prompt_prefix: false,
+            cache_conversation: false,
         }
+    }
+
+    #[test]
+    fn a_request_without_conversation_caching_has_no_cache_field() {
+        let body = serde_json::to_value(wire_request(&req())).unwrap();
+        assert!(body.get("cache_control").is_none(), "{body}");
+        assert!(!body.to_string().contains("cache_control"), "{body}");
+    }
+
+    #[test]
+    fn conversation_caching_adds_one_top_level_breakpoint_and_leaves_messages_alone() {
+        let mut r = req();
+        r.cache_conversation = true;
+        let body = serde_json::to_value(wire_request(&r)).unwrap();
+        assert_eq!(
+            body["cache_control"],
+            serde_json::json!({"type": "ephemeral"})
+        );
+        assert_eq!(body["messages"][0]["content"], "go", "{body}");
+        assert_eq!(body.to_string().matches("cache_control").count(), 1);
     }
 
     async fn collect(url: String) -> Vec<StreamEvent> {

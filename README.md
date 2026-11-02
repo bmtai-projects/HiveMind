@@ -247,14 +247,16 @@ whole conversation** on every turn. A few things fix most of that:
 
 | What | How it helps | Where to read the code |
 |---|---|---|
-| **Stable prompt prefix** | The start of every request stays identical, so providers that cache can charge the cheap "cached" rate for it. Cached input costs a small fraction of normal input on providers that support it. HiveMind shows the cache hit rate live. | [`wire.rs`](crates/harness-provider/src/wire.rs), [`tool.rs`](crates/harness-tools/src/tool.rs) |
+| **Stable prompt prefix** | The start of every request stays identical, so providers that cache can charge the cheap "cached" rate for it. Cached input costs a small fraction of normal input on providers that support it. Claude needs to be asked, so with Claude on Anthropic's API or OpenRouter, HiveMind also marks the conversation for caching. HiveMind shows the cache hit rate live. | [`wire.rs`](crates/harness-provider/src/wire.rs), [`anthropic.rs`](crates/harness-provider/src/anthropic.rs), [`tool.rs`](crates/harness-tools/src/tool.rs) |
+| **Written files aren't re-sent** | Once a request is finished, the text of files it wrote is left out of later requests, since the file is on disk and the model can read it again. The saved session keeps everything. | [`lean.rs`](crates/harness-agent/src/lean.rs) |
+| **No pointless check reminders** | If the agent changed files and ran nothing, it is asked once to run a check. Changes to docs only, or to plain web pages outside any project, skip that extra turn, since nothing could check them. | [`validation.rs`](crates/harness-agent/src/validation.rs) |
 | **Compaction** | When a session fills 75% of the model's memory (you can change that), older turns are folded into one summary instead of being re-sent forever. | [`compaction.rs`](crates/harness-agent/src/compaction.rs) |
 | **Small edits** | `edit_file` swaps one exact piece of text instead of rewriting the whole file. Output tokens are the most expensive kind, so this saves the most. | [`edit.rs`](crates/harness-tools/src/edit.rs) |
 | **Big results go to disk** | A huge command output is saved as a file, and the conversation keeps a short preview and a handle. `read_artifact` fetches more if needed. | [`artifact.rs`](crates/harness-tools/src/artifact.rs) |
 | **Cheap first, stronger only when stuck** | On the hosted service, a task starts on the cheap default model. If the agent repeats itself or keeps hitting errors, it switches to a stronger model for that task only. | [`agent.rs`](crates/harness-agent/src/agent.rs) |
 | **Parallel tools** | When the model asks for several tools at once, they run at the same time. Results are put back in order. | [`tool.rs`](crates/harness-tools/src/tool.rs) |
 | **Retries with backoff** | Rate limits and network hiccups are retried with growing, randomized waits, and a server's `Retry-After` is respected. | [`retry.rs`](crates/harness-provider/src/retry.rs) |
-| **Reused connections, no copies** | One connection pool for the whole run, and the conversation is not copied to send a turn. | [`client.rs`](crates/harness-provider/src/client.rs) |
+| **Reused connections, few copies** | One connection pool for the whole run, and the conversation is copied to send a turn only when old file text is left out. | [`client.rs`](crates/harness-provider/src/client.rs) |
 | **Live cost readout** | Every reply prints what that turn and the session cost. | [`ui.rs`](crates/harness-cli/src/ui.rs) |
 
 ## How it is built

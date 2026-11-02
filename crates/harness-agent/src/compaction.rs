@@ -291,6 +291,7 @@ async fn summarize(
         max_tokens: Some(900),
         reasoning_effort: None,
         cache_prompt_prefix: false,
+        cache_conversation: false,
     };
     let mut rx = client.stream(&req);
     let mut result = None;

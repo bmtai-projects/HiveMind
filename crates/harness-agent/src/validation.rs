@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::path::Path;
 
 use serde::Deserialize;
 use serde_json::value::RawValue;
@@ -26,6 +27,29 @@ const TEST_MARKERS: &[&str] = &[
 const SOURCE_EXTENSIONS: &[&str] = &[
     "rs", "ts", "tsx", "js", "jsx", "py", "go", "java", "rb", "php", "c", "cc", "cpp", "h", "hpp",
     "cs", "swift", "kt", "scala", "sh",
+];
+
+/// Nothing runs these. The nudge itself tells the model to say so, costing a turn.
+const DOC_EXTENSIONS: &[&str] = &["md", "markdown", "rst", "adoc", "txt"];
+
+/// Checkable only by a project's own tooling, so exempt outside one.
+const STATIC_WEB_EXTENSIONS: &[&str] = &["html", "htm", "css", "svg"];
+
+const PROJECT_MANIFESTS: &[&str] = &[
+    "package.json",
+    "Cargo.toml",
+    "pyproject.toml",
+    "setup.py",
+    "go.mod",
+    "pom.xml",
+    "build.gradle",
+    "build.gradle.kts",
+    "Makefile",
+    "CMakeLists.txt",
+    "composer.json",
+    "Gemfile",
+    "deno.json",
+    "tsconfig.json",
 ];
 
 const READ_ONLY_COMMANDS: &[&str] = &[
@@ -96,6 +120,29 @@ fn is_source_file(path: &str) -> bool {
     path.rsplit('.')
         .next()
         .is_some_and(|ext| SOURCE_EXTENSIONS.contains(&ext.to_lowercase().as_str()))
+}
+
+fn extension_in(path: &str, list: &[&str]) -> bool {
+    Path::new(path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| list.contains(&ext.to_ascii_lowercase().as_str()))
+}
+
+/// Whether a project manifest sits beside `path` or in a folder above it, up to `root`.
+pub(crate) fn belongs_to_a_project(root: &Path, path: &str) -> bool {
+    let full = root.join(path);
+    let mut dir = full.parent();
+    while let Some(d) = dir {
+        if PROJECT_MANIFESTS.iter().any(|name| d.join(name).is_file()) {
+            return true;
+        }
+        if d == root || !d.starts_with(root) {
+            return false;
+        }
+        dir = d.parent();
+    }
+    false
 }
 
 #[derive(Default)]
@@ -169,11 +216,25 @@ impl RunLedger {
         (!self.changed.is_empty() && !self.anything_ran()).then_some(self.changed.len())
     }
 
-    pub(crate) fn nudge_now(&self, already_nudged: bool) -> Option<Nudge> {
+    fn nothing_could_check(&self, in_a_project: &impl Fn(&str) -> bool) -> bool {
+        self.changed.iter().all(|path| {
+            extension_in(path, DOC_EXTENSIONS)
+                || (extension_in(path, STATIC_WEB_EXTENSIONS) && !in_a_project(path))
+        })
+    }
+
+    pub(crate) fn nudge_now(
+        &self,
+        already_nudged: bool,
+        in_a_project: impl Fn(&str) -> bool,
+    ) -> Option<Nudge> {
         if already_nudged {
             return None;
         }
         if let Some(changed) = self.unchecked_change_count() {
+            if self.nothing_could_check(&in_a_project) {
+                return None;
+            }
             return Some(Nudge::NothingRan { changed });
         }
 
@@ -240,6 +301,70 @@ mod tests {
 
     fn args(json: serde_json::Value) -> Box<RawValue> {
         RawValue::from_string(json.to_string()).unwrap()
+    }
+
+    fn in_project(_: &str) -> bool {
+        true
+    }
+
+    fn loose(_: &str) -> bool {
+        false
+    }
+
+    #[test]
+    fn docs_alone_are_never_asked_for_a_check() {
+        let mut l = RunLedger::default();
+        edit(&mut l, "README.md");
+        edit(&mut l, "docs/notes.TXT");
+        assert_eq!(l.unchecked_change_count(), Some(2));
+        assert_eq!(l.nudge_now(false, in_project), None);
+        assert_eq!(l.nudge_now(false, loose), None);
+    }
+
+    #[test]
+    fn a_loose_web_page_is_not_asked_for_a_check_but_one_in_a_project_is() {
+        let mut l = RunLedger::default();
+        edit(&mut l, "shooting_game.html");
+        edit(&mut l, "style.css");
+        assert_eq!(l.nudge_now(false, loose), None);
+        assert_eq!(
+            l.nudge_now(false, in_project),
+            Some(Nudge::NothingRan { changed: 2 })
+        );
+    }
+
+    #[test]
+    fn any_code_among_the_changes_still_gets_the_note() {
+        let mut l = RunLedger::default();
+        edit(&mut l, "index.html");
+        edit(&mut l, "README.md");
+        edit(&mut l, "server.js");
+        assert_eq!(
+            l.nudge_now(false, loose),
+            Some(Nudge::NothingRan { changed: 3 })
+        );
+        let mut config = RunLedger::default();
+        edit(&mut config, "package.json");
+        assert_eq!(
+            config.nudge_now(false, loose),
+            Some(Nudge::NothingRan { changed: 1 })
+        );
+    }
+
+    #[test]
+    fn a_project_is_found_beside_the_file_or_above_it_but_not_outside_the_workspace() {
+        let root = std::env::temp_dir().join(format!("hm-validation-{}", std::process::id()));
+        let app = root.join("apps").join("site");
+        std::fs::create_dir_all(app.join("pages")).unwrap();
+        assert!(!belongs_to_a_project(&root, "apps/site/pages/index.html"));
+        std::fs::write(app.join("package.json"), "{}").unwrap();
+        assert!(belongs_to_a_project(&root, "apps/site/pages/index.html"));
+        assert!(belongs_to_a_project(&root, "apps/site/index.html"));
+        assert!(!belongs_to_a_project(&root, "other/index.html"));
+        assert!(!belongs_to_a_project(&root, "index.html"));
+        std::fs::write(root.join("Cargo.toml"), "").unwrap();
+        assert!(belongs_to_a_project(&root, "index.html"));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     fn edit(ledger: &mut RunLedger, path: &str) {
@@ -401,14 +526,17 @@ mod tests {
         edit(&mut l, "src/main.rs");
 
         // Turn 1: the model stops without checking. Asked once.
-        assert_eq!(l.nudge_now(false), Some(Nudge::NothingRan { changed: 1 }));
+        assert_eq!(
+            l.nudge_now(false, in_project),
+            Some(Nudge::NothingRan { changed: 1 })
+        );
 
         // Turn 2: it edits more and stops again, still without checking.
         // The ledger still says the work is unchecked -- and the run is
         // still allowed to end.
         edit(&mut l, "src/other.rs");
         assert_eq!(l.unchecked_change_count(), Some(2));
-        assert_eq!(l.nudge_now(true), None);
+        assert_eq!(l.nudge_now(true, in_project), None);
     }
 
     /// A run that takes the note seriously must not then be nudged for the
@@ -417,10 +545,13 @@ mod tests {
     fn a_run_that_checks_after_being_asked_is_not_asked_again() {
         let mut l = RunLedger::default();
         edit(&mut l, "src/main.rs");
-        assert_eq!(l.nudge_now(false), Some(Nudge::NothingRan { changed: 1 }));
+        assert_eq!(
+            l.nudge_now(false, in_project),
+            Some(Nudge::NothingRan { changed: 1 })
+        );
         edit(&mut l, "src/main.rs");
         shell(&mut l, "cargo test");
-        assert_eq!(l.nudge_now(true), None);
+        assert_eq!(l.nudge_now(true, in_project), None);
         assert_eq!(l.unchecked_change_count(), None);
     }
 
@@ -470,7 +601,7 @@ mod tests {
         );
 
         assert_eq!(
-            l.nudge_now(false),
+            l.nudge_now(false, in_project),
             Some(Nudge::NewCodeNeverRun { created: 1 }),
             "cargo check must not stand in for running the code"
         );
@@ -482,7 +613,7 @@ mod tests {
         create(&mut l, "src/trace.rs");
         shell(&mut l, "cargo test -p harness-agent");
         shell(&mut l, "cargo clippy --workspace -- -D warnings");
-        assert_eq!(l.nudge_now(false), None);
+        assert_eq!(l.nudge_now(false, in_project), None);
     }
 
     /// The real gap: a generated implementation ran `cargo check` and
@@ -499,7 +630,7 @@ mod tests {
             "cd HiveMind && cargo test --package harness-agent 2>&1",
         );
         assert_eq!(
-            l.nudge_now(false),
+            l.nudge_now(false, in_project),
             Some(Nudge::NewCodeNotLinted { created: 1 })
         );
     }
@@ -530,7 +661,7 @@ mod tests {
         let mut l = RunLedger::default();
         edit(&mut l, "src/agent.rs");
         shell(&mut l, "cargo test");
-        assert_eq!(l.nudge_now(false), None);
+        assert_eq!(l.nudge_now(false, in_project), None);
     }
 
     #[test]
@@ -540,7 +671,7 @@ mod tests {
         shell(&mut l, "cargo test");
         shell(&mut l, "cargo clippy");
         shell(&mut l, "cargo fmt");
-        assert_eq!(l.nudge_now(false), None);
+        assert_eq!(l.nudge_now(false, in_project), None);
     }
 
     /// One command that does both counts as the stronger of the two --
@@ -565,7 +696,7 @@ mod tests {
         let mut l = RunLedger::default();
         edit(&mut l, "src/agent.rs");
         shell(&mut l, "cargo check");
-        assert_eq!(l.nudge_now(false), None);
+        assert_eq!(l.nudge_now(false, in_project), None);
     }
 
     /// A new README has nothing to execute. Demanding a test for one is the
@@ -575,7 +706,7 @@ mod tests {
         let mut l = RunLedger::default();
         create(&mut l, "docs/DESIGN.md");
         shell(&mut l, "cargo check");
-        assert_eq!(l.nudge_now(false), None);
+        assert_eq!(l.nudge_now(false, in_project), None);
     }
 
     /// The stronger note must not hand back the "nothing applies" out: it

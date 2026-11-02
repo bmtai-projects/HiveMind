@@ -153,6 +153,8 @@ pub struct ChatRequest {
     /// needs_explicit_cache_control`). Providers that cache automatically
     /// need this off — sending it to them buys nothing and risks a 400.
     pub cache_prompt_prefix: bool,
+    /// Also cache the conversation via a breakpoint at its end. Caller-gated: Claude on Anthropic or OpenRouter only.
+    pub cache_conversation: bool,
 }
 
 /// The assembled result of one sampling request.
