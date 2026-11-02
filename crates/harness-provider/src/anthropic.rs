@@ -400,7 +400,11 @@ struct WireMessage {
 #[serde(tag = "type")]
 enum WireContentBlock {
     #[serde(rename = "text")]
-    Text { text: String },
+    Text {
+        text: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<WireCacheControl>,
+    },
     #[serde(rename = "tool_use")]
     ToolUse {
         id: String,
@@ -411,6 +415,8 @@ enum WireContentBlock {
     ToolResult {
         tool_use_id: String,
         content: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<WireCacheControl>,
     },
 }
 
@@ -473,7 +479,7 @@ fn build_request(req: &ChatRequest) -> Result<WireRequest<'_>, String> {
         None
     } else {
         let joined = system_text.join("\n\n");
-        Some(if req.cache_prompt_prefix {
+        Some(if req.cache_prompt_prefix || req.cache_conversation {
             WireSystem::Blocks(vec![WireSystemBlock {
                 kind: "text",
                 text: joined,
@@ -484,7 +490,10 @@ fn build_request(req: &ChatRequest) -> Result<WireRequest<'_>, String> {
         })
     };
 
-    let messages = to_wire_messages(&req.messages)?;
+    let mut messages = to_wire_messages(&req.messages)?;
+    if req.cache_conversation {
+        mark_conversation_end(&mut messages);
+    }
     let tools = req
         .tools
         .iter()
@@ -505,6 +514,27 @@ fn build_request(req: &ChatRequest) -> Result<WireRequest<'_>, String> {
         temperature,
         thinking,
     })
+}
+
+/// Breakpoint on the last non-empty block, so the next turn reads everything before it from cache.
+fn mark_conversation_end(messages: &mut [WireMessage]) {
+    let Some(block) = messages.last_mut().and_then(|m| m.content.last_mut()) else {
+        return;
+    };
+    match block {
+        WireContentBlock::Text {
+            text: body,
+            cache_control,
+        }
+        | WireContentBlock::ToolResult {
+            content: body,
+            cache_control,
+            ..
+        } if !body.is_empty() => {
+            *cache_control = Some(WireCacheControl { kind: "ephemeral" });
+        }
+        _ => {}
+    }
 }
 
 /// Non-system messages, Anthropic-shaped. Consecutive tool-result messages
@@ -530,6 +560,7 @@ fn to_wire_messages(msgs: &[Message]) -> Result<Vec<WireMessage>, String> {
                     blocks.push(WireContentBlock::ToolResult {
                         tool_use_id,
                         content: tr.content.clone(),
+                        cache_control: None,
                     });
                     i += 1;
                 }
@@ -543,6 +574,7 @@ fn to_wire_messages(msgs: &[Message]) -> Result<Vec<WireMessage>, String> {
                 if !m.content.is_empty() {
                     blocks.push(WireContentBlock::Text {
                         text: m.content.clone(),
+                        cache_control: None,
                     });
                 }
                 for tc in &m.tool_calls {
@@ -565,6 +597,7 @@ fn to_wire_messages(msgs: &[Message]) -> Result<Vec<WireMessage>, String> {
                     role: "user",
                     content: vec![WireContentBlock::Text {
                         text: m.content.clone(),
+                        cache_control: None,
                     }],
                 });
                 i += 1;
@@ -707,6 +740,7 @@ mod tests {
             max_tokens: None,
             reasoning_effort: None,
             cache_prompt_prefix: false,
+            cache_conversation: false,
         }
     }
 
@@ -861,6 +895,61 @@ mod tests {
         r.cache_prompt_prefix = true;
         let wire = build_request(&r).unwrap();
         assert!(matches!(wire.system, Some(WireSystem::Blocks(_))));
+    }
+
+    fn wire_json(r: &ChatRequest) -> serde_json::Value {
+        serde_json::to_value(build_request(r).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn without_conversation_caching_no_message_carries_a_breakpoint() {
+        let mut r = req();
+        r.messages
+            .push(Message::tool_result("c0", "read_file", "a"));
+        let j = wire_json(&r);
+        assert!(!j["messages"].to_string().contains("cache_control"), "{j}");
+        assert!(j["system"].is_string(), "{j}");
+    }
+
+    #[test]
+    fn conversation_caching_marks_the_system_and_the_last_block_only() {
+        let mut r = req();
+        r.cache_conversation = true;
+        r.messages.push(Message::assistant("looking"));
+        r.messages.push(Message::user("and now?"));
+        let j = wire_json(&r);
+        assert_eq!(j["system"][0]["cache_control"]["type"], "ephemeral");
+        let messages = j["messages"].as_array().unwrap();
+        let last = messages.last().unwrap();
+        assert_eq!(last["content"][0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(
+            j.to_string().matches("cache_control").count(),
+            2,
+            "one breakpoint for the prefix, one for the conversation: {j}"
+        );
+    }
+
+    #[test]
+    fn a_trailing_tool_result_carries_the_conversation_breakpoint() {
+        let mut r = req();
+        r.cache_conversation = true;
+        r.messages
+            .push(Message::tool_result("c0", "read_file", "a"));
+        r.messages.push(Message::tool_result("c1", "search", "b"));
+        let j = wire_json(&r);
+        let last = j["messages"].as_array().unwrap().last().unwrap().clone();
+        assert!(last["content"][0].get("cache_control").is_none(), "{last}");
+        assert_eq!(last["content"][1]["type"], "tool_result");
+        assert_eq!(last["content"][1]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn an_empty_last_block_gets_no_breakpoint() {
+        let mut r = req();
+        r.cache_conversation = true;
+        r.messages.push(Message::tool_result("c0", "run_shell", ""));
+        let j = wire_json(&r);
+        assert!(!j["messages"].to_string().contains("cache_control"), "{j}");
     }
 
     #[test]

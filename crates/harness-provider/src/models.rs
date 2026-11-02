@@ -176,7 +176,7 @@ pub(crate) async fn fetch_models(
 }
 
 /// Only OpenRouter answers a `category` filter, so only it is asked.
-pub(crate) fn is_openrouter(base_url: &str) -> bool {
+pub fn is_openrouter(base_url: &str) -> bool {
     base_url
         .split_once("://")
         .map_or(base_url, |(_, rest)| rest)

@@ -23,7 +23,7 @@ use harness_types::ChatRequest;
 pub use anthropic::AnthropicClient;
 pub use client::{ChatClient, EventStream, RetryHook};
 pub use error::ProviderError;
-pub use models::{ModelsFuture, RemoteModel};
+pub use models::{ModelsFuture, RemoteModel, is_openrouter};
 pub use retry::{DEFAULT_MAX_RETRIES, backoff_delay};
 
 /// One dialect that can stream a sampling request, behind a single object

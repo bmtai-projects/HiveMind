@@ -185,6 +185,8 @@ pub struct Agent {
     default_model: String,
     current_model: String,
     backend: Backend,
+    /// Anthropic's API or OpenRouter: where Claude's cache breakpoints are documented.
+    claude_caching_endpoint: bool,
     /// The provider's own list of models, once asked for. Empty until then.
     listed_models: Vec<RemoteModel>,
     models_loaded: bool,
@@ -287,6 +289,8 @@ impl Agent {
         ui: Arc<dyn Ui>,
         system_prompt: String,
     ) -> Self {
+        let claude_caching_endpoint = resolved.dialect == Dialect::Anthropic
+            || harness_provider::is_openrouter(&resolved.endpoint.base_url);
         let ui_for_retry = ui.clone();
         let retry_hook = Arc::new(move |attempt, max, delay, err: &ProviderError| {
             ui_for_retry.retrying(attempt, max, delay, &err.to_string());
@@ -331,6 +335,7 @@ impl Agent {
             current_model: default_model.clone(),
             default_model,
             backend: resolved.backend,
+            claude_caching_endpoint,
             listed_models: Vec::new(),
             models_loaded: false,
             popular_ids: Vec::new(),
@@ -801,9 +806,11 @@ impl Agent {
                     .then(|| effort.to_string())
             });
 
+            let lighter = crate::lean::lighter_history(&self.messages, self.current_request_start);
+            let sending_stored = lighter.is_none();
             let mut req = ChatRequest {
                 model: self.current_model.clone(),
-                messages: std::mem::take(&mut self.messages),
+                messages: lighter.unwrap_or_else(|| std::mem::take(&mut self.messages)),
                 tools: self.tools.schemas(),
                 temperature: None,
                 max_tokens: None,
@@ -813,6 +820,8 @@ impl Agent {
                 // breakpoint; the rest cache automatically.
                 cache_prompt_prefix: harness_config::lookup_model(&self.current_model)
                     .is_some_and(|m| m.needs_explicit_cache_control),
+                cache_conversation: self.claude_caching_endpoint
+                    && harness_config::is_claude_model(&self.current_model),
             };
 
             self.ui.turn_started();
@@ -820,7 +829,9 @@ impl Agent {
                 t.emit("provider_request_started");
             }
             let mut rx = self.client.stream(&req);
-            self.messages = std::mem::take(&mut req.messages);
+            if sending_stored {
+                self.messages = std::mem::take(&mut req.messages);
+            }
 
             let resp = self.drain_stream(&mut rx).await?;
 
@@ -887,7 +898,13 @@ impl Agent {
                 // and is then let through on its next answer whatever it
                 // says -- see `validation.rs` for why this is a nudge and
                 // not a gate.
-                if let Some(nudge) = self.run_ledger.nudge_now(self.validation_nudged_this_run) {
+                let root = &self.workspace.root;
+                if let Some(nudge) = self
+                    .run_ledger
+                    .nudge_now(self.validation_nudged_this_run, |path| {
+                        crate::validation::belongs_to_a_project(root, path)
+                    })
+                {
                     self.validation_nudged_this_run = true;
                     let (count, text) = match nudge {
                         crate::validation::Nudge::NothingRan { changed } => {
@@ -1117,6 +1134,21 @@ impl Agent {
 
         let mut executable = Vec::with_capacity(allowed.len());
         for call in allowed {
+            if crate::lean::copies_an_omission_note(&call) {
+                let result = crate::lean::COPIED_NOTE_ERROR;
+                self.ui.tool_end_detailed(crate::ToolEvent {
+                    call_id: &call.id,
+                    name: &call.name,
+                    result,
+                    status: harness_tools::ToolStatus::Denied,
+                    changed_files: &[],
+                    cost_usd: 0.0,
+                    session_cost_usd: self.session_cost_usd,
+                });
+                self.messages
+                    .push(Message::tool_result(call.id, call.name, result.to_string()));
+                continue;
+            }
             if is_web_tool(&call.name) {
                 if self.web_operations_remaining == 0 {
                     let result = "ERROR: web operation quota exhausted for this user request (maximum 3); use the sources already gathered and answer now";

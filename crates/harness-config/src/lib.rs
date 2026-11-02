@@ -162,6 +162,18 @@ pub fn lookup_model(id: &str) -> Option<&'static ModelCatalogEntry> {
     KNOWN_MODELS.iter().find(|m| m.id == id)
 }
 
+/// Whether `id` names an Anthropic Claude model, bare (`claude-…`) or the
+/// way OpenRouter lists it (`anthropic/claude-…`).
+pub fn is_claude_model(id: &str) -> bool {
+    let id = id.trim_start_matches('~').to_ascii_lowercase();
+    let name = match id.split_once('/') {
+        Some(("anthropic", name)) => name,
+        Some(_) => return false,
+        None => id.as_str(),
+    };
+    name.starts_with("claude")
+}
+
 /// Resolved model endpoint: where to send requests and with what key.
 #[derive(Debug, Clone)]
 pub struct Endpoint {
@@ -806,6 +818,29 @@ mod tests {
     // whole duration (guard held until scope end), so they're serialized
     // against each other without slowing down or affecting unrelated tests.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn claude_is_recognised_bare_or_as_openrouter_lists_it_and_nothing_else() {
+        for id in [
+            "claude-sonnet-5",
+            "claude-3-5-haiku-latest",
+            "anthropic/claude-opus-5.5",
+            "~anthropic/claude-sonnet-latest",
+            "Anthropic/Claude-Sonnet-5",
+        ] {
+            assert!(is_claude_model(id), "{id}");
+        }
+        for id in [
+            "hivemind",
+            "deepseek/deepseek-v4-flash",
+            "someone/claude-distill",
+            "anthropic/other",
+            "openai/gpt-5",
+            "",
+        ] {
+            assert!(!is_claude_model(id), "{id}");
+        }
+    }
 
     #[test]
     fn known_models_lookup_finds_hivemind_and_rejects_unknown() {
