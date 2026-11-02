@@ -31,6 +31,9 @@ pub(crate) struct WireRequest<'a> {
     // on some deployments.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<&'a str>,
+    /// OpenRouter's automatic caching: a breakpoint it moves to the conversation's end.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<WireCacheControl>,
 }
 
 #[derive(Serialize)]

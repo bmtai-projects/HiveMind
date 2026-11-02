@@ -5,6 +5,7 @@ mod cost;
 mod hooks;
 mod interjection;
 mod latency_trace;
+mod lean;
 mod reasoning;
 mod review_orchestrator;
 mod session;
