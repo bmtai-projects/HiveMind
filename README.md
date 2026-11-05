@@ -108,7 +108,20 @@ Things to know:
 
 - HiveMind has no default local model. Use `ollama list` to see yours.
 - Pick a model that supports tool calling. Without it the agent cannot read or
-  edit files.
+  edit files. Some models (for example `qwen2.5-coder`) write their tool
+  calls as plain JSON text instead; HiveMind recognizes those and runs them.
+- Give the model a context of at least 16k tokens. Ollama's default is 4,096,
+  and it silently cuts anything longer, so the model loses its instructions.
+  Set `OLLAMA_CONTEXT_LENGTH=16384` (on Windows: `setx OLLAMA_CONTEXT_LENGTH 16384`)
+  and restart Ollama. HiveMind warns you when it sees a cut prompt.
+- The first message is the slow one: the model has to read about 3,000 tokens
+  of instructions and tool descriptions, which can take a few minutes on a
+  CPU. Later messages reuse that work while the model stays loaded, so also
+  set `OLLAMA_KEEP_ALIVE=1h`, or it unloads after 5 idle minutes.
+- To keep that first read short, local models get a smaller tool set: no
+  PDF, spreadsheet, diagram or semantic search tools. Set
+  `local_all_tools = true` under `[agent]` in config.toml to give them every
+  tool, for example a big model on a GPU.
 - No prices are known for your own model, so no cost is shown.
 - Your code and prompts stay on your machine, but HiveMind is not fully
   offline. Every time `hivemind activate` starts, it asks GitHub whether a

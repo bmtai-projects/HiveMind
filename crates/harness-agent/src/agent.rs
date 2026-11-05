@@ -40,6 +40,8 @@ const ESCALATION_BUDGET_HEADROOM: f64 = 0.5;
 /// count they never chose.
 const MAX_TURN_EXTENSIONS: u32 = 4;
 const SEND_GUARD_PERCENT: u64 = 95;
+/// Smaller requests fit any local context, so a low count there means nothing.
+const PROMPT_CUT_MIN_TOKENS: u64 = 2_000;
 const WEB_OPERATIONS_PER_RUN: u8 = 3;
 const WEB_SYSTEM_INSTRUCTION: &str = "\
 <web-mode>
@@ -233,6 +235,7 @@ pub struct Agent {
     /// run can genuinely both go in circles *and* finish without checking
     /// its edits, and each observation is worth making once.
     validation_nudged_this_run: bool,
+    prompt_cut_warned_this_run: bool,
     /// Index in `messages` where the in-flight user request begins.
     /// Everything from here on is what the agent is working from right now,
     /// which `crate::trim` protects from being aged out until there is
@@ -355,6 +358,7 @@ impl Agent {
             nudged_this_run: false,
             run_ledger: crate::validation::RunLedger::default(),
             validation_nudged_this_run: false,
+            prompt_cut_warned_this_run: false,
             current_request_start: 0,
             last_turn_had_failure: false,
             workspace,
@@ -722,6 +726,7 @@ impl Agent {
         self.nudged_this_run = false;
         self.run_ledger.clear();
         self.validation_nudged_this_run = false;
+        self.prompt_cut_warned_this_run = false;
         self.web_operations_remaining = WEB_OPERATIONS_PER_RUN;
         let mut checkpoint = Checkpoint::open(user_input, self.messages.len());
         // Same boundary the checkpoint takes, and for a related reason: this
@@ -829,11 +834,18 @@ impl Agent {
                 t.emit("provider_request_started");
             }
             let mut rx = self.client.stream(&req);
+            let sent_tokens = (self.backend == Backend::Local).then(|| {
+                crate::tokens::estimate_tokens(&req.messages)
+                    + crate::tokens::estimate_schema_tokens(&req.tools)
+            });
             if sending_stored {
                 self.messages = std::mem::take(&mut req.messages);
             }
 
             let resp = self.drain_stream(&mut rx).await?;
+            if let Some(sent) = sent_tokens {
+                self.warn_if_prompt_was_cut(sent, resp.usage.prompt_tokens);
+            }
 
             self.last_total_tokens = resp.usage.total_tokens;
             self.context_window = harness_config::lookup_model(&self.current_model)
@@ -1038,6 +1050,9 @@ impl Agent {
         let mut saw_text = false;
         let mut first_token_emitted = false;
         let mut first_visible_emitted = false;
+        // A local model may write a tool call as text: hold it until it can be told apart.
+        let mut holding = self.backend == Backend::Local;
+        let mut held = String::new();
         while let Some(event) = rx.recv().await {
             if let Some(t) = self.tracer.as_ref()
                 && !first_token_emitted
@@ -1047,12 +1062,20 @@ impl Agent {
             }
             let event = event.map_err(|e| self.wrap_provider_error(e))?;
             match event {
-                StreamEvent::TextDelta(t) => {
+                StreamEvent::TextDelta(mut t) => {
                     if let Some(t) = self.tracer.as_ref()
                         && !first_visible_emitted
                     {
                         first_visible_emitted = true;
                         t.emit("first_user_visible_event_emitted");
+                    }
+                    if holding {
+                        held.push_str(&t);
+                        if crate::text_calls::may_be_a_call(&held) {
+                            continue;
+                        }
+                        holding = false;
+                        t = std::mem::take(&mut held);
                     }
                     saw_text = true;
                     self.ui.assistant_delta(&t);
@@ -1074,10 +1097,58 @@ impl Agent {
                 }
             }
         }
+        let mut resp = final_response
+            .ok_or_else(|| anyhow::anyhow!("stream closed without a terminal response"))?;
+        if !held.is_empty() && !self.take_written_calls(&mut resp) {
+            saw_text = true;
+            self.ui.assistant_delta(&held);
+        }
         if saw_text {
             self.ui.assistant_done();
         }
-        final_response.ok_or_else(|| anyhow::anyhow!("stream closed without a terminal response"))
+        Ok(resp)
+    }
+
+    /// Makes a reply that is only written-out calls to known tools into real tool calls.
+    fn take_written_calls(&self, resp: &mut harness_types::ChatResponse) -> bool {
+        if !resp.tool_calls.is_empty() {
+            return false;
+        }
+        let Some(calls) =
+            crate::text_calls::parse(&resp.content, |name| self.tools.is_enabled(name))
+        else {
+            return false;
+        };
+        let turn = self.messages.len();
+        resp.tool_calls = calls
+            .into_iter()
+            .enumerate()
+            .map(|(i, (name, args))| ToolCall {
+                id: format!("call_text_{turn}_{i}"),
+                name,
+                args,
+            })
+            .collect();
+        resp.content.clear();
+        resp.finish_reason = "tool_calls".to_string();
+        true
+    }
+
+    /// Local servers silently cut a prompt longer than their context window.
+    fn warn_if_prompt_was_cut(&mut self, sent_estimate: u64, read: u64) {
+        let cut = read > 0
+            && sent_estimate >= PROMPT_CUT_MIN_TOKENS
+            && read.saturating_mul(2) < sent_estimate;
+        if !cut || self.prompt_cut_warned_this_run {
+            return;
+        }
+        self.prompt_cut_warned_this_run = true;
+        self.ui.diagnostic(&format!(
+            "The local model read only {read} tokens of this request: its server cut the rest, \
+             so the model is missing instructions and tools. Give it a context of at least 16k \
+             tokens. For Ollama, set OLLAMA_CONTEXT_LENGTH=16384 and restart Ollama, or use a \
+             model with a larger num_ctx."
+        ));
     }
 
     /// Run every requested tool call concurrently, notify the UI, and push

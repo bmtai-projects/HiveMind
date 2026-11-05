@@ -213,9 +213,48 @@ fn platform_note() -> &'static str {
     }
 }
 
-fn system_prompt(project: Option<&str>, read_program_available: bool) -> String {
-    let mut prompt = format!("{IDENTITY}\n\n{SYSTEM_PROMPT_BODY}\n\n{}", platform_note());
-    if read_program_available {
+/// Which optional tools the system prompt may point the model at.
+#[derive(Clone, Copy, Default)]
+struct PromptTools {
+    read_program: bool,
+    /// Local models get the core tools only, so the prompt must not mention the rest.
+    local_core: bool,
+}
+
+/// Left out for local models, which must read every prompt token on the user's machine.
+const LOCAL_LEFT_OUT_TOOLS: [&str; 4] = [
+    "semantic_search",
+    "create_pdf",
+    "create_spreadsheet",
+    "create_diagram",
+];
+const SEMANTIC_SEARCH_HINT: &str = ", or
+  `semantic_search` to find code by concept when you don't know the symbol
+  (prefer both over shell grep)";
+const DOCUMENT_TOOLS_START: &str = "- To produce a PDF or an Excel workbook";
+const DOCUMENT_TOOLS_END: &str = "- To change an existing file";
+
+fn prompt_body(local_core: bool) -> String {
+    if !local_core {
+        return SYSTEM_PROMPT_BODY.to_string();
+    }
+    let body = SYSTEM_PROMPT_BODY.replace(SEMANTIC_SEARCH_HINT, "\n  (prefer it over shell grep)");
+    match (
+        body.find(DOCUMENT_TOOLS_START),
+        body.find(DOCUMENT_TOOLS_END),
+    ) {
+        (Some(start), Some(end)) if start < end => format!("{}{}", &body[..start], &body[end..]),
+        _ => body,
+    }
+}
+
+fn system_prompt(project: Option<&str>, tools: PromptTools) -> String {
+    let mut prompt = format!(
+        "{IDENTITY}\n\n{}\n\n{}",
+        prompt_body(tools.local_core),
+        platform_note()
+    );
+    if tools.read_program {
         prompt.push_str("\n\n");
         prompt.push_str(READ_PROGRAM_PROMPT);
     }
@@ -850,7 +889,12 @@ async fn run(args: ActivateArgs) -> anyhow::Result<()> {
     // session could bypass a policy targeting read_file/search/list_dir.
     // Keeping the existing tools only preserves every configured hook's
     // enforcement and observability semantics.
-    let read_program_available = resolved.hooks.is_empty();
+    let local_core =
+        resolved.backend == harness_config::Backend::Local && !resolved.policy.local_all_tools;
+    let prompt_tools = PromptTools {
+        read_program: resolved.hooks.is_empty() && !local_core,
+        local_core,
+    };
     let artifact_store = Arc::new(harness_tools::ArtifactStore::new(
         harness_config::default_artifacts_dir(),
     ));
@@ -860,7 +904,7 @@ async fn run(args: ActivateArgs) -> anyhow::Result<()> {
     registry.register(Arc::new(ListDir(ws.clone())));
     registry.register(Arc::new(ProjectMap(ws.clone())));
     registry.register(Arc::new(Search(ws.clone())));
-    if read_program_available {
+    if prompt_tools.read_program {
         registry.register(Arc::new(ReadProgram::new(ws.clone())));
     }
     if resolved.backend.is_hosted()
@@ -898,6 +942,11 @@ async fn run(args: ActivateArgs) -> anyhow::Result<()> {
     registry.register(Arc::new(CreatePdf(ws.clone())));
     registry.register(Arc::new(CreateSpreadsheet(ws.clone())));
     registry.register(Arc::new(CreateDiagram(ws.clone())));
+    if prompt_tools.local_core {
+        for name in LOCAL_LEFT_OUT_TOOLS {
+            registry.set_enabled(name, false);
+        }
+    }
 
     // Shell approval has three shapes:
     // - `--yolo` (either mode): auto-approved, no round-trip at all.
@@ -940,7 +989,7 @@ async fn run(args: ActivateArgs) -> anyhow::Result<()> {
             registry,
             ws.clone(),
             json_ui.clone(),
-            system_prompt(project_conventions.as_deref(), read_program_available),
+            system_prompt(project_conventions.as_deref(), prompt_tools),
         );
         agent.warm_connection();
         if let Some(tracer) = latency_tracer.clone() {
@@ -963,7 +1012,7 @@ async fn run(args: ActivateArgs) -> anyhow::Result<()> {
             workspace,
             false,
             project_conventions.as_deref(),
-            read_program_available,
+            prompt_tools,
         )?;
         if args.web {
             agent.set_web_enabled(true).map_err(anyhow::Error::msg)?;
@@ -980,7 +1029,7 @@ async fn run(args: ActivateArgs) -> anyhow::Result<()> {
             registry,
             ws.clone(),
             tui_bridge.clone(),
-            system_prompt(project_conventions.as_deref(), read_program_available),
+            system_prompt(project_conventions.as_deref(), prompt_tools),
         );
         agent.warm_connection();
         if let Some(tracer) = latency_tracer.clone() {
@@ -1002,7 +1051,7 @@ async fn run(args: ActivateArgs) -> anyhow::Result<()> {
             workspace.clone(),
             false,
             project_conventions.as_deref(),
-            read_program_available,
+            prompt_tools,
         )?;
         if args.web {
             agent.set_web_enabled(true).map_err(anyhow::Error::msg)?;
@@ -1029,7 +1078,7 @@ async fn run(args: ActivateArgs) -> anyhow::Result<()> {
         registry,
         ws.clone(),
         ui.clone(),
-        system_prompt(project_conventions.as_deref(), read_program_available),
+        system_prompt(project_conventions.as_deref(), prompt_tools),
     );
     agent.warm_connection();
     if let Some(tracer) = latency_tracer {
@@ -1065,7 +1114,7 @@ async fn run(args: ActivateArgs) -> anyhow::Result<()> {
         workspace,
         true,
         project_conventions.as_deref(),
-        read_program_available,
+        prompt_tools,
     )?;
     if args.web {
         agent.set_web_enabled(true).map_err(anyhow::Error::msg)?;
@@ -1088,7 +1137,7 @@ fn attach_or_restore_session(
     workspace: String,
     announce: bool,
     project_conventions: Option<&str>,
-    read_program_available: bool,
+    prompt_tools: PromptTools,
 ) -> anyhow::Result<()> {
     let restored = if let Some(id) = &args.resume {
         // An explicit id that doesn't exist is a real error: silently
@@ -1119,7 +1168,7 @@ fn attach_or_restore_session(
             agent.restore(
                 record,
                 store,
-                system_prompt(project_conventions, read_program_available),
+                system_prompt(project_conventions, prompt_tools),
             );
             // `repair_after_interrupt` was previously only ever called from
             // the interactive REPL's own Ctrl+C handler, immediately after
@@ -1874,14 +1923,14 @@ mod system_prompt_tests {
 
     #[test]
     fn identity_leads_the_prompt() {
-        let p = system_prompt(None, false);
+        let p = system_prompt(None, PromptTools::default());
         assert!(p.starts_with("You are HiveMind, a coding agent built by bmtai."));
     }
 
     #[test]
     fn a_workspace_with_no_conventions_changes_nothing() {
         assert_eq!(
-            system_prompt(None, false),
+            system_prompt(None, PromptTools::default()),
             format!("{IDENTITY}\n\n{SYSTEM_PROMPT_BODY}\n\n{}", platform_note())
         );
     }
@@ -1893,7 +1942,7 @@ mod system_prompt_tests {
         // fed the escalation counter that spent a month's budget in one
         // task. The specific strings matter: "terminal" alone is what the
         // prompt said before, and it is not enough.
-        let p = system_prompt(None, false);
+        let p = system_prompt(None, PromptTools::default());
         assert!(p.contains("Environment: "), "{p}");
         assert!(p.contains("run_shell` executes through"), "{p}");
         if cfg!(windows) {
@@ -1908,7 +1957,7 @@ mod system_prompt_tests {
     fn project_conventions_land_last_so_they_win_ties() {
         let p = system_prompt(
             Some("<project-instructions>use just</project-instructions>"),
-            false,
+            PromptTools::default(),
         );
         assert!(p.contains("use just"));
         // Specializations have to sit *after* the general rules they
@@ -1921,7 +1970,7 @@ mod system_prompt_tests {
 
     #[test]
     fn the_final_answer_contract_survives_in_the_prompt() {
-        let p = system_prompt(None, false);
+        let p = system_prompt(None, PromptTools::default());
         // The "did not verify" clause is the load-bearing half of the
         // contract -- a summary that only lists successes is the failure
         // mode this exists to prevent.
@@ -1931,7 +1980,13 @@ mod system_prompt_tests {
 
     #[test]
     fn read_program_guidance_is_narrow_and_preserves_simple_tools() {
-        let p = system_prompt(None, true);
+        let p = system_prompt(
+            None,
+            PromptTools {
+                read_program: true,
+                local_core: false,
+            },
+        );
         assert!(p.contains("bounded `search_then_read`"));
         assert!(p.contains("Keep a single simple"));
         assert!(p.contains("`read_program` is read-only"));
@@ -1939,9 +1994,55 @@ mod system_prompt_tests {
 
     #[test]
     fn hooked_sessions_do_not_advertise_the_composite_tool() {
-        let p = system_prompt(None, false);
+        let p = system_prompt(None, PromptTools::default());
         assert!(!p.contains("`read_program`"));
         assert!(!p.contains("`search_then_read`"));
+    }
+
+    const LOCAL: PromptTools = PromptTools {
+        read_program: false,
+        local_core: true,
+    };
+
+    #[test]
+    fn the_local_prompt_never_points_at_a_tool_local_models_lack() {
+        let p = system_prompt(None, LOCAL);
+        for tool in LOCAL_LEFT_OUT_TOOLS.iter().chain(&["read_program"]) {
+            assert!(!p.contains(tool), "{tool} is still mentioned");
+        }
+        for tool in [
+            "project_map",
+            "`search`",
+            "read_file",
+            "edit_file",
+            "todo_write",
+            "run_shell",
+        ] {
+            assert!(p.contains(tool), "{tool} should still be explained");
+        }
+        assert!(
+            p.contains("use `search` for an exact string\n  (prefer it over shell grep); then")
+        );
+        assert!(p.contains("Reserve `write_file` for creating new files."));
+    }
+
+    #[test]
+    fn the_local_prompt_only_drops_lines_about_the_missing_tools() {
+        // Guards the cut points: editing the main prompt must not silently disable the trim.
+        assert!(SYSTEM_PROMPT_BODY.contains(SEMANTIC_SEARCH_HINT));
+        assert!(SYSTEM_PROMPT_BODY.contains(DOCUMENT_TOOLS_START));
+        assert!(SYSTEM_PROMPT_BODY.contains(DOCUMENT_TOOLS_END));
+        let full = system_prompt(None, PromptTools::default());
+        let local = system_prompt(None, LOCAL);
+        assert!(local.len() < full.len());
+        // The one reworded line, now that `search` is the only search tool.
+        let reworded = "(prefer it over shell grep); then `read_file` and `list_dir` for detail.";
+        for line in local.lines().filter(|l| l.trim() != reworded) {
+            assert!(
+                full.contains(line.trim()),
+                "new text in the local prompt: {line}"
+            );
+        }
     }
 }
 

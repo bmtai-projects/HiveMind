@@ -1,8 +1,21 @@
-use harness_types::Message;
+use harness_types::{Message, ToolSchema};
 const CHARS_PER_TOKEN: f64 = 3.3;
 const PER_MESSAGE_OVERHEAD_TOKENS: u64 = 4;
 pub fn estimate_tokens(messages: &[Message]) -> u64 {
     messages.iter().map(estimate_message_tokens).sum()
+}
+
+/// The tool definitions sent alongside the messages in every request.
+pub fn estimate_schema_tokens(tools: &[ToolSchema]) -> u64 {
+    let chars: usize = tools
+        .iter()
+        .map(|t| {
+            t.name.chars().count()
+                + t.description.chars().count()
+                + t.parameters.to_string().chars().count()
+        })
+        .sum();
+    (chars as f64 / CHARS_PER_TOKEN).ceil() as u64
 }
 
 pub fn estimate_message_tokens(m: &Message) -> u64 {
@@ -21,6 +34,18 @@ mod tests {
     #[test]
     fn empty_history_is_zero() {
         assert_eq!(estimate_tokens(&[]), 0);
+        assert_eq!(estimate_schema_tokens(&[]), 0);
+    }
+
+    #[test]
+    fn tool_definitions_count_their_name_description_and_parameters() {
+        let tool = ToolSchema {
+            name: "abc".into(),
+            description: "x".repeat(30),
+            parameters: serde_json::json!({}),
+        };
+        // 3 + 30 + 2 ("{}") = 35 chars / 3.3 -> 11.
+        assert_eq!(estimate_schema_tokens(&[tool]), 11);
     }
 
     #[test]
