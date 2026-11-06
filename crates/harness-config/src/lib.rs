@@ -162,6 +162,23 @@ pub fn lookup_model(id: &str) -> Option<&'static ModelCatalogEntry> {
     KNOWN_MODELS.iter().find(|m| m.id == id)
 }
 
+/// Whether `url` points at this machine (`localhost`, `127.x.x.x`, `::1`, `0.0.0.0`).
+pub fn is_loopback_url(url: &str) -> bool {
+    let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let authority = after_scheme.split(['/', '?', '#']).next().unwrap_or("");
+    let host_port = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let host = match host_port.strip_prefix('[') {
+        Some(v6) => v6.split(']').next().unwrap_or(""),
+        None => host_port.split(':').next().unwrap_or(""),
+    };
+    let host = host.to_ascii_lowercase();
+    host == "localhost"
+        || host.ends_with(".localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback() || ip.is_unspecified())
+}
+
 /// Whether `id` names an Anthropic Claude model, bare (`claude-…`) or the
 /// way OpenRouter lists it (`anthropic/claude-…`).
 pub fn is_claude_model(id: &str) -> bool {
@@ -455,19 +472,27 @@ pub fn resolve(
 ) -> Result<Resolved, ConfigError> {
     let file = load_file(config_path)?;
 
-    let explicit_key = cli
+    let cli_key = cli.api_key.clone().filter(|k| !k.is_empty());
+    let file_key = file
+        .model
         .api_key
         .clone()
-        .or_else(|| file.model.api_key.clone())
         .or_else(|| file.deepseek.api_key.clone())
-        .or_else(|| std::env::var("HIVEMIND_API_KEY").ok())
-        .or_else(|| std::env::var("DEEPSEEK_API_KEY").ok())
         .filter(|k| !k.is_empty());
     let base_url_override = cli
         .base_url
         .clone()
         .or_else(|| file.model.base_url.clone())
         .or_else(|| file.deepseek.base_url.clone());
+    // A server on this machine gets a key only when the user gave one with it. Hosted sign-ins are unaffected.
+    let key_goes_with_url = cli_key.is_some() || (file_key.is_some() && cli.base_url.is_none());
+    let keyless_local =
+        base_url_override.as_deref().is_some_and(is_loopback_url) && !key_goes_with_url;
+    let explicit_key = cli_key
+        .or(file_key)
+        .or_else(|| std::env::var("HIVEMIND_API_KEY").ok())
+        .or_else(|| std::env::var("DEEPSEEK_API_KEY").ok())
+        .filter(|k| !k.is_empty());
     // Only meaningful for Byok below -- Hosted and Local are always
     // OpenAiCompatible regardless of what's configured here.
     let dialect = cli
@@ -486,6 +511,12 @@ pub fn resolve(
     // be hosted", which made Ollama impossible to express without inventing
     // a fake key.
     let (api_key, base_url, backend, dialect) = match explicit_key {
+        Some(_) if keyless_local => (
+            String::new(),
+            base_url_override.unwrap_or_default(),
+            Backend::Local,
+            Dialect::OpenAiCompatible,
+        ),
         // An explicit key is BYOK regardless of what else is configured.
         // The default endpoint depends on the dialect: Anthropic's own API,
         // or DeepSeek's for every OpenAI-compatible key.
@@ -1271,6 +1302,162 @@ mod tests {
         .unwrap();
         assert_eq!(resolved.dialect, Dialect::OpenAiCompatible);
         assert_eq!(resolved.endpoint.base_url, "https://api.deepseek.com");
+    }
+
+    #[test]
+    fn loopback_addresses_are_recognised_and_nothing_else() {
+        for url in [
+            "http://127.0.0.1:11434/v1",
+            "http://localhost:1234/v1",
+            "http://LOCALHOST/v1",
+            "http://127.1.2.3",
+            "http://[::1]:11434/v1",
+            "http://0.0.0.0:11434",
+            "http://app.localhost:8080/v1",
+            "localhost:11434",
+            "http://user:pw@127.0.0.1:4000/v1",
+        ] {
+            assert!(is_loopback_url(url), "{url}");
+        }
+        for url in [
+            "https://openrouter.ai/api/v1",
+            "https://api.deepseek.com",
+            "http://192.168.1.20:11434/v1",
+            "http://localhost.example.com/v1",
+            "http://127.0.0.1.example.com",
+            "https://example.com/127.0.0.1",
+            "",
+        ] {
+            assert!(!is_loopback_url(url), "{url}");
+        }
+    }
+
+    /// Resolves with `config` as config.toml, `credentials` (if any) as the hosted sign-in.
+    fn resolve_with(config: &str, credentials: Option<&str>, cli: CliOverrides) -> Resolved {
+        let dir = std::env::temp_dir().join(format!(
+            "hivemind-test-loopback-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("config.toml");
+        std::fs::write(&config_path, config).unwrap();
+        let credentials_path = dir.join("credentials.toml");
+        match credentials {
+            Some(text) => std::fs::write(&credentials_path, text).unwrap(),
+            None => {
+                let _ = std::fs::remove_file(&credentials_path);
+            }
+        }
+        let resolved = resolve(&config_path, &credentials_path, cli).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        resolved
+    }
+
+    fn local_cli() -> CliOverrides {
+        CliOverrides {
+            base_url: Some("http://127.0.0.1:11434/v1".into()),
+            model: Some("qwen2.5-coder:7b".into()),
+            ..CliOverrides::default()
+        }
+    }
+
+    const SAVED_OPENROUTER: &str = "[model]\napi_key = \"sk-or-saved\"\nbase_url = \"https://openrouter.ai/api/v1\"\nmodel = \"deepseek/deepseek-v4-flash\"\n";
+
+    #[test]
+    fn a_local_address_is_local_even_with_a_key_saved_for_another_provider() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("HIVEMIND_API_KEY");
+            std::env::remove_var("DEEPSEEK_API_KEY");
+        };
+        let resolved = resolve_with(SAVED_OPENROUTER, None, local_cli());
+        assert_eq!(resolved.backend, Backend::Local);
+        assert_eq!(
+            resolved.endpoint.api_key, "",
+            "the OpenRouter key stays home"
+        );
+        assert_eq!(resolved.endpoint.base_url, "http://127.0.0.1:11434/v1");
+        assert_eq!(resolved.default_model, "qwen2.5-coder:7b");
+    }
+
+    #[test]
+    fn a_local_address_is_local_even_with_a_key_in_the_environment() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var("HIVEMIND_API_KEY", "sk-env");
+            std::env::remove_var("DEEPSEEK_API_KEY");
+        };
+        let with_env = resolve_with("", None, local_cli());
+        unsafe { std::env::remove_var("HIVEMIND_API_KEY") };
+        assert_eq!(with_env.backend, Backend::Local);
+        assert_eq!(with_env.endpoint.api_key, "");
+    }
+
+    #[test]
+    fn a_hosted_sign_in_still_reaches_a_local_server_build() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("HIVEMIND_API_KEY");
+            std::env::remove_var("DEEPSEEK_API_KEY");
+        };
+        let signed_in =
+            "[hosted]\napi_base = \"https://api.hivemind.bmtai.in\"\naccess_token = \"tok\"\n";
+        let resolved = resolve_with("", Some(signed_in), local_cli());
+        assert_eq!(resolved.backend, Backend::Hosted);
+        assert_eq!(resolved.endpoint.api_key, "tok");
+    }
+
+    #[test]
+    fn a_key_given_together_with_a_local_address_is_still_used() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("HIVEMIND_API_KEY");
+            std::env::remove_var("DEEPSEEK_API_KEY");
+        };
+        // A local proxy that needs a key, e.g. LiteLLM.
+        let on_the_command_line = resolve_with(
+            SAVED_OPENROUTER,
+            None,
+            CliOverrides {
+                api_key: Some("sk-proxy".into()),
+                ..local_cli()
+            },
+        );
+        assert_eq!(on_the_command_line.backend, Backend::Byok);
+        assert_eq!(on_the_command_line.endpoint.api_key, "sk-proxy");
+
+        let saved_together = "[model]\napi_key = \"sk-proxy\"\nbase_url = \"http://localhost:4000/v1\"\nmodel = \"m\"\n";
+        let in_the_config = resolve_with(saved_together, None, CliOverrides::default());
+        assert_eq!(in_the_config.backend, Backend::Byok);
+        assert_eq!(in_the_config.endpoint.api_key, "sk-proxy");
+    }
+
+    #[test]
+    fn other_addresses_resolve_exactly_as_before() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("HIVEMIND_API_KEY");
+            std::env::remove_var("DEEPSEEK_API_KEY");
+        };
+        let saved = resolve_with(SAVED_OPENROUTER, None, CliOverrides::default());
+        assert_eq!(saved.backend, Backend::Byok);
+        assert_eq!(saved.endpoint.api_key, "sk-or-saved");
+
+        let lan = resolve_with(
+            SAVED_OPENROUTER,
+            None,
+            CliOverrides {
+                base_url: Some("http://192.168.1.20:11434/v1".into()),
+                ..CliOverrides::default()
+            },
+        );
+        assert_eq!(
+            lan.backend,
+            Backend::Byok,
+            "only this machine counts as local"
+        );
+        assert_eq!(lan.endpoint.api_key, "sk-or-saved");
     }
 
     #[test]
