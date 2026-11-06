@@ -191,25 +191,25 @@ anything. Raise it to 16k, and keep the model loaded between messages:
 hivemind activate --base-url http://127.0.0.1:11434/v1 --model qwen2.5-coder:7b
 ```
 
-To save it instead, run `hivemind activate`, choose **Other** in the menu,
-enter `http://127.0.0.1:11434/v1`, leave the key empty, and type the model
-name.
+This works even if you saved an API key for another provider: HiveMind
+never sends a key to a server on your own machine unless you give one for it
+with `--api-key`.
 
-> **Already saved an API key, or signed in to HiveMind's service?** Then
-> HiveMind does not treat the server as local: it sends your key or sign-in
-> token to it, and local models don't get the settings below. Keep the local
-> setup in a separate file, `~/.config/hivemind/local.toml`:
->
-> ```toml
-> [model]
-> base_url = "http://127.0.0.1:11434/v1"
-> model = "qwen2.5-coder:7b"
-> ```
->
-> Start it with `hivemind activate --config ~/.config/hivemind/local.toml`
-> (Windows: `--config $env:USERPROFILE\.config\hivemind\local.toml`). Also
-> sign out of the hosted service (`hivemind auth logout`), and don't set
-> `HIVEMIND_API_KEY`.
+To make the local model your default, set the `[model]` section of your
+config file (see [Settings](#settings)) to:
+
+```toml
+[model]
+base_url = "http://127.0.0.1:11434/v1"
+model = "qwen2.5-coder:7b"
+```
+
+If nothing is set up yet, the menu's **Other** option writes this for you:
+enter the address, leave the key empty, and type the model name.
+
+> **Signed in to HiveMind's service?** Sign out first
+> (`hivemind auth logout`). While you are signed in, HiveMind uses your
+> sign-in with that address instead of treating it as a local model.
 
 What to expect:
 
