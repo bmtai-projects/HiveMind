@@ -199,6 +199,8 @@ pub struct AgentPolicy {
     /// (4,772 bytes) inline while capturing the handful that hold most of
     /// the transcript's bytes. `0` turns offloading off entirely.
     pub artifact_threshold_bytes: usize,
+    /// Give local models every tool instead of the smaller default set.
+    pub local_all_tools: bool,
 }
 
 impl Default for AgentPolicy {
@@ -214,6 +216,7 @@ impl Default for AgentPolicy {
             // layer. harness-agent depends on both and asserts they agree
             // (`the_artifact_threshold_default_matches_the_tool_layer`).
             artifact_threshold_bytes: 10_000,
+            local_all_tools: false,
         }
     }
 }
@@ -367,6 +370,7 @@ struct AgentSection {
     escalate_after_repeats: Option<u32>,
     budget_usd: Option<f64>,
     artifact_threshold_bytes: Option<usize>,
+    local_all_tools: Option<bool>,
 }
 
 #[derive(Debug, Error)]
@@ -562,6 +566,9 @@ pub fn resolve(
     }
     if let Some(v) = file.agent.artifact_threshold_bytes {
         policy.artifact_threshold_bytes = v;
+    }
+    if let Some(v) = file.agent.local_all_tools {
+        policy.local_all_tools = v;
     }
     if let Some(v) = file.agent.escalate_after_repeats {
         policy.escalate_after_repeats = v;
@@ -1264,6 +1271,32 @@ mod tests {
         .unwrap();
         assert_eq!(resolved.dialect, Dialect::OpenAiCompatible);
         assert_eq!(resolved.endpoint.base_url, "https://api.deepseek.com");
+    }
+
+    #[test]
+    fn local_all_tools_is_off_unless_the_agent_section_turns_it_on() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("HIVEMIND_API_KEY");
+            std::env::remove_var("DEEPSEEK_API_KEY");
+        };
+        let dir =
+            std::env::temp_dir().join(format!("hivemind-test-local-tools-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("config.toml");
+        let local = "[model]\nbase_url = \"http://localhost:11434/v1\"\nmodel = \"qwen\"\n";
+        for (agent, expected) in [("", false), ("[agent]\nlocal_all_tools = true\n", true)] {
+            std::fs::write(&config_path, format!("{local}{agent}")).unwrap();
+            let resolved = resolve(
+                &config_path,
+                Path::new("/nonexistent/credentials.toml"),
+                CliOverrides::default(),
+            )
+            .unwrap();
+            assert_eq!(resolved.backend, Backend::Local);
+            assert_eq!(resolved.policy.local_all_tools, expected, "{agent:?}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

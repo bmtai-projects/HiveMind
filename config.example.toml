@@ -24,6 +24,9 @@ escalate_after_repeats = 2          # consecutive repeats/errors before escalati
 # budget_usd = 0.50                 # unbounded by default. Stops the session (cleanly, not an
                                      # error) once estimated spend reaches this, at the next turn
                                      # boundary -- an in-flight turn always finishes first.
+# local_all_tools = true            # local models (Ollama, LM Studio) get a smaller tool set by
+                                     # default, so the prompt they must read is ~40% shorter.
+                                     # Turn this on to give them every tool (e.g. a big model on a GPU).
 
 # For common cases -- "never let it force-push", "only let it write inside
 # src/" -- you don't need to write any of the below by hand. Run:

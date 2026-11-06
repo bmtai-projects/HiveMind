@@ -10,6 +10,7 @@ mod reasoning;
 mod review_orchestrator;
 mod session;
 pub mod skills;
+mod text_calls;
 mod tokens;
 mod trim;
 mod ui;
