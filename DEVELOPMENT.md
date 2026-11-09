@@ -115,7 +115,7 @@ ollama list                                # shows the exact names you can use
 Two things to watch: sign out of the hosted service first (`hivemind auth
 logout`), because while you are signed in `--base-url` keeps using your
 account. And use a model that supports tool calling, or the agent cannot read
-or edit files. The [README](README.md#3-a-model-on-your-own-machine-no-key-no-cost)
+or edit files. The [README](README.md#c-a-model-on-your-own-computer)
 explains the details.
 
 To try your build, run it from `target/`. Do not copy it over your installed
