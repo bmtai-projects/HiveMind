@@ -1,49 +1,42 @@
 # HiveMind
 
-HiveMind is a coding agent that lives in your terminal. You describe a task in
-plain English. It reads your code, edits files, runs commands, and tells you
-what it did and what it cost.
+HiveMind is an AI coding assistant that works in your terminal. You tell it
+what you want in plain English. It reads your code, edits files, runs
+commands (after asking you), and tells you what it did and what it cost.
 
-It is written in Rust, ships as one small program called `hivemind`, and is
-built around one goal: **make an agentic coding loop cheap enough to give
-away.**
+It is one small program, `hivemind`, for Windows, macOS and Linux. Use it with
+HiveMind's own service, with your own API key from a provider such as
+OpenRouter, or with a free model running on your own computer.
 
 ```text
+$ cd my-project
 $ hivemind activate
 > add a --verbose flag to the CLI and update the tests
 ```
 
-## What it does
+**On this page:** [Install](#1-install) ·
+[Connect a model](#2-connect-a-model) · [Use it](#3-use-it) ·
+[Settings](#settings) · [Troubleshooting](#troubleshooting) ·
+[Contributing](#contributing)
 
-- **Reads and edits your code.** It can search by exact text or by meaning,
-  read files, and change just the lines that need changing.
-- **Runs commands, with your permission.** It asks before every shell command
-  unless you turn that off.
-- **Shows the cost as it goes.** Every reply prints what that turn cost and
-  what the session has cost so far.
-- **Works with your choice of model.** Use HiveMind's own service, bring your
-  own API key, or point it at a model running on your own machine.
-- **Reviews code.** `hivemind review` looks at your Git changes and reports
-  problems, with evidence.
+## 1. Install
 
-## Install
-
-macOS and Linux:
-
-```sh
-curl -fsSL https://hivemind.bmtai.in/install.sh | bash
-```
-
-Windows (PowerShell):
+**Windows** (PowerShell):
 
 ```powershell
 irm https://hivemind.bmtai.in/install.ps1 | iex
 ```
 
-The Windows installer adds `hivemind` to your PATH, so open a **new**
-PowerShell window afterwards. The macOS/Linux installer puts it in
-`~/.local/bin` and tells you what to add to your PATH if that folder is not
-already on it.
+Then close PowerShell and open a **new** window, so it can find `hivemind`.
+
+**macOS and Linux:**
+
+```sh
+curl -fsSL https://hivemind.bmtai.in/install.sh | bash
+```
+
+This puts `hivemind` in `~/.local/bin`. If that folder is not on your PATH,
+the installer prints the line to add.
 
 Check that it worked:
 
@@ -51,230 +44,345 @@ Check that it worked:
 hivemind --version
 ```
 
-Later, `hivemind update` replaces your copy with the newest release.
+- **Update later:** `hivemind update` replaces your copy with the newest
+  release.
+- **Build it yourself:** see [DEVELOPMENT.md](DEVELOPMENT.md).
+- **Uninstall:** delete the program, `%LOCALAPPDATA%\hivemind` on Windows
+  (also remove it from your user PATH) or `~/.local/bin/hivemind` on macOS and
+  Linux. Your settings and saved sessions are in `~/.config/hivemind`
+  (Windows: `%USERPROFILE%\.config\hivemind`); delete that folder too if you
+  want them gone.
 
-Prefer to build it yourself? See [DEVELOPMENT.md](DEVELOPMENT.md).
+## 2. Connect a model
 
-## First run
+HiveMind needs a language model to do the thinking. Pick **one** of these:
 
-HiveMind needs a model to talk to. Pick **one** of these three ways.
+| | Cost | What you need | Good for |
+|---|---|---|---|
+| **A. HiveMind's service** | Pay as you go, from a prepaid balance | A HiveMind account | Starting fast, web search |
+| **B. Your own API key** | Your provider's prices. OpenRouter also has free models. | A key from OpenRouter, OpenAI, Anthropic, DeepSeek or similar | Choosing from hundreds of models |
+| **C. A model on your computer** | Free | [Ollama](https://ollama.com) (or similar) and a reasonably fast computer | Privacy, no account |
 
-### 1. HiveMind's own service (easiest)
+The first time you run `hivemind activate`, with nothing set up yet, it shows
+a menu that does A or B for you:
 
-No API key of your own. You sign in and pay from a prepaid balance. See the
-[pricing page](https://hivemind.bmtai.in/pricing).
+```text
+No backend configured yet. Pick one:
+
+  1) HiveMind (hosted) — sign in, pay-as-you-go, no key needed
+  2) OpenRouter
+  3) OpenAI
+  4) Anthropic (Claude)
+  5) DeepSeek
+  6) Other (any OpenAI-compatible endpoint)
+```
+
+### A. HiveMind's own service
 
 ```sh
 hivemind auth login     # opens your browser to sign in
 hivemind activate
 ```
 
-`hivemind auth status` shows whether you are signed in and what your balance
-is. Web search only works this way.
+- `hivemind auth status` shows whether you are signed in and your balance.
+- `hivemind models` lists the models you can choose with `--model`.
+- Prices are on the [pricing page](https://hivemind.bmtai.in/pricing).
+- `hivemind auth logout` signs you out.
 
-### 2. Your own API key
+### B. Your own API key
 
-Any provider that speaks the OpenAI-style chat API works, for example
-OpenRouter. Always pass `--base-url` and `--model` with your key. Anthropic's
-own API works too: add `--dialect anthropic` and use
-`--base-url https://api.anthropic.com`.
+1. Get an API key from your provider's website. For OpenRouter, sign up at
+   [openrouter.ai](https://openrouter.ai) and create one under **Keys**.
+2. Run `hivemind activate`, choose your provider from the menu, and paste the
+   key. It is hidden as you type.
+3. If asked, type a model id. OpenRouter and DeepSeek have a default, so you
+   can just press on.
 
-```sh
-export HIVEMIND_API_KEY=<your key>          # Windows PowerShell: $env:HIVEMIND_API_KEY = "<your key>"
-hivemind activate --base-url https://openrouter.ai/api/v1 --model <a model id your provider uses>
-```
+That's it: the choice is saved, and from now on `hivemind activate` uses it.
 
-> **Do not skip `--base-url`.** If you give a key but no address, HiveMind
-> sends the key to its built-in default, `https://api.deepseek.com`, which is
-> only right if the key is for that service.
+| Provider | Address (`--base-url`) | Model id to start with |
+|---|---|---|
+| OpenRouter | `https://openrouter.ai/api/v1` | `deepseek/deepseek-v4-flash` (the default) |
+| OpenAI | `https://api.openai.com/v1` | one from OpenAI's model list |
+| Anthropic | `https://api.anthropic.com` (also needs `--dialect anthropic`) | one from Anthropic's model list |
+| DeepSeek | `https://api.deepseek.com` | `deepseek-v4-flash` (the default) |
+| Other | your provider's address | any service with an OpenAI-style chat API |
 
-If nothing is configured, `hivemind activate` offers a picker instead. A key
-you paste there is hidden as you type and saved as plain text in your config
-file (see [Settings](#settings)). On macOS and Linux that file is readable only
-by you; on Windows it relies on your user folder's default permissions. To
-remove a saved key, delete the `api_key` line from that file.
+Good to know:
 
-### 3. A model on your own machine (no key, no cost)
+- **Not sure which model?** Start with the default, then type `/model` in a
+  session. With OpenRouter it opens on a **Top 5** and lets you sort every
+  model by score, price or context size.
+- **Free models:** on OpenRouter, models whose id ends in `:free` cost
+  nothing but have a daily request limit.
+- **Where the key goes:** the menu saves it as plain text in your config file
+  (see [Settings](#settings)). To remove it, delete the `api_key` line there.
+- **Switching provider later:** the menu only appears when nothing is set up.
+  To change provider, edit the `[model]` section of your config file. Delete
+  that section and `hivemind activate` shows the menu again.
 
-This works with any server that speaks the OpenAI-style chat API, such as
-Ollama, which serves one at `http://localhost:11434/v1` by default.
-
-```sh
-hivemind auth logout      # only if you were signed in to the hosted service
-hivemind activate --base-url http://127.0.0.1:11434/v1 --model <a model you have pulled>
-```
-
-Things to know:
-
-- HiveMind has no default local model. Use `ollama list` to see yours.
-- Pick a model that supports tool calling. Without it the agent cannot read or
-  edit files. Some models (for example `qwen2.5-coder`) write their tool
-  calls as plain JSON text instead; HiveMind recognizes those and runs them.
-- Give the model a context of at least 16k tokens. Ollama's default is 4,096,
-  and it silently cuts anything longer, so the model loses its instructions.
-  Set `OLLAMA_CONTEXT_LENGTH=16384` (on Windows: `setx OLLAMA_CONTEXT_LENGTH 16384`)
-  and restart Ollama. HiveMind warns you when it sees a cut prompt.
-- The first message is the slow one: the model has to read about 3,000 tokens
-  of instructions and tool descriptions, which can take a few minutes on a
-  CPU. Later messages reuse that work while the model stays loaded, so also
-  set `OLLAMA_KEEP_ALIVE=1h`, or it unloads after 5 idle minutes.
-- To keep that first read short, local models get a smaller tool set: no
-  PDF, spreadsheet, diagram or semantic search tools. Set
-  `local_all_tools = true` under `[agent]` in config.toml to give them every
-  tool, for example a big model on a GPU.
-- No prices are known for your own model, so no cost is shown.
-- Your code and prompts stay on your machine, but HiveMind is not fully
-  offline. Every time `hivemind activate` starts, it asks GitHub whether a
-  newer release exists. That is one small web request that gives up after
-  under a second, and there is no setting to turn it off yet.
-- If you are still signed in, `--base-url` on its own keeps using your hosted
-  account and **sends it your sign-in token**. Sign out first.
-
-### Then try it
+**Without the menu:** put the key in an environment variable and give the
+address and model each time.
 
 ```sh
-hivemind activate                                            # interactive session
-hivemind activate -p "summarize what this project does"      # one question, then exit
-hivemind activate --continue                                 # pick up your last session here
-hivemind activate --ui plain                                 # the old line-at-a-time REPL instead
+# macOS / Linux
+export HIVEMIND_API_KEY=<your key>
+hivemind activate --base-url https://openrouter.ai/api/v1 --model deepseek/deepseek-v4-flash
 ```
 
-Inside a session, type `/help` to see every command, and `@path/to/file` to
-hand a file to the model directly.
+```powershell
+# Windows: setx keeps the key for future windows, $env: sets it for this one
+setx HIVEMIND_API_KEY "<your key>"
+$env:HIVEMIND_API_KEY = "<your key>"
+hivemind activate --base-url https://openrouter.ai/api/v1 --model deepseek/deepseek-v4-flash
+```
 
-## What works today
+> **Always pass `--base-url` with a key.** Without it, HiveMind sends the key
+> to its built-in default, `https://api.deepseek.com`, which is only right if
+> it is a DeepSeek key.
 
-**Everyday use**
+### C. A model on your own computer
 
-- Interactive sessions and one-shot prompts (`-p`).
-- Saved sessions you can come back to: `--continue`, `--resume <id>`, and
-  `hivemind sessions`.
-- `/undo` restores files the agent edited or wrote. It does **not** undo
-  shell commands, and it only remembers the current session.
-- `/diff`, `/status`, `/context`, `/model`, `/reasoning`, `/skill`, `/cost`,
-  `/budget`, `/compact`.
-- `@path` mentions that put a file's contents straight into your message.
-- `hivemind review`: reads your Git changes (`--staged`, `--base`, `--commit`,
-  `--range`) and reports problems. It never edits your repository. It needs a
-  model, so set one up as above first.
+Free, and your code and prompts stay on your machine. It is slower than a
+cloud model, especially on a laptop without a graphics card.
 
-**Tools the agent can use**
+**1. Install Ollama** from [ollama.com](https://ollama.com) and start it.
+
+**2. Download a model that can use tools**, for example:
+
+```sh
+ollama pull qwen2.5-coder:7b     # about 5 GB; this is the one we test with
+```
+
+Bigger models do better work if your computer can run them.
+
+**3. Give the model enough room.** Ollama's default context is 4,096 tokens.
+HiveMind's instructions are longer than that, so Ollama silently cuts them
+and the model gets confused, for example printing JSON instead of doing
+anything. Raise it to 16k, and keep the model loaded between messages:
+
+- **Windows:** run these, then quit Ollama from the taskbar and start it
+  again:
+
+  ```powershell
+  setx OLLAMA_CONTEXT_LENGTH 16384
+  setx OLLAMA_KEEP_ALIVE 1h
+  ```
+
+- **macOS:** run these, then quit and reopen the Ollama app:
+
+  ```sh
+  launchctl setenv OLLAMA_CONTEXT_LENGTH 16384
+  launchctl setenv OLLAMA_KEEP_ALIVE 1h
+  ```
+
+- **Linux** (Ollama running as a service): run `sudo systemctl edit ollama.service`,
+  add the lines below, then `sudo systemctl restart ollama`:
+
+  ```ini
+  [Service]
+  Environment="OLLAMA_CONTEXT_LENGTH=16384"
+  Environment="OLLAMA_KEEP_ALIVE=1h"
+  ```
+
+**4. Connect HiveMind:**
+
+```sh
+hivemind activate --base-url http://127.0.0.1:11434/v1 --model qwen2.5-coder:7b
+```
+
+To save it instead, run `hivemind activate`, choose **Other** in the menu,
+enter `http://127.0.0.1:11434/v1`, leave the key empty, and type the model
+name.
+
+> **Already saved an API key, or signed in to HiveMind's service?** Then
+> HiveMind does not treat the server as local: it sends your key or sign-in
+> token to it, and local models don't get the settings below. Keep the local
+> setup in a separate file, `~/.config/hivemind/local.toml`:
+>
+> ```toml
+> [model]
+> base_url = "http://127.0.0.1:11434/v1"
+> model = "qwen2.5-coder:7b"
+> ```
+>
+> Start it with `hivemind activate --config ~/.config/hivemind/local.toml`
+> (Windows: `--config $env:USERPROFILE\.config\hivemind\local.toml`). Also
+> sign out of the hosted service (`hivemind auth logout`), and don't set
+> `HIVEMIND_API_KEY`.
+
+What to expect:
+
+- **The first message is the slow one.** The model must first read about
+  3,000 tokens of instructions and tool descriptions. On a laptop CPU that
+  can take a few minutes. After that, replies take seconds while the model
+  stays loaded.
+- **A smaller set of tools**, to keep that first read short: no PDF,
+  spreadsheet, diagram or semantic-search tools. To give local models every
+  tool (say, a big model on a GPU), set `local_all_tools = true` under
+  `[agent]` in your config file.
+- **If HiveMind says the model "read only N tokens"**, the context is still
+  too small. Check step 3, and that you restarted Ollama.
+- Some models write their tool calls as plain text. HiveMind spots those and
+  runs them.
+- No cost is shown, since nothing is billed.
+- Other local servers work the same way. LM Studio's address is usually
+  `http://127.0.0.1:1234/v1`.
+- HiveMind is not fully offline: each time it starts, it asks GitHub whether
+  a newer release exists. That one small request gives up after under a
+  second.
+
+## 3. Use it
+
+Open a terminal **in your project folder** and start a session:
+
+```sh
+cd my-project
+hivemind activate
+```
+
+HiveMind only reads and writes files inside that folder (or the one you give
+with `--workdir`). Type what you want, for example:
+
+- `explain what this project does`
+- `fix the failing test in tests/parser.rs`
+- `add input validation to the signup form`
+- `@src/main.rs why does this crash on empty input?` (`@` hands a file to
+  the model; press Tab to complete the name)
+
+Before it runs any shell command, HiveMind shows you the exact command and
+waits for `Y` or `N`.
+
+**Other ways to start**
+
+| Command | What it does |
+|---|---|
+| `hivemind activate -p "summarize this project"` | Answer one request and exit. Shell commands run **without asking** in this mode. |
+| `hivemind activate --continue` | Pick up your last session in this folder |
+| `hivemind sessions`, then `hivemind activate --resume <id>` | Go back to an older session |
+| `hivemind review --staged` | Review your Git changes (also `--base`, `--commit`, `--range`). It never edits anything. |
+| `hivemind activate --ui plain` | A simple line-by-line mode, if the full-screen one misbehaves in your terminal |
+
+**Keys in a session**
+
+| Key | What it does |
+|---|---|
+| `Enter` / `Shift+Enter` | Send / new line |
+| `Esc` | Stop the current run |
+| `Ctrl+C` | Interrupt, or clear the message box |
+| `Tab`, then `↑` `↓` `PgUp` `PgDn` or the mouse wheel | Move between panels and scroll them |
+| `Enter` on a tool call or a changed file | Open its full result, or its diff |
+| `Ctrl+O` | Show everything, with tool calls expanded |
+| `Shift`+drag | Select text (`Option`+drag in iTerm2) |
+| `?` | List every key |
+
+**Commands in a session** (type `/` to see them all)
+
+| Command | What it does |
+|---|---|
+| `/model` | Choose a model. With your own key, the list comes from your provider. |
+| `/reasoning` | Choose how much the model thinks before it answers |
+| `/undo [n]` | Undo the last `n` turns. Restores files it edited or wrote; it cannot undo shell commands. |
+| `/diff` | Every change this session made |
+| `/cost` | What this session has cost |
+| `/budget 0.50` | Stop once this session reaches $0.50 (`/budget off` to remove) |
+| `/compact` | Fold older messages into a summary, to save tokens |
+| `/skill` | Tune it for one kind of job (`hivemind skills` lists them) |
+| `/web on` | Let it search the web (HiveMind's service only) |
+| `/status`, `/context` | Session details, and how full the model's memory is |
+| `/sessions`, `/reviews` | Saved sessions and saved reviews |
+| `/copy`, `/transcript` | Copy the last reply; show the whole conversation |
+| `/help`, `/exit` | All commands; quit |
+
+**What the agent can do**
 
 | Tool | What it does |
 |---|---|
-| `read_file`, `list_dir`, `project_map` | Look at files and the shape of the project. With `--features pdf` at build time, `read_file` also reads the text of a PDF, a few pages at a time (not scanned PDFs, which have no text to read). The official downloads do not include this yet. |
-| `search` | Find exact text |
-| `semantic_search` | Find code by meaning. Runs locally. |
-| `read_program` | Several read-only lookups in one step (turned off if you have hooks configured) |
-| `edit_file` | Change one exact piece of a file |
-| `write_file` | Create a new file |
+| `read_file`, `list_dir`, `project_map` | Look at files and the shape of the project |
+| `search`, `semantic_search` | Find exact text, or code by meaning |
+| `edit_file`, `write_file` | Change part of a file, or create one |
 | `run_shell` | Run a command, after you approve it |
 | `todo_write` | Keep a visible checklist for bigger jobs |
 | `create_pdf`, `create_spreadsheet`, `create_diagram` | Make documents |
-| `read_artifact` | Read back a large result that was saved to disk |
-| `web_search`, `web_fetch` | Hosted service only, and off until you turn on `--web` |
+| `web_search`, `web_fetch` | HiveMind's service only, and only after `/web on` or `--web` |
 
-**Safety and control**
+Reading PDFs needs a build with `--features pdf`. The official downloads
+don't include it yet.
 
-- Files are confined to your working folder (`--workdir`, default: the current
-  folder).
-- Shell commands ask `[y/N]` first. `--yolo`, or the headless `-p` mode, skips
-  the question, so use them carefully.
-- Safety rules you can switch on with one command, such as "never force-push"
-  or "only write inside `src/`": `hivemind hooks list`, then
-  `hivemind hooks enable <name>`. You can also write your own in the config
-  file.
-- A spending cap: `--budget 0.50`, or `/budget` inside a session. It stops at
-  the end of a turn, never in the middle of an edit.
-- Four built-in skills that tune the agent for one kind of job: `hivemind skills`.
+**Staying in control**
 
-**A full-screen terminal interface**
+- Files outside your working folder are off limits.
+- Shell commands wait for your `Y`. `--yolo` (and `-p` mode) skip that, so
+  use them with care.
+- Spending caps: `--budget 0.50` when you start, or `/budget` in a session.
+  It stops between steps, never in the middle of an edit.
+- Ready-made safety rules, such as "never force-push" or "only write inside
+  `src/`": run `hivemind hooks list`, then `hivemind hooks enable <name>`.
 
-`hivemind activate` opens a Ratatui-based full-screen interface by default.
-`--ui plain` switches back to the plain line-at-a-time REPL, for terminals
-that don't get along with raw mode (some SSH setups, unusual multiplexers).
-Neither can be combined with `--protocol json` or headless `--prompt`.
+## Settings
 
-The screen shows the conversation with each tool call in place, the model's
-`todo_write` checklist, every tool call, changed files with their `+/−` line
-counts, the provider and model, and session tokens and cost. Shell commands
-use the same approval policy as the plain REPL: a panel shows the exact
-command, and `[Y]`/`[N]` approves or denies it.
+You don't need a config file. HiveMind keeps its files in
+`~/.config/hivemind` (Windows: `%USERPROFILE%\.config\hivemind`):
 
-Useful keys:
+| File | What's in it |
+|---|---|
+| `config.toml` | Your settings, and the provider and key the menu saved |
+| `credentials.toml` | Your HiveMind sign-in (`hivemind auth login`) |
+| `sessions/` | Saved conversations, for `--continue` and `--resume` |
 
-- `Enter` sends a message; `Shift+Enter` adds a line.
-- `Tab` moves between panels, and `↑`/`↓`, `PgUp`/`PgDn` and the mouse wheel
-  scroll them.
-- `Enter` on a tool call or a changed file opens its full result or its diff.
-  `Ctrl+O` (or `/transcript`) shows everything with tool calls expanded, and
-  `/diff` shows every change this session.
-- `Esc` stops a run, `Ctrl+C` interrupts or clears the message box, and `?`
-  lists every key.
+To change defaults, copy [`config.example.toml`](config.example.toml) to
+`config.toml` there. Every setting is optional and explained in comments.
+`--config <file>` uses a different file.
 
-The same slash commands as the plain REPL work here too, plus `/copy` to copy
-the last reply. `/model` and `/reasoning` open a list: `↑`/`↓` to move, `Enter`
-to choose, `Esc` to cancel. With your own key the model list comes from your
-provider when it publishes one.
+`hivemind activate --help` lists every flag. The most useful:
 
-When the provider publishes benchmark scores (OpenRouter does), `/model` opens
-on **Top 5**, five good starting points with a tag saying why each is there
-(Smartest, Best value, Popular for coding, and so on). `Tab` or `←`/`→` switch
-to **Smartest**, **Cheapest**, **Context** (largest window), **Popular** or
-**All**. Each row shows a cost tier (`$` to `$$$$`), the price per 1M tokens
-(input/output), the context size, the score, and whether the model thinks.
-Typing jumps to **All** and filters it. Models without a score appear only
-under Popular and All. The model you're using always stays at the top.
+| Flag | What it does |
+|---|---|
+| `--model <id>` | Start on a specific model |
+| `--base-url <url>` | Talk to a different provider or server |
+| `--reasoning-effort <level>` | How much the model thinks, if it supports that |
+| `--budget <usd>` | Stop once the session's estimated spend reaches this |
+| `--skill <id>` | Start with a skill selected |
+| `--web` | Allow web search (HiveMind's service only) |
+| `--workdir <folder>` | Work in a different folder |
+| `--yolo` | Don't ask before running shell commands |
+| `--ui plain` | Use the simple line-by-line mode |
 
-OpenRouter also says which reasoning levels each model accepts. Where a
-provider doesn't say, `/reasoning` offers `low`, `medium` and `high`, marked as
-unverified, and sends your choice as-is. You can still type `/model <id>` or
-`/reasoning <level>` directly.
+## Troubleshooting
 
-The interface captures the mouse so the wheel can scroll each panel, so select
-text with `Shift`+drag (`Option`+drag in iTerm2).
+**`hivemind` is not recognized, or "command not found".** On Windows, open a
+new PowerShell window after installing. On macOS and Linux, add
+`~/.local/bin` to your PATH as the installer said.
 
-**For editors and other tools**
+**The provider menu doesn't appear.** It only appears when nothing is set up.
+To change provider, edit or delete the `[model]` section in `config.toml`.
 
-- `hivemind activate --protocol json` talks in JSON lines over stdin and
-  stdout, so an editor or script can drive HiveMind.
+**"401", "unauthorized" or "invalid API key".** The key and `--base-url` must
+belong to the same provider. If you gave a key without `--base-url`, it went
+to DeepSeek.
 
-## What is planned
+**A local model prints JSON, ignores the task, or HiveMind says it "read
+only N tokens".** Its context is too small. Follow step 3 of
+[section C](#c-a-model-on-your-own-computer), then restart Ollama.
 
-These do **not** exist yet. Some are good places to help; see
-[docs/community-tasks.md](docs/community-tasks.md) for small starting points.
+**A local model is very slow.** The first message is the slow one on a CPU.
+Set `OLLAMA_KEEP_ALIVE=1h` so the model isn't unloaded between messages, or
+try a smaller model.
 
-- **An easier way to use a local model**, with a `--local` flag, and a
-  `hivemind models` that asks your server what it has. Today `hivemind models`
-  only prints the built-in list.
-- **MCP support**, to plug in outside tool servers.
-- **A real neural embedding model for local `semantic_search`.** Today the
-  local one matches on words, not meaning.
-- **More providers that do not use the OpenAI-style chat API.** Anthropic's
-  own API works today; others would each need a new client.
+**An OpenRouter `:free` model stops answering.** Free models have a daily
+request limit. Wait until the next day, or use a paid model.
 
-## Why it is cheap
+**The screen looks wrong, or keys don't work.** Some terminals and SSH setups
+don't get along with the full-screen mode. Use `hivemind activate --ui plain`.
 
-Most of what a coding agent costs is not the model. It is **re-sending the
-whole conversation** on every turn. A few things fix most of that:
+**I can't select text.** Hold `Shift` while dragging (`Option` in iTerm2).
 
-| What | How it helps | Where to read the code |
-|---|---|---|
-| **Stable prompt prefix** | The start of every request stays identical, so providers that cache can charge the cheap "cached" rate for it. Cached input costs a small fraction of normal input on providers that support it. Claude needs to be asked, so with Claude on Anthropic's API or OpenRouter, HiveMind also marks the conversation for caching. HiveMind shows the cache hit rate live. | [`wire.rs`](crates/harness-provider/src/wire.rs), [`anthropic.rs`](crates/harness-provider/src/anthropic.rs), [`tool.rs`](crates/harness-tools/src/tool.rs) |
-| **Written files aren't re-sent** | Once a request is finished, the text of files it wrote is left out of later requests, since the file is on disk and the model can read it again. The saved session keeps everything. | [`lean.rs`](crates/harness-agent/src/lean.rs) |
-| **No pointless check reminders** | If the agent changed files and ran nothing, it is asked once to run a check. Changes to docs only, or to plain web pages outside any project, skip that extra turn, since nothing could check them. | [`validation.rs`](crates/harness-agent/src/validation.rs) |
-| **Compaction** | When a session fills 75% of the model's memory (you can change that), older turns are folded into one summary instead of being re-sent forever. | [`compaction.rs`](crates/harness-agent/src/compaction.rs) |
-| **Small edits** | `edit_file` swaps one exact piece of text instead of rewriting the whole file. Output tokens are the most expensive kind, so this saves the most. | [`edit.rs`](crates/harness-tools/src/edit.rs) |
-| **Big results go to disk** | A huge command output is saved as a file, and the conversation keeps a short preview and a handle. `read_artifact` fetches more if needed. | [`artifact.rs`](crates/harness-tools/src/artifact.rs) |
-| **Cheap first, stronger only when stuck** | On the hosted service, a task starts on the cheap default model. If the agent repeats itself or keeps hitting errors, it switches to a stronger model for that task only. | [`agent.rs`](crates/harness-agent/src/agent.rs) |
-| **Parallel tools** | When the model asks for several tools at once, they run at the same time. Results are put back in order. | [`tool.rs`](crates/harness-tools/src/tool.rs) |
-| **Retries with backoff** | Rate limits and network hiccups are retried with growing, randomized waits, and a server's `Retry-After` is respected. | [`retry.rs`](crates/harness-provider/src/retry.rs) |
-| **Reused connections, few copies** | One connection pool for the whole run, and the conversation is copied to send a turn only when old file text is left out. | [`client.rs`](crates/harness-provider/src/client.rs) |
-| **Live cost readout** | Every reply prints what that turn and the session cost. | [`ui.rs`](crates/harness-cli/src/ui.rs) |
+Still stuck? [Open an issue](https://github.com/bmtai-projects/HiveMind/issues).
 
 ## How it is built
 
-Follow one request from Enter to the answer in [How a turn works](docs/how-a-turn-works.md).
+This part is for contributors. Follow one request from Enter to the answer
+in [How a turn works](docs/how-a-turn-works.md).
 
 HiveMind is a Rust workspace of seven small crates:
 
@@ -319,29 +427,10 @@ speaks Anthropic's own Messages API. `Agent::new` picks one from the
 implementation.
 
 The hosted service (accounts, billing, and the model proxy) is a separate
-private service. Nothing in this repository needs it, and the second and
-third ways to connect never talk to it. Ready-made downloads are attached to
-this repository's [releases](https://github.com/bmtai-projects/HiveMind/releases).
-
-## Settings
-
-You do not need a config file. To change defaults, copy
-[`config.example.toml`](config.example.toml) to
-`~/.config/hivemind/config.toml` (on Windows that is
-`%USERPROFILE%\.config\hivemind\config.toml`). Every setting there is optional
-and explained in comments.
-
-`hivemind activate --help` lists every flag. The most useful:
-
-| Flag | What it does |
-|---|---|
-| `-p, --prompt` | Run one prompt and exit |
-| `--model` | Start on a specific model |
-| `--budget` | Stop once estimated spend reaches this many USD |
-| `--continue` / `--resume <id>` | Return to a saved session |
-| `--skill` | Start with a skill selected |
-| `--yolo` | Do not ask before running shell commands |
-| `--ui plain` | Use the old line-at-a-time REPL instead of the full-screen interface |
+private service. Nothing in this repository needs it, and connecting with
+your own key or a local model never talks to it. Ready-made downloads are
+attached to this repository's
+[releases](https://github.com/bmtai-projects/HiveMind/releases).
 
 ## Contributing
 
